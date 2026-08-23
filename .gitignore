@@ -1,0 +1,4 @@
+target/
+*.adabt
+/scratch/
+results*.json

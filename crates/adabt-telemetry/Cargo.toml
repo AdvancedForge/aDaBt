@@ -1,0 +1,18 @@
+[package]
+name = "adabt-telemetry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+adabt-core.workspace = true
+
+[features]
+default = ["counters"]
+# No observation at all: every probe call compiles to nothing.
+off = []
+# Cheap aggregate counters and latency samples.
+counters = []
+# Everything in `counters` plus per-query-shape detail and sampled traces.
+full = ["counters"]

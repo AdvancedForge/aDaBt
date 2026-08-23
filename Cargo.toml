@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/adabt-core",
+    "crates/adabt-telemetry",
+    "crates/adabt-testkit",
+    "crates/adabt-bench",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+adabt-core = { path = "crates/adabt-core" }
+adabt-telemetry = { path = "crates/adabt-telemetry" }
+adabt-testkit = { path = "crates/adabt-testkit" }
+thiserror = "1"
+
+[profile.release]
+debug = 1
+lto = "thin"
+codegen-units = 1
+
+# Benchmarks must never run against a debug build. This profile gives optimised
+# code with tolerable compile times for iterating on the harness itself.
+[profile.bench-fast]
+inherits = "release"
+lto = false
+codegen-units = 16

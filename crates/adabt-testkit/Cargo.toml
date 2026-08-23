@@ -1,0 +1,9 @@
+[package]
+name = "adabt-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+adabt-core.workspace = true
