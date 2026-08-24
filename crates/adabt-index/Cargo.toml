@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 adabt-core.workspace = true
+adabt-ir.workspace = true
 
 [dev-dependencies]
 adabt-testkit.workspace = true

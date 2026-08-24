@@ -87,6 +87,15 @@ pub fn level_preset(level: u8) -> Vec<LevelEntry> {
         out.push(entry("column_store", &[]));
         out.push(entry("materialized_view", &[]));
     }
+    if level >= 5 {
+        // Level 5 is "workload-aware", and a composite index is the clearest
+        // example of the idea: it is chosen from which fields this workload
+        // constrains *together*, which is a fact about the traffic and not
+        // about the schema. Above `auto_index` because it costs more per write
+        // and serves a narrower set of queries, so it is worth reaching for
+        // only once the single-field indexes exist and are not enough.
+        out.push(entry("auto_composite_index", &[]));
+    }
     if level >= 8 {
         // Freezing is what makes direct addressing legal for a collection that
         // did not start out fixed, which is why it sits below it.

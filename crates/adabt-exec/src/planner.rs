@@ -22,6 +22,22 @@ use crate::physical::{PhysicalOp, PhysicalPlan};
 pub struct PlanContext<'a> {
     /// Indexes available per collection, keyed by field.
     pub indexes: HashMap<&'a str, Vec<(&'a str, IndexKind)>>,
+    /// Composite indexes per collection, as the ordered field list each
+    /// covers. Separate from `indexes` because they are matched by a
+    /// different question — "does the predicate constrain every one of
+    /// these fields" rather than "is this one field indexed" — and folding
+    /// them into the same map would mean every existing lookup had to
+    /// learn to skip them.
+    pub composite: HashMap<&'a str, Vec<Vec<String>>>,
+    /// Covering indexes per collection: the indexed field and the projection
+    /// it carries. Kept apart from `indexes` for the same reason `composite`
+    /// is — the question asked of it is different ("does this projection
+    /// contain everything the query reads") and folding it in would make
+    /// every existing lookup learn to skip entries it must not select.
+    pub covering: HashMap<&'a str, Vec<(&'a str, Vec<String>)>>,
+    /// Partial indexes per collection: the index's full name, the condition
+    /// it holds only the qualifying records for, and its kind.
+    pub partial: HashMap<&'a str, Vec<(&'a str, Expr, IndexKind)>>,
     /// Collections with a columnar derived representation.
     pub columnar: Vec<&'a str>,
 }
@@ -30,6 +46,9 @@ impl<'a> PlanContext<'a> {
     pub fn empty() -> Self {
         Self {
             indexes: HashMap::new(),
+            composite: HashMap::new(),
+            covering: HashMap::new(),
+            partial: HashMap::new(),
             columnar: Vec::new(),
         }
     }
@@ -41,7 +60,21 @@ impl<'a> PlanContext<'a> {
             indexes.iter().map(|i| (i.field(), i.kind())).collect(),
         );
         Self {
+            covering: {
+                let mut c: HashMap<&str, Vec<(&str, Vec<String>)>> = HashMap::new();
+                let found: Vec<(&str, Vec<String>)> = indexes
+                    .iter()
+                    .filter(|i| !i.covers().is_empty())
+                    .map(|i| (i.field(), i.covers().to_vec()))
+                    .collect();
+                if !found.is_empty() {
+                    c.insert(collection, found);
+                }
+                c
+            },
             indexes: m,
+            composite: HashMap::new(),
+            partial: HashMap::new(),
             columnar: Vec::new(),
         }
     }
@@ -64,6 +97,97 @@ impl<'a> PlanContext<'a> {
                     IndexKind::Bitmap => best = Some(IndexKind::Bitmap),
                     IndexKind::BTree => best = best.or(Some(IndexKind::BTree)),
                 }
+            }
+        }
+        best
+    }
+
+    /// A covering index on one of the pinned fields whose projection contains
+    /// everything the query reads.
+    ///
+    /// `needed` is `None` when whole records escape the plan; a projection can
+    /// never serve that, so this declines rather than looking for a best fit.
+    fn covering_for(
+        &self,
+        collection: &str,
+        equalities: &[(String, adabt_core::value::Value)],
+        needed: Option<&[String]>,
+    ) -> Option<(String, adabt_core::value::Value, Vec<String>)> {
+        let needed = needed?;
+        let list = self.covering.get(collection)?;
+        for (name, covers) in list {
+            let (base, _) = adabt_index::covering_parts(name);
+            let Some((_, key)) = equalities.iter().find(|(f, _)| *f == base) else {
+                continue;
+            };
+            if needed.iter().all(|n| covers.contains(n)) {
+                return Some((base, key.clone(), needed.to_vec()));
+            }
+        }
+        None
+    }
+
+    /// A partial index on `field` whose condition the query's predicate
+    /// guarantees.
+    ///
+    /// The test is *syntactic containment*: the predicate must be, or must
+    /// contain as a top-level `AND` conjunct, an expression structurally equal
+    /// to the index's condition. That is far weaker than real implication —
+    /// `age > 20` does not match an index conditioned on `age > 18`, though it
+    /// entails it — and weak is the correct direction to err. Failing to
+    /// recognise an implication costs a slower plan; inventing one returns
+    /// rows that are not there, or drops rows that are.
+    fn partial_for(
+        &self,
+        collection: &str,
+        field: &str,
+        predicate: &Expr,
+    ) -> Option<(String, IndexKind)> {
+        let list = self.partial.get(collection)?;
+        for (name, condition, kind) in list {
+            let (base, _) = adabt_index::partial_parts(name);
+            if base != field {
+                continue;
+            }
+            if implies(predicate, condition) {
+                return Some((name.to_string(), *kind));
+            }
+        }
+        None
+    }
+
+    /// A composite index every one of whose fields the predicate pins to a
+    /// literal, with the key that lookup needs.
+    ///
+    /// Longest first: an index over `(a, b, c)` narrows strictly harder than
+    /// one over `(a, b)` when the predicate constrains all three, and picking
+    /// the shorter one would leave work for the residual filter that the index
+    /// could have done.
+    fn composite_for(
+        &self,
+        collection: &str,
+        equalities: &[(String, adabt_core::value::Value)],
+    ) -> Option<(Vec<String>, adabt_core::value::Value)> {
+        let list = self.composite.get(collection)?;
+        let mut best: Option<(Vec<String>, adabt_core::value::Value)> = None;
+        for fields in list {
+            let mut parts = Vec::with_capacity(fields.len());
+            let mut covered = true;
+            for f in fields {
+                match equalities.iter().find(|(name, _)| name == f) {
+                    Some((_, v)) => parts.push(v.clone()),
+                    None => {
+                        covered = false;
+                        break;
+                    }
+                }
+            }
+            if !covered {
+                continue;
+            }
+            let longer = best.as_ref().is_none_or(|(b, _)| fields.len() > b.len());
+            if longer {
+                best = Some((fields.clone(), adabt_core::value::Value::List(parts)));
             }
         }
         best
@@ -291,6 +415,9 @@ mod tests {
         m.insert("users", pairs);
         PlanContext {
             indexes: m,
+            composite: HashMap::new(),
+            covering: HashMap::new(),
+            partial: HashMap::new(),
             columnar: Vec::new(),
         }
     }
@@ -439,9 +566,25 @@ pub enum AccessDecision {
     ById,
     ByIds,
     FullScan,
-    ColumnScan { fields: Vec<String> },
-    IndexLookup { field: String, kind: IndexKind },
-    IndexRange { field: String },
+    ColumnScan {
+        fields: Vec<String>,
+    },
+    IndexLookup {
+        field: String,
+        kind: IndexKind,
+    },
+    /// A composite index covering every field the predicate pins.
+    CompositeLookup {
+        fields: Vec<String>,
+    },
+    /// A covering index that answers the whole query without a fetch.
+    CoveringLookup {
+        field: String,
+        needed: Vec<String>,
+    },
+    IndexRange {
+        field: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -450,15 +593,86 @@ pub struct PlanDecision {
     pub rationale: String,
 }
 
+/// Whether `predicate` guarantees `condition` holds for every row it selects.
+///
+/// Structural, not semantic. `predicate` implies `condition` when the two are
+/// equal, or when `predicate` is an `AND` one of whose conjuncts implies it.
+/// Everything else is `false`.
+///
+/// This is deliberately the weakest rule that is obviously sound. Real
+/// predicate implication is undecidable in general and expensive well before
+/// the general case, and every step toward cleverness here trades a slower
+/// plan for the possibility of a wrong one. `OR` is not descended into for the
+/// same reason it must not be: `a OR b` guarantees neither.
+fn implies(predicate: &Expr, condition: &Expr) -> bool {
+    if predicate == condition {
+        return true;
+    }
+    match predicate {
+        Expr::And(parts) => parts.iter().any(|p| implies(p, condition)),
+        _ => false,
+    }
+}
+
+/// The predicate of a `Filter` sitting directly on a `Scan`, if the plan has
+/// one.
+///
+/// The same shape `decide`'s walk looks for, extracted so the access decision
+/// can be made before the walk. Only a filter *directly* over a scan counts:
+/// anything between them changes what reaches the filter, and an index chosen
+/// from a predicate that no longer applies to the whole collection would
+/// return the wrong rows.
+fn filter_directly_over_scan(op: &LogicalOp) -> Option<&Expr> {
+    match op {
+        LogicalOp::Filter { input, predicate }
+            if matches!(input.as_ref(), LogicalOp::Scan { .. }) =>
+        {
+            Some(predicate)
+        }
+        LogicalOp::Filter { input, .. }
+        | LogicalOp::Project { input, .. }
+        | LogicalOp::Sort { input, .. }
+        | LogicalOp::Limit { input, .. }
+        | LogicalOp::Aggregate { input, .. } => filter_directly_over_scan(input),
+        _ => None,
+    }
+}
+
 /// Choose an access path. Depends on the plan's shape and the available
 /// indexes, never on its literals.
 pub fn decide(logical: &LogicalOp, ctx: &PlanContext<'_>) -> PlanDecision {
+    // What the plan actually reads, computed once. `None` means whole records
+    // reach the caller, which rules out both of the representations below:
+    // neither a columnar read nor a covering index can reconstruct a field
+    // nobody told them to keep.
+    let needed = logical.required_fields();
+
+    // Covering is considered before columnar, and before the walk to the leaf,
+    // because it is the only access path that returns rows without reading the
+    // primary at all. A column scan still scans; a covering lookup does not.
+    if let Some(pred) = filter_directly_over_scan(logical) {
+        let equalities = pred.equality_constraints();
+        if let Some((field, _, needed)) =
+            ctx.covering_for(logical.collection(), &equalities, needed.as_deref())
+        {
+            let rationale = format!(
+                "equality on {}.{field} answered from a covering index ({})",
+                logical.collection(),
+                needed.join(", ")
+            );
+            return PlanDecision {
+                access: AccessDecision::CoveringLookup { field, needed },
+                rationale,
+            };
+        }
+    }
+
     // A columnar read beats a heap scan when the plan touches only some fields,
     // but it cannot serve an index lookup, so it is considered only where the
     // access would otherwise be a full scan. `required_fields` returning None
     // means the plan hands whole records upward and columnar is not legal.
     if ctx.has_columnar(logical.collection()) {
-        if let Some(fields) = logical.required_fields() {
+        if let Some(fields) = needed.clone() {
             let equality_indexed = false;
             if !equality_indexed {
                 let rationale = format!(
@@ -491,7 +705,41 @@ pub fn decide(logical: &LogicalOp, ctx: &PlanContext<'_>) -> PlanDecision {
             }
             LogicalOp::Scan { collection } => {
                 if let Some(pred) = filter_over_scan {
-                    for (field, _) in pred.equality_constraints() {
+                    let equalities = pred.equality_constraints();
+                    // Composite first: an index covering three pinned fields
+                    // narrows harder than any single-field index over one of
+                    // them, so asking about single fields first would take a
+                    // worse path whenever both exist.
+                    if let Some((fields, _)) = ctx.composite_for(collection, &equalities) {
+                        let rationale = format!(
+                            "equality on every field of the composite index ({}) on {collection}",
+                            fields.join(", ")
+                        );
+                        return PlanDecision {
+                            access: AccessDecision::CompositeLookup { fields },
+                            rationale,
+                        };
+                    }
+                    for (field, _) in equalities {
+                        // A partial index first when the predicate guarantees
+                        // its condition: it holds a subset of the same rows,
+                        // so it is strictly cheaper to probe, and the `Filter`
+                        // above re-checks the whole predicate either way.
+                        //
+                        // The decision names the index by its full name —
+                        // condition and all — because that is what the index
+                        // answers to. A bare field name would find the
+                        // unrestricted index, or nothing.
+                        if let Some((name, kind)) = ctx.partial_for(collection, &field, pred) {
+                            let rationale = format!(
+                                "equality on {collection}.{field} served by a partial {} index",
+                                kind.as_str()
+                            );
+                            return PlanDecision {
+                                access: AccessDecision::IndexLookup { field: name, kind },
+                                rationale,
+                            };
+                        }
                         if let Some(kind) = ctx.index_for(collection, &field) {
                             let rationale = format!(
                                 "equality on {collection}.{field} served by {} index",
@@ -570,10 +818,18 @@ fn build_node(op: &LogicalOp, decision: &PlanDecision) -> PhysicalOp {
             if let LogicalOp::Scan { collection } = input.as_ref() {
                 match &decision.access {
                     AccessDecision::IndexLookup { field, kind } => {
+                        // The decision may name a *partial* index, whose name
+                        // is the field plus its encoded condition. The key is
+                        // still bound from the plain field, so strip the
+                        // condition before matching — comparing the whole name
+                        // against the predicate's field names would never
+                        // match, and the plan would silently fall through to a
+                        // scan.
+                        let (base, _) = adabt_index::partial_parts(field);
                         if let Some((_, key)) = predicate
                             .equality_constraints()
                             .into_iter()
-                            .find(|(f, _)| f == field)
+                            .find(|(f, _)| *f == base)
                         {
                             return PhysicalOp::Filter {
                                 input: Box::new(PhysicalOp::IndexLookup {
@@ -581,6 +837,54 @@ fn build_node(op: &LogicalOp, decision: &PlanDecision) -> PhysicalOp {
                                     field: field.clone(),
                                     kind: *kind,
                                     key,
+                                }),
+                                predicate: predicate.clone(),
+                            };
+                        }
+                    }
+                    AccessDecision::CoveringLookup { field, needed } => {
+                        // Rebound from this predicate's literals, like every
+                        // other access path here.
+                        //
+                        // The `Filter` above it is not redundant. A covering
+                        // index pins one field; the predicate may constrain
+                        // others, and those rows are in the index too. Dropping
+                        // the filter here would return them.
+                        let equalities = predicate.equality_constraints();
+                        if let Some((_, key)) = equalities.iter().find(|(n, _)| n == field) {
+                            return PhysicalOp::Filter {
+                                input: Box::new(PhysicalOp::CoveringLookup {
+                                    collection: collection.clone(),
+                                    field: field.clone(),
+                                    key: key.clone(),
+                                    needed: needed.clone(),
+                                }),
+                                predicate: predicate.clone(),
+                            };
+                        }
+                    }
+                    AccessDecision::CompositeLookup { fields } => {
+                        // Rebound from *this* predicate's literals, like every
+                        // other access path here — a cached decision names the
+                        // fields, never the values.
+                        let equalities = predicate.equality_constraints();
+                        let mut parts = Vec::with_capacity(fields.len());
+                        let mut covered = true;
+                        for f in fields {
+                            match equalities.iter().find(|(n, _)| n == f) {
+                                Some((_, v)) => parts.push(v.clone()),
+                                None => {
+                                    covered = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if covered {
+                            return PhysicalOp::Filter {
+                                input: Box::new(PhysicalOp::CompositeLookup {
+                                    collection: collection.clone(),
+                                    fields: fields.clone(),
+                                    key: adabt_core::value::Value::List(parts),
                                 }),
                                 predicate: predicate.clone(),
                             };
@@ -652,6 +956,9 @@ mod decision_tests {
         m.insert("users", pairs);
         PlanContext {
             indexes: m,
+            composite: HashMap::new(),
+            covering: HashMap::new(),
+            partial: HashMap::new(),
             columnar: Vec::new(),
         }
     }

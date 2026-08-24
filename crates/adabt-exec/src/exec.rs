@@ -118,6 +118,42 @@ pub trait Source {
         field: &str,
         key: &Value,
     ) -> Result<Option<Vec<RecordId>>>;
+    /// Ids matching a composite index's full key, or `None` when no such
+    /// index exists. Defaulted so a `Source` that has no composite indexes
+    /// — the reference model, the merged-rows source used for sharded
+    /// post-merge work — needs no change and correctly reports that it
+    /// cannot serve one.
+    fn composite_lookup(
+        &mut self,
+        _collection: &str,
+        _fields: &[String],
+        _key: &Value,
+    ) -> Result<Option<Vec<RecordId>>> {
+        Ok(None)
+    }
+
+    /// Rows matching an indexed equality, served entirely from a covering
+    /// index — or `None` when no index on `field` carries every field in
+    /// `needed`.
+    ///
+    /// The distinction between `None` and `Some(vec![])` is load-bearing here
+    /// exactly as it is for `range`: the second means "the key matched
+    /// nothing", and a caller that read it as "no covering index" would fall
+    /// back to a scan and get the same answer slowly, while a caller that read
+    /// `None` as "nothing matched" would silently drop every row.
+    ///
+    /// Defaulted, so a `Source` with no covering indexes correctly reports
+    /// that it cannot serve one rather than needing to be changed.
+    fn covering_lookup(
+        &mut self,
+        _collection: &str,
+        _field: &str,
+        _key: &Value,
+        _needed: &[String],
+    ) -> Result<Option<Vec<(RecordId, Record)>>> {
+        Ok(None)
+    }
+
     /// Ids in an indexed range, or `None` when no index can serve it.
     fn index_range(
         &mut self,
@@ -259,10 +295,7 @@ fn run<S: Source>(
             match src.column_scan(collection, fields)? {
                 Some(rows) => {
                     stats.rows_scanned += rows.len() as u64;
-                    Ok(rows
-                        .chunks(BATCH_SIZE)
-                        .map(|c| RecordBatch::from_rows(c.to_vec()))
-                        .collect())
+                    Ok(batches_of(rows))
                 }
                 None => {
                     // The planner believed a column store existed and it does not.
@@ -288,6 +321,63 @@ fn run<S: Source>(
                     // The planner believed an index existed and it does not.
                     // Falling back to a scan keeps the answer correct; the
                     // counter makes the disagreement visible rather than silent.
+                    stats.index_misses += 1;
+                    let ids = src.all_ids(collection)?;
+                    fetch_batches(collection, ids, src, stats, budget)
+                }
+            }
+        }
+
+        // The whole point of a covering index: rows without a fetch.
+        //
+        // Note what is *not* here — no `fetch_batches`, no page directory, no
+        // buffer pool, no decode. The rows come out of the index. The
+        // fallback is an ordinary indexed lookup, not a scan, because the
+        // index on the field still exists even when its projection cannot
+        // answer this particular query.
+        PhysicalOp::CoveringLookup {
+            collection,
+            field,
+            key,
+            needed,
+        } => {
+            stats.index_probes += 1;
+            match src.covering_lookup(collection, field, key, needed)? {
+                Some(rows) => {
+                    stats.rows_scanned += rows.len() as u64;
+                    // Already in ascending id order — the covering index keeps
+                    // its projections in an ordered map, and `fetch_batches`
+                    // sorts for exactly the same reason: the same query must
+                    // not return rows in a different order because a different
+                    // structure answered it.
+                    Ok(batches_of(rows))
+                }
+                None => {
+                    stats.index_misses += 1;
+                    match src.index_lookup(collection, field, key)? {
+                        Some(ids) => fetch_batches(collection, ids, src, stats, budget),
+                        None => {
+                            let ids = src.all_ids(collection)?;
+                            fetch_batches(collection, ids, src, stats, budget)
+                        }
+                    }
+                }
+            }
+        }
+
+        PhysicalOp::CompositeLookup {
+            collection,
+            fields,
+            key,
+        } => {
+            stats.index_probes += 1;
+            match src.composite_lookup(collection, fields, key)? {
+                Some(ids) => fetch_batches(collection, ids, src, stats, budget),
+                None => {
+                    // The planner believed a composite index existed and it
+                    // does not. Falling back keeps the answer correct; the
+                    // counter makes the disagreement visible rather than
+                    // silent, exactly as the single-field paths do.
                     stats.index_misses += 1;
                     let ids = src.all_ids(collection)?;
                     fetch_batches(collection, ids, src, stats, budget)
@@ -381,10 +471,7 @@ fn run<S: Source>(
         PhysicalOp::Sort { input, keys } => {
             let mut rows = collect_rows(input, src, stats, budget)?;
             rows.sort_by(|a, b| compare_rows(&a.1, &b.1, keys).then(a.0.cmp(&b.0)));
-            Ok(rows
-                .chunks(BATCH_SIZE)
-                .map(|c| RecordBatch::from_rows(c.to_vec()))
-                .collect())
+            Ok(batches_of(rows))
         }
 
         PhysicalOp::Aggregate {
@@ -695,6 +782,28 @@ fn hash_join(
     Ok(acc.out)
 }
 
+/// Split owned rows into batches, moving each row exactly once.
+///
+/// The obvious spelling — `rows.chunks(BATCH_SIZE).map(|c| c.to_vec())` —
+/// *clones* every record, because `chunks` borrows and `to_vec` copies. The
+/// rows are already owned at every call site here, so that clone buys nothing
+/// at all: a sorted query duplicated its entire result set on the way out and
+/// dropped the original immediately.
+///
+/// Same shape as the disabled result cache: correct answers, doubled work,
+/// invisible to anything that compares answers.
+fn batches_of(rows: Vec<(RecordId, Record)>) -> Vec<RecordBatch> {
+    let mut out = Vec::with_capacity(rows.len().div_ceil(BATCH_SIZE));
+    let mut it = rows.into_iter();
+    loop {
+        let chunk: Vec<(RecordId, Record)> = it.by_ref().take(BATCH_SIZE).collect();
+        if chunk.is_empty() {
+            return out;
+        }
+        out.push(RecordBatch::from_rows(chunk));
+    }
+}
+
 /// Fabricate a `RecordId` from each row's position in the join's output — the
 /// same convention `aggregate` and `MaterializedViews::rows` already use for
 /// a row with no single natural id of its own.
@@ -704,9 +813,7 @@ fn batch_from_rows(rows: Vec<Record>) -> Vec<RecordBatch> {
         .enumerate()
         .map(|(i, r)| (RecordId(i as u64), r))
         .collect();
-    rows.chunks(BATCH_SIZE)
-        .map(|c| RecordBatch::from_rows(c.to_vec()))
-        .collect()
+    batches_of(rows)
 }
 
 /// A columnar scan, optionally under one filter, that an aggregate can be
@@ -926,6 +1033,9 @@ mod tests {
             );
             PlanContext {
                 indexes: m,
+                composite: std::collections::HashMap::new(),
+                covering: std::collections::HashMap::new(),
+                partial: std::collections::HashMap::new(),
                 columnar: Vec::new(),
             }
         }
@@ -1102,6 +1212,9 @@ mod tests {
             &LogicalOp::scan("c").filter(Expr::eq("bucket", 2i64)),
             &PlanContext {
                 indexes: m,
+                composite: std::collections::HashMap::new(),
+                covering: std::collections::HashMap::new(),
+                partial: std::collections::HashMap::new(),
                 columnar: Vec::new(),
             },
         );

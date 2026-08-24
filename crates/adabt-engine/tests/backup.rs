@@ -227,3 +227,125 @@ fn open_at_restores_a_database_to_an_earlier_point_indexes_and_all() {
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].0, RecordId(2));
 }
+
+#[test]
+fn point_in_time_recovery_is_reachable_entirely_from_the_engine_api() {
+    // The whole PITR story through `Database` alone, with no reach into
+    // `adabt-storage`. Each of the three pieces below existed in the storage
+    // crate and was exposed nowhere above it, which made M22's
+    // "point-in-time recovery" true of the storage layer and not of anything
+    // an application could call:
+    //   - set_log_archive   (keeps the segments a checkpoint would discard)
+    //   - lsn_at_or_before  (turns a wall-clock moment into an lsn)
+    //   - open_at           (replays only that far)
+    // A sweep for the same pattern found them; this test is what stops the
+    // gap reopening.
+    let live = Tmp::new("pitr-api-live");
+    let archive = Tmp::new("pitr-api-archive");
+    std::fs::create_dir_all(archive.path()).unwrap();
+
+    let mut db = Database::open(live.path(), Policy::conventional()).unwrap();
+    db.set_log_archive(Some(archive.path().to_path_buf()));
+    db.create_collection("users", schema()).unwrap();
+    for i in 0..5u64 {
+        db.insert(
+            "users",
+            RecordId(i),
+            Record::new().with("id", i).with("name", format!("u{i}")),
+        )
+        .unwrap();
+    }
+    db.checkpoint().unwrap();
+
+    // A moment in the middle, captured the way an operator would: by the
+    // clock, not by an lsn they have no way to know.
+    let moment = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    std::thread::sleep(std::time::Duration::from_millis(5));
+
+    for i in 5..12u64 {
+        db.insert(
+            "users",
+            RecordId(i),
+            Record::new().with("id", i).with("name", format!("u{i}")),
+        )
+        .unwrap();
+    }
+    drop(db);
+
+    let target = Database::lsn_at_or_before(live.path(), moment)
+        .unwrap()
+        .expect("a log entry at or before the captured moment must exist");
+    let mut restored = Database::open_at(
+        live.path(),
+        Policy::conventional(),
+        RecoverTarget::Lsn(target),
+    )
+    .unwrap();
+
+    // Everything before the moment, nothing after it.
+    assert_eq!(restored.count("users").unwrap(), 5);
+    assert!(restored.get("users", RecordId(4)).unwrap().is_some());
+    assert!(restored.get("users", RecordId(5)).unwrap().is_none());
+}
+
+#[test]
+fn restore_from_round_trips_through_the_engine_api_alone() {
+    let src = Tmp::new("api-src");
+    let backup = Tmp::new("api-backup");
+    let dest = Tmp::new("api-dest");
+
+    let mut db = Database::open(src.path(), Policy::conventional()).unwrap();
+    db.create_collection("users", schema()).unwrap();
+    db.add_unique_constraint("users", "name").unwrap();
+    db.insert(
+        "users",
+        RecordId(1),
+        Record::new().with("id", 1u64).with("name", "ada"),
+    )
+    .unwrap();
+    db.backup_to(backup.path()).unwrap();
+    drop(db);
+
+    Database::restore_from(backup.path(), dest.path()).unwrap();
+    let mut restored = Database::open(dest.path(), Policy::conventional()).unwrap();
+    assert_eq!(restored.count("users").unwrap(), 1);
+    // The engine-level sidecar came back too, not just the storage files.
+    assert!(restored.has_unique_constraint("users", "name"));
+}
+
+#[test]
+fn vacuum_is_reachable_from_the_engine_and_leaves_data_intact() {
+    let t = Tmp::new("vacuum-api");
+    let mut db = Database::open(t.path(), Policy::conventional()).unwrap();
+    db.create_collection("users", schema()).unwrap();
+    for i in 0..200u64 {
+        db.insert(
+            "users",
+            RecordId(i),
+            Record::new().with("id", i).with("name", format!("u{i}")),
+        )
+        .unwrap();
+    }
+    for i in 0..150u64 {
+        db.delete("users", RecordId(i)).unwrap();
+    }
+    db.checkpoint().unwrap();
+
+    let before = db.count("users").unwrap();
+    db.vacuum().unwrap();
+    assert_eq!(
+        db.count("users").unwrap(),
+        before,
+        "vacuum changed what the database holds"
+    );
+    // And the surviving rows still read back correctly after being moved.
+    for i in 150..200u64 {
+        assert_eq!(
+            db.get("users", RecordId(i)).unwrap().unwrap().get("name"),
+            Some(&adabt_core::value::Value::Str(format!("u{i}")))
+        );
+    }
+}

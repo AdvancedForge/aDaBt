@@ -45,15 +45,40 @@ use crate::shadow::ShadowReport;
 /// so what is hidden is exactly what was built. A prediction that drifted from
 /// reality would hide the wrong thing, and hiding the wrong thing means the
 /// "baseline" measurement is quietly taken through the candidate.
+/// Structures an experiment has built but not yet proven, hidden from the
+/// planner until they are.
+///
+/// `column_store` and `direct` are per-collection lists rather than global
+/// flags. They were flags, and that was a real defect: `Action::SetColumnStore`
+/// and `Action::SetDirectLookup` are engine-wide actions, so an experiment
+/// trialling a column store for one collection masked the column store for
+/// *every* collection — including ones whose column store was built and
+/// promoted long ago. That silently slowed unrelated queries for the duration
+/// and, worse, moved the baseline those queries were being measured against
+/// while an experiment elsewhere was running. Scoping the mask to the
+/// collection the experiment is actually about is both the fix and the
+/// precondition for ever running two experiments at once.
+///
+/// Every entry is tagged with the id of the experiment that built it.
+/// Without that, retiring one experiment cleared the whole mask and
+/// unmasked another experiment's unproven structure into live traffic —
+/// which is the difference between "concurrency is unimplemented" and
+/// "concurrency is unsafe".
 #[derive(Debug, Default, Clone)]
 pub struct Candidates {
-    indexes: Vec<(String, String, IndexKind)>,
-    column_store: bool,
-    direct: bool,
+    indexes: Vec<(u64, String, String, IndexKind)>,
+    column_store: Vec<(u64, String)>,
+    direct: Vec<(u64, String)>,
 }
 
 impl Candidates {
-    pub(crate) fn record(&mut self, action: &Action) {
+    /// Note a structure experiment `id` just built.
+    ///
+    /// `for_collection` is that experiment's own collection, needed because
+    /// `SetColumnStore`/`SetDirectLookup` are engine-wide actions that carry
+    /// no collection of their own — the experiment knows which collection it
+    /// is about, the action does not.
+    pub(crate) fn record(&mut self, id: u64, action: &Action, for_collection: &str) {
         match action {
             Action::CreateIndex {
                 collection,
@@ -61,42 +86,99 @@ impl Candidates {
                 kind,
             } => self
                 .indexes
-                .push((collection.clone(), field.clone(), *kind)),
-            Action::SetColumnStore(true) => self.column_store = true,
-            Action::SetDirectLookup(true) => self.direct = true,
+                .push((id, collection.clone(), field.clone(), *kind)),
+            // Both are engine-wide actions carrying no collection of their
+            // own, so the experiment's collection is what scopes them.
+            Action::SetColumnStore(true) | Action::SetDirectLookup(true) => {
+                if for_collection.is_empty() {
+                    return;
+                }
+                let list = if matches!(action, Action::SetColumnStore(true)) {
+                    &mut self.column_store
+                } else {
+                    &mut self.direct
+                };
+                if !list.iter().any(|(_, c)| c == for_collection) {
+                    list.push((id, for_collection.to_string()));
+                }
+            }
             _ => {}
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.indexes.is_empty() && !self.column_store && !self.direct
+    /// Drop everything experiment `id` contributed, leaving every other
+    /// experiment's mask intact.
+    ///
+    /// This is what makes concurrent experiments safe rather than merely
+    /// possible: clearing the whole mask on retirement would expose another
+    /// experiment's unproven structure to live traffic the instant an
+    /// unrelated experiment finished.
+    pub(crate) fn forget(&mut self, id: u64) {
+        self.indexes.retain(|(e, _, _, _)| *e != id);
+        self.column_store.retain(|(e, _)| *e != id);
+        self.direct.retain(|(e, _)| *e != id);
     }
 
-    pub fn hides_index(&self, collection: &str, field: &str, kind: IndexKind) -> bool {
+    pub fn is_empty(&self) -> bool {
+        self.indexes.is_empty() && self.column_store.is_empty() && self.direct.is_empty()
+    }
+
+    /// Whether anything at all is masked for experiment `id`.
+    pub(crate) fn is_empty_for(&self, id: u64) -> bool {
+        !self.indexes.iter().any(|(e, _, _, _)| *e == id)
+            && !self.column_store.iter().any(|(e, _)| *e == id)
+            && !self.direct.iter().any(|(e, _)| *e == id)
+    }
+
+    /// Whether this index is an unproven candidate that must stay hidden.
+    ///
+    /// `revealed` names the one experiment whose candidate the current query
+    /// is allowed to see — the canary path sets it while routing a query to
+    /// the candidate side. Every *other* experiment's structures stay hidden
+    /// regardless.
+    ///
+    /// That parameter is what makes concurrent experiments safe. A single
+    /// global "candidates are visible now" flag revealed every running
+    /// experiment's unproven structure at once, so one experiment's canary
+    /// query would be served using another experiment's untested index — and
+    /// each would be measuring the other.
+    pub fn hides_index(
+        &self,
+        revealed: Option<u64>,
+        collection: &str,
+        field: &str,
+        kind: IndexKind,
+    ) -> bool {
         self.indexes
             .iter()
-            .any(|(c, f, k)| c == collection && f == field && *k == kind)
+            .any(|(e, c, f, k)| Some(*e) != revealed && c == collection && f == field && *k == kind)
     }
 
-    pub fn hides_column_store(&self) -> bool {
+    /// Whether this collection's column store is an unproven candidate.
+    pub fn hides_column_store(&self, revealed: Option<u64>, collection: &str) -> bool {
         self.column_store
+            .iter()
+            .any(|(e, c)| Some(*e) != revealed && c == collection)
     }
 
-    pub fn hides_direct(&self) -> bool {
+    /// Whether this collection's direct array is an unproven candidate.
+    pub fn hides_direct(&self, revealed: Option<u64>, collection: &str) -> bool {
         self.direct
+            .iter()
+            .any(|(e, c)| Some(*e) != revealed && c == collection)
     }
 
     pub fn describe(&self) -> String {
         let mut parts: Vec<String> = self
             .indexes
             .iter()
-            .map(|(c, f, k)| format!("{} index on {c}.{f}", k.as_str()))
+            .map(|(_, c, f, k)| format!("{} index on {c}.{f}", k.as_str()))
             .collect();
-        if self.column_store {
-            parts.push("column store".into());
+        for (_, c) in &self.column_store {
+            parts.push(format!("column store on {c}"));
         }
-        if self.direct {
-            parts.push("direct lookup".into());
+        for (_, c) in &self.direct {
+            parts.push(format!("direct lookup on {c}"));
         }
         if parts.is_empty() {
             "nothing".into()
@@ -104,6 +186,22 @@ impl Candidates {
             parts.join(", ")
         }
     }
+}
+
+/// Whether two experiment scopes could see each other's traffic.
+///
+/// An experiment named by a collection takes only that collection's queries as
+/// evidence; one scoped globally (the empty string) takes every query. So two
+/// experiments are safe to run together exactly when their collections differ
+/// and neither is global.
+///
+/// Overlapping scopes would put both candidates in front of the same queries,
+/// and each would then be measuring the other's change as if it were noise in
+/// its own. That is the reason experiments used to be limited to one at a
+/// time; with per-experiment masking in place, this is the whole of what
+/// remains of that restriction.
+pub(crate) fn scopes_overlap(a: &str, b: &str) -> bool {
+    a.is_empty() || b.is_empty() || a == b
 }
 
 /// An experiment with its evidence, mid-flight.
@@ -301,17 +399,93 @@ mod tests {
     #[test]
     fn a_mask_matches_only_the_exact_structure_it_recorded() {
         let mut c = Candidates::default();
-        c.record(&Action::CreateIndex {
-            collection: "users".into(),
-            field: "country".into(),
-            kind: IndexKind::Hash,
-        });
-        assert!(c.hides_index("users", "country", IndexKind::Hash));
+        c.record(
+            1,
+            &Action::CreateIndex {
+                collection: "users".into(),
+                field: "country".into(),
+                kind: IndexKind::Hash,
+            },
+            "users",
+        );
+        assert!(c.hides_index(None, "users", "country", IndexKind::Hash));
         assert!(
-            !c.hides_index("users", "country", IndexKind::BTree),
+            !c.hides_index(None, "users", "country", IndexKind::BTree),
             "a hash candidate masked a pre-existing btree on the same field"
         );
-        assert!(!c.hides_index("orders", "country", IndexKind::Hash));
+        assert!(!c.hides_index(None, "orders", "country", IndexKind::Hash));
+    }
+
+    #[test]
+    fn a_candidate_on_one_collection_does_not_mask_another_collections_structures() {
+        // The defect this scoping fixed. `SetColumnStore` and
+        // `SetDirectLookup` are engine-wide actions, so when the mask held a
+        // single global flag, an experiment trialling a column store for
+        // `users` hid the column store for *every* collection — including
+        // `orders`, whose column store had been built and promoted long
+        // before. Unrelated queries got slower for the duration, and the
+        // baseline they were measured against moved while an experiment
+        // somewhere else was running.
+        let mut c = Candidates::default();
+        c.record(1, &Action::SetColumnStore(true), "users");
+        c.record(1, &Action::SetDirectLookup(true), "users");
+
+        assert!(c.hides_column_store(None, "users"));
+        assert!(c.hides_direct(None, "users"));
+        assert!(
+            !c.hides_column_store(None, "orders"),
+            "an experiment on users masked orders' column store"
+        );
+        assert!(
+            !c.hides_direct(None, "orders"),
+            "an experiment on users masked orders' direct array"
+        );
+    }
+
+    #[test]
+    fn retiring_one_experiment_leaves_anothers_mask_intact() {
+        // The blocker that made concurrent experiments *unsafe* rather than
+        // merely unimplemented: retirement used to clear the whole mask, so
+        // finishing experiment 1 would unmask experiment 2's unproven
+        // structure into live traffic the instant it happened.
+        let mut c = Candidates::default();
+        c.record(1, &Action::SetColumnStore(true), "users");
+        c.record(
+            2,
+            &Action::CreateIndex {
+                collection: "orders".into(),
+                field: "total".into(),
+                kind: IndexKind::Hash,
+            },
+            "orders",
+        );
+        assert!(c.hides_column_store(None, "users"));
+        assert!(c.hides_index(None, "orders", "total", IndexKind::Hash));
+
+        c.forget(1);
+        assert!(
+            !c.hides_column_store(None, "users"),
+            "experiment 1 was not unmasked"
+        );
+        assert!(
+            c.hides_index(None, "orders", "total", IndexKind::Hash),
+            "retiring experiment 1 exposed experiment 2's unproven index"
+        );
+        assert!(c.is_empty_for(1));
+        assert!(!c.is_empty_for(2));
+        assert!(!c.is_empty(), "the mask as a whole is not empty");
+    }
+
+    #[test]
+    fn a_global_scoped_candidate_masks_nothing_by_collection() {
+        // An experiment with no collection of its own has nothing to scope
+        // the mask to, so it records nothing rather than masking everything —
+        // the safe direction: an unmasked candidate is measured honestly as
+        // part of the baseline, where masking the wrong thing would take the
+        // "baseline" reading through the candidate itself.
+        let mut c = Candidates::default();
+        c.record(1, &Action::SetColumnStore(true), "");
+        assert!(c.is_empty());
     }
 
     #[test]
@@ -320,11 +494,15 @@ mod tests {
         // the sink must not leave the engine believing it has something to hide,
         // because there is no second copy to hide it from.
         let mut c = Candidates::default();
-        c.record(&Action::SetRecordCompression(true));
-        c.record(&Action::SetBufferPoolPages(4096));
-        c.record(&Action::FreezeSchema {
-            collection: "users".into(),
-        });
+        c.record(1, &Action::SetRecordCompression(true), "users");
+        c.record(1, &Action::SetBufferPoolPages(4096), "users");
+        c.record(
+            1,
+            &Action::FreezeSchema {
+                collection: "users".into(),
+            },
+            "users",
+        );
         assert!(c.is_empty());
     }
 
@@ -372,5 +550,30 @@ mod tests {
             e.experiment.candidate.errors, 0,
             "a baseline error was blamed on the candidate"
         );
+    }
+}
+
+#[cfg(test)]
+mod scope_overlap {
+    use super::scopes_overlap;
+
+    #[test]
+    fn the_same_collection_overlaps_with_itself() {
+        assert!(scopes_overlap("users", "users"));
+    }
+
+    #[test]
+    fn different_collections_do_not_overlap() {
+        assert!(!scopes_overlap("users", "orders"));
+    }
+
+    /// A global experiment takes every query as evidence, so it overlaps with
+    /// everything — in both directions, which is the part an asymmetric
+    /// implementation would get wrong.
+    #[test]
+    fn a_global_scope_overlaps_with_everything() {
+        assert!(scopes_overlap("", "users"));
+        assert!(scopes_overlap("users", ""));
+        assert!(scopes_overlap("", ""));
     }
 }

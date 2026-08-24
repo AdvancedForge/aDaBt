@@ -39,6 +39,12 @@ use adabt_core::policy::Policy;
 
 /// One candidate for inclusion in a configuration.
 pub struct Candidate<'a> {
+    /// Unique identity of this candidate — an optimization can appear once
+    /// per scope, so the name alone does not identify one. The caller maps
+    /// this back to whatever it was derived from.
+    pub key: String,
+    /// The optimization's name, used for coherence: `conflicts_with` and
+    /// `prerequisites` are declared between optimizations, not scopes.
     pub name: &'a str,
     pub meta: &'a OptMeta,
     /// This candidate's score on its own, as the greedy driver computes it.
@@ -50,7 +56,8 @@ pub struct Candidate<'a> {
 /// A scored combination.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Combination {
-    pub names: Vec<String>,
+    /// `Candidate::key`s of the chosen members.
+    pub keys: Vec<String>,
     pub total: f64,
     pub ram_bytes: i64,
 }
@@ -135,7 +142,7 @@ pub fn best_combination(candidates: &[Candidate<'_>], policy: &Policy) -> Option
         };
         if better {
             best = Some(Combination {
-                names: chosen.iter().map(|c| c.name.to_string()).collect(),
+                keys: chosen.iter().map(|c| c.key.clone()).collect(),
                 total,
                 ram_bytes: ram,
             });
@@ -171,6 +178,7 @@ mod tests {
 
     fn cand<'a>(name: &'a str, m: &'a OptMeta, score: f64, ram: i64) -> Candidate<'a> {
         Candidate {
+            key: name.to_string(),
             name,
             meta: m,
             solo_score: score,
@@ -188,7 +196,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(got.total, 3.0);
-        assert_eq!(got.names.len(), 2);
+        assert_eq!(got.keys.len(), 2);
     }
 
     #[test]
@@ -200,7 +208,7 @@ mod tests {
             &Policy::conventional(),
         )
         .unwrap();
-        assert_eq!(got.names, vec!["b"], "should keep the higher scorer alone");
+        assert_eq!(got.keys, vec!["b"], "should keep the higher scorer alone");
         assert_eq!(got.total, 2.0);
     }
 
@@ -218,8 +226,8 @@ mod tests {
             &Policy::conventional(),
         )
         .unwrap();
-        assert!(got.names.contains(&"base".to_string()));
-        assert!(got.names.contains(&"dependent".to_string()));
+        assert!(got.keys.contains(&"base".to_string()));
+        assert!(got.keys.contains(&"dependent".to_string()));
         assert_eq!(got.total, 5.5);
     }
 
@@ -259,7 +267,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(got.total, 5.0, "search did not beat the greedy choice");
-        assert!(!got.names.contains(&"big".to_string()));
+        assert!(!got.keys.contains(&"big".to_string()));
         assert!(got.ram_bytes <= 100);
     }
 

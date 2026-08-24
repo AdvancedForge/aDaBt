@@ -1,0 +1,33 @@
+# Deliberately its own workspace, not a member of the one above.
+#
+# aDaBt's library crates have exactly one external dependency (`thiserror`),
+# and that is a property worth keeping. A comparison against SQLite needs
+# SQLite, which means a C compiler and a vendored amalgamation — none of which
+# should be able to reach the shipped library. Excluding this from the
+# workspace makes that structural rather than a matter of discipline:
+# `cargo build` at the root cannot pull any of it in.
+[workspace]
+
+[package]
+name = "adabt-comparison"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[dependencies]
+adabt-core = { path = "../crates/adabt-core" }
+adabt-engine = { path = "../crates/adabt-engine" }
+adabt-ir = { path = "../crates/adabt-ir" }
+# `bundled` compiles SQLite from vendored C rather than linking a system
+# library, so the comparison measures a known version on any machine instead of
+# whatever happened to be installed.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[[bin]]
+name = "adabt-comparison"
+path = "src/main.rs"
+
+[profile.release]
+debug = 1
+lto = "thin"
+codegen-units = 1

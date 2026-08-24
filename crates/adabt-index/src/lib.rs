@@ -68,6 +68,38 @@ pub trait Index: Send {
         }
     }
 
+    /// Fields this index stores alongside the ids. Empty for an ordinary one.
+    ///
+    /// An index that carries a projection of each indexed record can answer a
+    /// query *entirely from the index*, with no fetch at all. That matters
+    /// here more than it does in most engines: the fetch is the measured
+    /// majority of what a lookup costs (see `docs/m36-notes.md`), so removing
+    /// it is not a constant-factor saving but the removal of the dominant
+    /// term.
+    fn covers(&self) -> &[String] {
+        &[]
+    }
+
+    /// The stored projection for `id`, when this index carries one.
+    ///
+    /// Returning `None` means "no projection here" and never "the record has
+    /// no fields" — the same `None`-versus-empty distinction `range` makes,
+    /// and for the same reason: a caller that confused them would serve empty
+    /// records instead of falling back to the heap.
+    fn covered(&self, _id: RecordId) -> Option<&Record> {
+        None
+    }
+
+    /// Whether this index holds only the records satisfying some condition.
+    ///
+    /// A partial index is smaller and cheaper to maintain, and is only a legal
+    /// access path for a query whose own predicate guarantees every row it
+    /// wants is present. `None` means the index holds every record with the
+    /// field, which is always safe to read.
+    fn condition(&self) -> Option<&str> {
+        None
+    }
+
     /// Fraction of entries that share their key with another entry. A
     /// selectivity near zero means the index pinpoints records; near one means
     /// it barely narrows anything and is probably not worth its upkeep.
@@ -773,5 +805,611 @@ mod tests {
         assert_eq!(idx.entry_count(), 50);
         assert_eq!(idx.key_count(), 5);
         assert_eq!(idx.lookup(&Value::I64(2)).len(), 10);
+    }
+}
+
+// -- composite ---------------------------------------------------------
+
+/// Separator joining a composite index's field names into the single name
+/// `Index::field` must return.
+///
+/// A NUL cannot appear in a field name the logical API accepts, so the join
+/// is unambiguous and a composite index can never collide with a
+/// single-field one — which also means the existing single-field planner
+/// path simply never matches a composite index, rather than matching one
+/// wrongly.
+pub const COMPOSITE_SEP: char = '\u{0}';
+
+/// The name a composite index over `fields` answers to.
+pub fn composite_name(fields: &[String]) -> String {
+    fields.join(&COMPOSITE_SEP.to_string())
+}
+
+/// Split a composite index's name back into its fields.
+pub fn composite_fields(name: &str) -> Vec<String> {
+    name.split(COMPOSITE_SEP).map(|s| s.to_string()).collect()
+}
+
+/// An index over several fields at once.
+///
+/// # Why this needed no new key type
+///
+/// A composite key is just the tuple of its fields' values, and `Value`
+/// already has a `List` variant with a total `Ord` and a `Hash` that agrees
+/// with it. So the key is `Value::List(vec![v1, v2, ...])` and the whole
+/// existing `Core`/`KeyMap` machinery — sorted id lists, key removal when
+/// the last entry goes, the running memory estimate — works unchanged.
+/// Inventing a parallel multi-value key type would have duplicated all of
+/// that for no gain.
+///
+/// # What it deliberately does not do
+///
+/// **Equality on every field, or nothing.** A composite index over
+/// `(a, b)` serves `a = 1 AND b = 2`. It does *not* serve `a = 1` alone:
+/// that would need the key ordering to be a prefix ordering and the lookup
+/// to be a range scan over it, which a hash-backed structure cannot do at
+/// all. `BTreeIndex`-backed prefix lookups are a real extension and are not
+/// claimed here — see `supports_prefix_lookup`, which returns false, rather
+/// than a comment nobody checks.
+///
+/// A record missing *any* of the fields is not indexed, matching the
+/// single-field rule that a record without the field is simply absent.
+pub struct CompositeIndex {
+    fields: Vec<String>,
+    name: String,
+    core: Core<HashMap<Value, Vec<RecordId>>>,
+}
+
+impl CompositeIndex {
+    pub fn new(fields: Vec<String>) -> Self {
+        let name = composite_name(&fields);
+        Self {
+            core: Core::new(name.clone()),
+            fields,
+            name,
+        }
+    }
+
+    pub fn build<'a>(
+        fields: Vec<String>,
+        records: impl Iterator<Item = (RecordId, &'a Record)>,
+    ) -> Self {
+        let mut idx = Self::new(fields);
+        for (id, rec) in records {
+            idx.index_record(id, rec);
+        }
+        idx
+    }
+
+    /// The fields this index covers, in order.
+    pub fn fields(&self) -> &[String] {
+        &self.fields
+    }
+
+    /// Whether this index can answer a lookup on a proper prefix of its
+    /// fields. It cannot: see the type docs.
+    pub fn supports_prefix_lookup(&self) -> bool {
+        false
+    }
+
+    /// The key for a record, or `None` when any covered field is absent or
+    /// null — the composite equivalent of the single-field rule that a
+    /// record without the field is not indexed.
+    fn key_for(&self, rec: &Record) -> Option<Value> {
+        let mut parts = Vec::with_capacity(self.fields.len());
+        for f in &self.fields {
+            let v = rec.get(f)?;
+            if v.is_null() {
+                return None;
+            }
+            parts.push(v.clone());
+        }
+        Some(Value::List(parts))
+    }
+
+    /// The key a set of equality constraints implies, when they cover every
+    /// field of this index. `None` when any field is unconstrained — which
+    /// is exactly when this index cannot serve the predicate.
+    pub fn key_from_equalities(&self, equalities: &[(String, Value)]) -> Option<Value> {
+        let mut parts = Vec::with_capacity(self.fields.len());
+        for f in &self.fields {
+            let v = equalities.iter().find(|(name, _)| name == f)?;
+            parts.push(v.1.clone());
+        }
+        Some(Value::List(parts))
+    }
+}
+
+impl Index for CompositeIndex {
+    fn kind(&self) -> IndexKind {
+        IndexKind::Hash
+    }
+    fn field(&self) -> &str {
+        &self.name
+    }
+    fn insert(&mut self, key: Value, id: RecordId) {
+        self.core.insert(key, id)
+    }
+    fn remove(&mut self, key: &Value, id: RecordId) {
+        self.core.remove(key, id)
+    }
+    fn lookup(&self, key: &Value) -> Vec<RecordId> {
+        self.core.lookup(key)
+    }
+    /// Declines, like every hash-backed index here.
+    fn range(&self, _lo: Bound<&Value>, _hi: Bound<&Value>) -> Option<Vec<RecordId>> {
+        None
+    }
+    fn snapshot(&self) -> Vec<(Value, Vec<RecordId>)> {
+        self.core.map.pairs()
+    }
+    fn key_count(&self) -> usize {
+        self.core.map.len()
+    }
+    fn entry_count(&self) -> usize {
+        self.core.entries
+    }
+    fn memory_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.core.memory_bytes()
+    }
+
+    /// Overridden because the composite key spans several fields; the
+    /// default implementation reads exactly one.
+    fn index_record(&mut self, id: RecordId, rec: &Record) {
+        if let Some(k) = self.key_for(rec) {
+            self.insert(k, id);
+        }
+    }
+
+    fn unindex_record(&mut self, id: RecordId, rec: &Record) {
+        if let Some(k) = self.key_for(rec) {
+            self.remove(&k, id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod composite_tests {
+    use super::*;
+
+    fn rec(a: i64, b: &str) -> Record {
+        Record::new().with("a", a).with("b", b)
+    }
+
+    fn idx() -> CompositeIndex {
+        CompositeIndex::new(vec!["a".into(), "b".into()])
+    }
+
+    #[test]
+    fn a_composite_index_matches_only_the_full_tuple() {
+        let mut i = idx();
+        i.index_record(RecordId(1), &rec(1, "x"));
+        i.index_record(RecordId(2), &rec(1, "y"));
+        i.index_record(RecordId(3), &rec(2, "x"));
+
+        let key = |a: i64, b: &str| Value::List(vec![Value::I64(a), Value::Str(b.into())]);
+        assert_eq!(i.lookup(&key(1, "x")), vec![RecordId(1)]);
+        assert_eq!(i.lookup(&key(1, "y")), vec![RecordId(2)]);
+        assert!(i.lookup(&key(9, "z")).is_empty());
+        assert_eq!(i.entry_count(), 3);
+        assert_eq!(i.key_count(), 3);
+    }
+
+    #[test]
+    fn a_record_missing_any_covered_field_is_not_indexed() {
+        let mut i = idx();
+        i.index_record(RecordId(1), &Record::new().with("a", 1i64));
+        i.index_record(RecordId(2), &Record::new().with("b", "x"));
+        i.index_record(
+            RecordId(3),
+            &Record::new().with("a", 1i64).with("b", Value::Null),
+        );
+        assert_eq!(i.entry_count(), 0, "a partial record was indexed");
+    }
+
+    #[test]
+    fn equalities_covering_every_field_produce_a_key() {
+        let i = idx();
+        let eqs = vec![
+            ("b".to_string(), Value::Str("x".into())),
+            ("a".to_string(), Value::I64(1)),
+        ];
+        // Order of the constraints must not matter; the index's own field
+        // order is what fixes the key.
+        assert_eq!(
+            i.key_from_equalities(&eqs),
+            Some(Value::List(vec![Value::I64(1), Value::Str("x".into())]))
+        );
+    }
+
+    #[test]
+    fn equalities_missing_a_field_produce_no_key() {
+        // The case that makes a composite index unusable for a predicate,
+        // and the reason the planner must ask before choosing one.
+        let i = idx();
+        let eqs = vec![("a".to_string(), Value::I64(1))];
+        assert_eq!(i.key_from_equalities(&eqs), None);
+        assert!(!i.supports_prefix_lookup());
+    }
+
+    #[test]
+    fn removal_is_exact() {
+        let mut i = idx();
+        i.index_record(RecordId(1), &rec(1, "x"));
+        i.index_record(RecordId(2), &rec(1, "x"));
+        i.unindex_record(RecordId(1), &rec(1, "x"));
+        let key = Value::List(vec![Value::I64(1), Value::Str("x".into())]);
+        assert_eq!(i.lookup(&key), vec![RecordId(2)]);
+    }
+
+    #[test]
+    fn names_round_trip_through_the_separator() {
+        let fields = vec!["country".to_string(), "age".to_string()];
+        let name = composite_name(&fields);
+        assert_eq!(composite_fields(&name), fields);
+        // And it cannot be confused with a single field of the same text.
+        assert_ne!(name, "countryage");
+    }
+
+    #[test]
+    fn build_reconstructs_from_records() {
+        let rows: Vec<(RecordId, Record)> = (0..20u64)
+            .map(|i| (RecordId(i), rec((i % 4) as i64, "x")))
+            .collect();
+        let i = CompositeIndex::build(
+            vec!["a".into(), "b".into()],
+            rows.iter().map(|(id, r)| (*id, r)),
+        );
+        assert_eq!(i.entry_count(), 20);
+        assert_eq!(i.key_count(), 4);
+    }
+}
+
+// -- covering and partial indexes ----------------------------------------
+
+/// Separator between an index's field and its covered projection in a name.
+///
+/// Same trick and the same reason as [`COMPOSITE_SEP`]: a name has to survive
+/// a round trip through the catalog, and it must not be able to collide with
+/// an ordinary index name. `\u{1}` cannot appear in an accepted field name, so
+/// `country\u{1}city\u{0}population` is unambiguously "index on country,
+/// covering city and population" and can never be a field somebody declared.
+pub const COVER_SEP: char = '\u{1}';
+
+/// Name for an index on `field` carrying `covers`.
+pub fn covering_name(field: &str, covers: &[String]) -> String {
+    if covers.is_empty() {
+        return field.to_string();
+    }
+    format!(
+        "{field}{COVER_SEP}{}",
+        covers.join(&COMPOSITE_SEP.to_string())
+    )
+}
+
+/// Split a covering index's name back into its field and its projection.
+pub fn covering_parts(name: &str) -> (String, Vec<String>) {
+    match name.split_once(COVER_SEP) {
+        None => (name.to_string(), Vec::new()),
+        Some((field, rest)) => (
+            field.to_string(),
+            rest.split(COMPOSITE_SEP).map(str::to_string).collect(),
+        ),
+    }
+}
+
+/// An index that also stores a projection of each record it indexes.
+///
+/// # What it buys, and what it costs
+///
+/// An ordinary index answers "which ids" and the executor then fetches each
+/// one. This stores the fields the query needs next to the id, so a query
+/// whose output is contained in the projection never touches the heap.
+///
+/// The cost is symmetric and worth stating plainly: the projection is a second
+/// copy of that data, so the index is larger, and *every write to a covered
+/// field must update it* — not just writes to the indexed field. That is
+/// strictly more maintenance than an ordinary index, which is exactly why
+/// this is worth building only when the read side actually uses it.
+///
+/// # Rebuildability
+///
+/// Held to the same invariant as everything else derived: the projection comes
+/// from the records and can be rebuilt from them, so losing this index costs a
+/// rebuild and never a record.
+pub struct CoveringIndex {
+    inner: Box<dyn Index>,
+    covers: Vec<String>,
+    /// Projection per indexed id. Sorted, so `snapshot`-driven rebuilds and
+    /// iteration are deterministic.
+    rows: BTreeMap<RecordId, Record>,
+    name: String,
+    bytes: usize,
+}
+
+impl CoveringIndex {
+    pub fn new(field: impl Into<String>, covers: Vec<String>, kind: IndexKind) -> Self {
+        let field = field.into();
+        let inner: Box<dyn Index> = match kind {
+            IndexKind::BTree => Box::new(BTreeIndex::new(field.clone())),
+            IndexKind::Bitmap => Box::new(BitmapIndex::new(field.clone())),
+            IndexKind::Hash => Box::new(HashIndex::new(field.clone())),
+        };
+        Self {
+            name: covering_name(&field, &covers),
+            inner,
+            covers,
+            rows: BTreeMap::new(),
+            bytes: 0,
+        }
+    }
+
+    pub fn build<'a>(
+        field: impl Into<String>,
+        covers: Vec<String>,
+        kind: IndexKind,
+        records: impl Iterator<Item = (RecordId, &'a Record)>,
+    ) -> Self {
+        let mut idx = Self::new(field, covers, kind);
+        for (id, rec) in records {
+            idx.index_record(id, rec);
+        }
+        idx
+    }
+
+    fn projection_of(&self, rec: &Record) -> Record {
+        let names: Vec<&str> = self.covers.iter().map(String::as_str).collect();
+        rec.project(&names)
+    }
+}
+
+impl Index for CoveringIndex {
+    fn kind(&self) -> IndexKind {
+        self.inner.kind()
+    }
+    /// The *name*, not the bare field: this is what the catalog stores and what
+    /// `Database` keys its index map by, and two indexes on the same field with
+    /// different projections are different indexes.
+    fn field(&self) -> &str {
+        &self.name
+    }
+    fn insert(&mut self, key: Value, id: RecordId) {
+        self.inner.insert(key, id)
+    }
+    fn remove(&mut self, key: &Value, id: RecordId) {
+        self.inner.remove(key, id)
+    }
+    fn lookup(&self, key: &Value) -> Vec<RecordId> {
+        self.inner.lookup(key)
+    }
+    fn range(&self, lo: Bound<&Value>, hi: Bound<&Value>) -> Option<Vec<RecordId>> {
+        self.inner.range(lo, hi)
+    }
+    fn snapshot(&self) -> Vec<(Value, Vec<RecordId>)> {
+        self.inner.snapshot()
+    }
+    fn key_count(&self) -> usize {
+        self.inner.key_count()
+    }
+    fn entry_count(&self) -> usize {
+        self.inner.entry_count()
+    }
+    fn memory_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.inner.memory_bytes() + self.bytes
+    }
+    fn covers(&self) -> &[String] {
+        &self.covers
+    }
+    fn covered(&self, id: RecordId) -> Option<&Record> {
+        self.rows.get(&id)
+    }
+
+    /// Indexes on the *underlying* field, and stores the projection beside it.
+    ///
+    /// Deliberately written out rather than delegating to `inner`: the two
+    /// halves must agree about which records are present, because a lookup
+    /// returns ids from `inner` and the covering path then reads `rows` for
+    /// each. An id in one and not the other would serve a row with no fields.
+    fn index_record(&mut self, id: RecordId, rec: &Record) {
+        let field = {
+            let f = self.inner.field();
+            f.to_string()
+        };
+        match rec.get(&field) {
+            Some(v) if !v.is_null() => {
+                self.inner.insert(v.clone(), id);
+                let projection = self.projection_of(rec);
+                self.bytes += projection.approx_size() + ID_BYTES + NODE_OVERHEAD;
+                if let Some(old) = self.rows.insert(id, projection) {
+                    self.bytes = self
+                        .bytes
+                        .saturating_sub(old.approx_size() + ID_BYTES + NODE_OVERHEAD);
+                }
+            }
+            _ => {
+                // Not indexed, so not covered either — the two stay in step.
+                if let Some(old) = self.rows.remove(&id) {
+                    self.bytes = self
+                        .bytes
+                        .saturating_sub(old.approx_size() + ID_BYTES + NODE_OVERHEAD);
+                }
+            }
+        }
+    }
+
+    fn unindex_record(&mut self, id: RecordId, rec: &Record) {
+        let field = self.inner.field().to_string();
+        if let Some(v) = rec.get(&field) {
+            if !v.is_null() {
+                self.inner.remove(v, id);
+            }
+        }
+        if let Some(old) = self.rows.remove(&id) {
+            self.bytes = self
+                .bytes
+                .saturating_sub(old.approx_size() + ID_BYTES + NODE_OVERHEAD);
+        }
+    }
+}
+
+/// Separator between an index's field and its condition in a name.
+pub const PARTIAL_SEP: char = '\u{2}';
+
+/// Name for an index on `field` restricted to `condition`.
+pub fn partial_name(field: &str, condition: &str) -> String {
+    format!("{field}{PARTIAL_SEP}{condition}")
+}
+
+/// Split a partial index's name back into its field and its condition.
+pub fn partial_parts(name: &str) -> (String, Option<String>) {
+    match name.split_once(PARTIAL_SEP) {
+        None => (name.to_string(), None),
+        Some((field, cond)) => (field.to_string(), Some(cond.to_string())),
+    }
+}
+
+/// An index holding only the records that satisfy a condition.
+///
+/// # Why this is worth having
+///
+/// Most indexes are mostly dead weight. An index on `orders.status` where
+/// 99% of rows are `shipped` and every query asks for `pending` still stores
+/// and maintains all of them. A partial index stores the 1%, which makes it
+/// smaller, faster to probe, and — the part that matters most on this engine —
+/// far cheaper to *maintain*, since a write to a record that fails the
+/// condition touches nothing.
+///
+/// # Why using one is the hard part
+///
+/// A partial index is only a legal access path for a query whose own predicate
+/// guarantees every row it wants is present. Deciding that in general is
+/// predicate implication, which is undecidable in the limit and expensive well
+/// before that. This engine does not attempt it.
+///
+/// Instead the condition is stored as its canonical *text*, and a query may
+/// use the index only when its predicate contains a syntactically identical
+/// conjunct. That is far weaker than real implication — `age > 20` will not
+/// match an index conditioned on `age > 18`, though it plainly should — and it
+/// is deliberately so. The failure mode of being too weak is a slower plan.
+/// The failure mode of being too clever is wrong answers.
+pub struct PartialIndex {
+    inner: Box<dyn Index>,
+    /// The canonical text of the condition, and the predicate it came from.
+    condition: String,
+    predicate: adabt_ir::Expr,
+    name: String,
+}
+
+impl PartialIndex {
+    pub fn new(
+        field: impl Into<String>,
+        predicate: adabt_ir::Expr,
+        encoded_condition: impl Into<String>,
+        kind: IndexKind,
+    ) -> Self {
+        let field = field.into();
+        let condition = encoded_condition.into();
+        let inner: Box<dyn Index> = match kind {
+            IndexKind::BTree => Box::new(BTreeIndex::new(field.clone())),
+            IndexKind::Bitmap => Box::new(BitmapIndex::new(field.clone())),
+            IndexKind::Hash => Box::new(HashIndex::new(field.clone())),
+        };
+        Self {
+            name: partial_name(&field, &condition),
+            inner,
+            condition,
+            predicate,
+        }
+    }
+
+    pub fn build<'a>(
+        field: impl Into<String>,
+        predicate: adabt_ir::Expr,
+        encoded_condition: impl Into<String>,
+        kind: IndexKind,
+        records: impl Iterator<Item = (RecordId, &'a Record)>,
+    ) -> Self {
+        let mut idx = Self::new(field, predicate, encoded_condition, kind);
+        for (id, rec) in records {
+            idx.index_record(id, rec);
+        }
+        idx
+    }
+
+    /// Whether a record belongs in this index.
+    ///
+    /// `Unknown` is treated as "no", the same way a `WHERE` clause treats it.
+    /// A record whose condition cannot be evaluated is not one the condition
+    /// is known to hold for, and admitting it would put rows in the index that
+    /// a query relying on the condition would not expect.
+    fn admits(&self, rec: &Record) -> bool {
+        self.predicate.evaluate(rec) == adabt_ir::Truth::True
+    }
+}
+
+impl Index for PartialIndex {
+    fn kind(&self) -> IndexKind {
+        self.inner.kind()
+    }
+    fn field(&self) -> &str {
+        &self.name
+    }
+    fn insert(&mut self, key: Value, id: RecordId) {
+        self.inner.insert(key, id)
+    }
+    fn remove(&mut self, key: &Value, id: RecordId) {
+        self.inner.remove(key, id)
+    }
+    fn lookup(&self, key: &Value) -> Vec<RecordId> {
+        self.inner.lookup(key)
+    }
+    fn range(&self, lo: Bound<&Value>, hi: Bound<&Value>) -> Option<Vec<RecordId>> {
+        self.inner.range(lo, hi)
+    }
+    fn snapshot(&self) -> Vec<(Value, Vec<RecordId>)> {
+        self.inner.snapshot()
+    }
+    fn key_count(&self) -> usize {
+        self.inner.key_count()
+    }
+    fn entry_count(&self) -> usize {
+        self.inner.entry_count()
+    }
+    fn memory_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.inner.memory_bytes() + self.condition.len()
+    }
+    fn condition(&self) -> Option<&str> {
+        Some(&self.condition)
+    }
+
+    fn index_record(&mut self, id: RecordId, rec: &Record) {
+        let field = self.inner.field().to_string();
+        if !self.admits(rec) {
+            // A record that no longer qualifies must leave, not merely fail to
+            // be added: `index_record` is what an update calls, and the old
+            // version may well have qualified.
+            if let Some(v) = rec.get(&field) {
+                self.inner.remove(v, id);
+            }
+            return;
+        }
+        if let Some(v) = rec.get(&field) {
+            if !v.is_null() {
+                self.inner.insert(v.clone(), id);
+            }
+        }
+    }
+
+    fn unindex_record(&mut self, id: RecordId, rec: &Record) {
+        let field = self.inner.field().to_string();
+        // Unconditionally, without consulting the condition. Whether the record
+        // qualifies is irrelevant when it is being removed, and an index that
+        // only removed qualifying records would leak entries every time a
+        // record stopped qualifying before it was deleted.
+        if let Some(v) = rec.get(&field) {
+            if !v.is_null() {
+                self.inner.remove(v, id);
+            }
+        }
     }
 }

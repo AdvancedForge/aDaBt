@@ -13,6 +13,9 @@ members = [
     "crates/adabt-bench",
     "crates/adabt-server",
 ]
+exclude = [
+    "comparison",
+]
 
 [workspace.package]
 version = "0.0.1"

@@ -89,6 +89,22 @@ pub enum Event<'a> {
         field: &'a str,
         equality: bool,
     },
+    /// A query pinned several fields to literals at once.
+    ///
+    /// Distinct from a run of `FieldFiltered` events, and the distinction is
+    /// the whole point: knowing that `country` and `age` are each filtered
+    /// often says nothing about whether they are filtered *together*, and a
+    /// composite index is only worth building for the fields that are. This
+    /// is the signal that made composite index selection possible — the
+    /// structure existed and nothing could choose it, because nothing
+    /// recorded co-occurrence.
+    ///
+    /// The field list arrives sorted and de-duplicated, so `(country, age)`
+    /// and `(age, country)` are the same observation.
+    FieldsPinnedTogether {
+        collection: &'a str,
+        fields: &'a [String],
+    },
     /// An index was maintained on the write path — one entry inserted or
     /// removed because a record changed.
     ///

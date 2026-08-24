@@ -75,6 +75,24 @@ pub trait LogicalStore {
     fn scan(&mut self, collection: &str) -> Result<Vec<(RecordId, Record)>>;
 
     fn count(&mut self, collection: &str) -> Result<usize>;
+
+    /// The ids of every live record, ascending — without reading the records.
+    ///
+    /// The executor needs ids alone to drive a scan: it sorts them, then
+    /// fetches each one. Serving that from `scan` means decoding the entire
+    /// collection and throwing every record away, so a full scan decodes the
+    /// collection twice and pays the second decode for nothing.
+    ///
+    /// The default is the honest one for a store that cannot do better: same
+    /// ids, same order, same cost as before. Overriding it is an optimization,
+    /// and the contract it must keep is that the ids are exactly `scan`'s.
+    fn ids(&mut self, collection: &str) -> Result<Vec<RecordId>> {
+        Ok(self
+            .scan(collection)?
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect())
+    }
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@ pub mod compiled;
 pub mod database;
 pub mod direct;
 pub mod experiment;
+pub mod exprcodec;
 pub mod infer;
 pub mod matview;
 pub mod optimizations;

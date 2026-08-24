@@ -1643,7 +1643,21 @@ impl HeapStore {
         self.pool.set_capacity(pages)
     }
 
+    /// Read one record out of the page it lives on.
+    ///
+    /// The codec is resolved *before* the page, and by touching
+    /// `self.collections` directly rather than through `coll`. Both matter:
+    /// `decompress` now borrows the page rather than copying it, so the
+    /// decoded bytes hold a borrow of `self.pool` for the rest of the
+    /// function. A `&self` method like `coll` borrows the whole struct and
+    /// would conflict with that; naming the two fields separately lets the
+    /// borrow checker see they are disjoint.
     fn read_at(&mut self, collection: &str, loc: RecordLocation) -> Result<Record> {
+        let codec = &self
+            .collections
+            .get(collection)
+            .ok_or_else(|| Error::NoSuchCollection(collection.to_string()))?
+            .codec;
         let page = self.pool.get(loc.page)?;
         let payload = page.get(loc.slot)?;
         if payload.len() < SLOT_PREFIX {
@@ -1653,7 +1667,7 @@ impl HeapStore {
         }
         let encoding = crate::compress::Encoding::from_bit(payload[SLOT_PREFIX - 1])?;
         let bytes = crate::compress::decompress(encoding, &payload[SLOT_PREFIX..])?;
-        self.coll(collection)?.codec.decode(&bytes)
+        codec.decode(&bytes)
     }
 }
 
@@ -1779,6 +1793,21 @@ impl LogicalStore for HeapStore {
             .values()
             .filter(|v| !v.is_absent())
             .count())
+    }
+
+    /// Straight off the in-memory page directory: no pages, no decodes.
+    ///
+    /// The filter matches `scan`'s exactly — `newest()` is `None` for a record
+    /// whose newest version is a tombstone — because the two must agree. They
+    /// are the same question asked at different costs, and a scan driven by
+    /// ids that disagreed with `scan` would drop or invent rows.
+    fn ids(&mut self, collection: &str) -> Result<Vec<RecordId>> {
+        Ok(self
+            .coll(collection)?
+            .directory
+            .iter()
+            .filter_map(|(k, v)| v.newest().map(|_| *k))
+            .collect())
     }
 }
 

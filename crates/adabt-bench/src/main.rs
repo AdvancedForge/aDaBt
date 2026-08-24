@@ -9,6 +9,7 @@
 mod harness;
 mod queries;
 mod resources;
+mod scale;
 mod soak;
 mod workload;
 
@@ -386,6 +387,42 @@ fn main() {
             }
         }
 
+        "scale" => {
+            let max = arg(&args, "--max-rows")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8_000_000u64);
+            let budget = arg(&args, "--budget-mb")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1_500u64);
+            let pool_pages: usize = arg(&args, "--pool-pages")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            scale::run(&data_dir, max, budget, pool_pages);
+        }
+        "fetch-profile" => {
+            let rows = arg(&args, "--size")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(50_000u64);
+            let reps: u32 = arg(&args, "--reps")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3);
+            scale::fetch_profile(rows, reps);
+        }
+        "record-repr" => {
+            let rows = arg(&args, "--size")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(200_000u64);
+            let reps: u32 = arg(&args, "--reps")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5);
+            scale::record_repr(rows, reps);
+        }
+        "index-scale" => {
+            let rows = arg(&args, "--size")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1_000_000u64);
+            scale::index_comparison(rows);
+        }
         "compiled" => {
             let scratch = Scratch::new(&data_dir, "compiled");
             let mut policy = Policy::manual(10);

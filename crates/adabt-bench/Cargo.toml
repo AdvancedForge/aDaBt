@@ -11,7 +11,9 @@ adabt-telemetry.workspace = true
 adabt-testkit.workspace = true
 adabt-storage.workspace = true
 adabt-engine.workspace = true
+adabt-index.workspace = true
 adabt-ir.workspace = true
+adabt-exec.workspace = true
 adabt-opt.workspace = true
 
 [[bin]]

@@ -8,6 +8,8 @@ version = "0.0.1"
 dependencies = [
  "adabt-core",
  "adabt-engine",
+ "adabt-exec",
+ "adabt-index",
  "adabt-ir",
  "adabt-opt",
  "adabt-storage",
@@ -52,6 +54,7 @@ name = "adabt-index"
 version = "0.0.1"
 dependencies = [
  "adabt-core",
+ "adabt-ir",
  "adabt-testkit",
 ]
 

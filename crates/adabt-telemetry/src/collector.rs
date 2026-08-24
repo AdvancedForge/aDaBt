@@ -70,6 +70,14 @@ pub struct Snapshot {
     pub field_filters: HashMap<(String, String), u64>,
     /// Of those, how many were equality predicates.
     pub equality_filters: HashMap<(String, String), u64>,
+    /// How often each *set* of fields was pinned to literals by one query.
+    ///
+    /// Keyed by collection and the sorted field list, so the key is the
+    /// question a composite index answers: "were these fields constrained at
+    /// the same time". Only sets of two or more are recorded — a single field
+    /// is already covered by `equality_filters`, and storing it twice would
+    /// let the two disagree.
+    pub pinned_sets: HashMap<(String, Vec<String>), u64>,
     /// `(collection, field) -> times the planner chose that index`.
     pub index_usage: HashMap<(String, String), u64>,
     /// `(collection, field)` -> index entries written on the write path.
@@ -124,6 +132,24 @@ impl Snapshot {
                 .then(a.0.cmp(&b.0))
         });
         v.truncate(n);
+        v
+    }
+
+    /// Field sets pinned together, most frequent first.
+    ///
+    /// The signal a composite index is chosen from. Ranked rather than
+    /// filtered here so the caller decides what threshold is worth acting on
+    /// — this crate measures and does not judge.
+    pub fn most_pinned_sets(&self) -> Vec<(String, Vec<String>, u64)> {
+        let mut v: Vec<(String, Vec<String>, u64)> = self
+            .pinned_sets
+            .iter()
+            .map(|((c, f), n)| (c.clone(), f.clone(), *n))
+            .collect();
+        // By count, then by the key, so equal counts rank deterministically
+        // rather than by hash order — a proposal that changed between runs on
+        // identical traffic would make every experiment irreproducible.
+        v.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
         v
     }
 
@@ -188,6 +214,7 @@ struct Shard {
     cache_misses: HashMap<&'static str, u64>,
     field_filters: HashMap<(String, String), u64>,
     equality_filters: HashMap<(String, String), u64>,
+    pinned_sets: HashMap<(String, Vec<String>), u64>,
     index_usage: HashMap<(String, String), u64>,
     index_maintenance: HashMap<(String, String), u64>,
     touches: u64,
@@ -262,6 +289,9 @@ impl CollectingProbe {
             }
             for (k, v) in &g.equality_filters {
                 *out.equality_filters.entry(k.clone()).or_default() += v;
+            }
+            for (k, v) in &g.pinned_sets {
+                *out.pinned_sets.entry(k.clone()).or_default() += v;
             }
             out.touches += g.touches;
             if let Some(t) = &mut out.temperature {
@@ -372,6 +402,12 @@ impl Probe for CollectingProbe {
             Event::Touch { id, .. } => {
                 g.touches += 1;
                 g.temperature.observe(id.0);
+            }
+            Event::FieldsPinnedTogether { collection, fields } => {
+                if fields.len() > 1 {
+                    let key = (collection.to_string(), fields.to_vec());
+                    *g.pinned_sets.entry(key).or_default() += 1;
+                }
             }
             Event::FieldFiltered {
                 collection,

@@ -33,10 +33,12 @@ use std::collections::HashMap;
 use crate::config::OptimizationConfig;
 use crate::decision::{Decision, DecisionAction, Source};
 use crate::driver::{DriverInput, OptimizationDriver};
+use crate::memory::{Fingerprint, WorkloadMemory};
 use crate::model::{CostModel, Metrics, Observation};
 use crate::optimization::{permitted_by, OptContext, Reversibility};
 use crate::registry::Registry;
 use crate::score::score_against;
+use crate::search::{best_combination, Candidate};
 
 /// Operations that must have been observed before the driver acts at all.
 ///
@@ -122,6 +124,21 @@ pub const TELEMETRY_DECAY: (u64, u64) = (3, 4);
 /// that the measurement is not swamped by everything else that moved.
 const OBSERVE_AFTER_CYCLES: u64 = 3;
 
+/// Cycles with no change proposed before the current configuration is
+/// recorded as what this workload shape settled on.
+///
+/// Two, not one: a single quiet cycle happens routinely while a change is
+/// waiting to be measured, and remembering then would record a
+/// configuration the driver has not finished judging.
+const STABLE_CYCLES_BEFORE_REMEMBERING: u32 = 2;
+
+/// Identity of one `(optimization, scope)` pair, for matching a search
+/// result back to the decision it came from. A NUL separator cannot occur in
+/// either half, so the join is unambiguous.
+fn scope_key(name: &str, scope: &str) -> String {
+    format!("{name}\u{0}{scope}")
+}
+
 /// A change waiting to be measured.
 struct Pending {
     optimization: String,
@@ -140,6 +157,16 @@ pub struct AdaptiveDriver {
     model: CostModel,
     /// Changes applied but not yet measured.
     pending: Vec<Pending>,
+    /// Configurations that worked for workload shapes seen before.
+    ///
+    /// Consulted to decide what to *try first*, never to bypass a bar — see
+    /// `crate::memory` for why recall is a hypothesis rather than evidence.
+    memory: WorkloadMemory,
+    /// Cycles in a row that ended with no change proposed. A configuration
+    /// is only worth remembering once it has stopped moving; remembering a
+    /// half-converged one would teach the memory a waypoint as a
+    /// destination.
+    stable_cycles: u32,
     /// Decisions emitted, for tests and the decision log.
     pub proposals: u64,
 }
@@ -158,6 +185,8 @@ impl AdaptiveDriver {
             retracted: HashMap::new(),
             model: CostModel::new(),
             pending: Vec::new(),
+            memory: WorkloadMemory::new(),
+            stable_cycles: 0,
             proposals: 0,
         }
     }
@@ -477,14 +506,100 @@ impl OptimizationDriver for AdaptiveDriver {
             }
             chosen.push(d);
         }
-        for (d, _) in self.additions(registry, current, policy, ctx) {
-            if chosen.len() >= MAX_CHANGES_PER_CYCLE {
-                break;
+
+        // What this workload looks like now, and what was learned about a
+        // workload shaped like it before.
+        let fingerprint = Fingerprint::of(telemetry);
+        let recalled = self
+            .memory
+            .recall(&fingerprint)
+            .map(|(cfg, score)| (cfg.clone(), score));
+
+        let mut additions: Vec<(Decision, f64)> = self
+            .additions(registry, current, policy, ctx)
+            .into_iter()
+            .filter(|(d, _)| !untouchable(d))
+            .collect();
+
+        // **Recall reorders; it never admits.** Every candidate here has
+        // already cleared `MIN_SCORE` on its own merits. A remembered
+        // configuration only decides which of those to try *first*, which is
+        // exactly the claim `crate::memory` makes for it: a hypothesis worth
+        // trying first, not evidence that it is still correct. Lowering a bar
+        // on the strength of memory would let a stale configuration reapply
+        // itself against a workload that has genuinely moved on.
+        if let Some((cfg, similarity)) = &recalled {
+            for (d, _) in additions.iter_mut() {
+                if cfg.is_enabled(d.optimization, &d.scope) {
+                    d.trigger = format!(
+                        "{}; tried first — a workload {:.0}% like this one used it",
+                        d.trigger,
+                        similarity * 100.0
+                    );
+                }
             }
-            if untouchable(&d) {
-                continue;
+            additions.sort_by(|a, b| {
+                let a_known = cfg.is_enabled(a.0.optimization, &a.0.scope);
+                let b_known = cfg.is_enabled(b.0.optimization, &b.0.scope);
+                b_known.cmp(&a_known).then(b.1.total_cmp(&a.1))
+            });
+        }
+
+        // Joint search over the combination rather than greedy top-N, so
+        // conflicts, prerequisites and the shared memory budget are judged
+        // against the set actually being proposed. See `crate::search` for
+        // why greedy is provably wrong when optimizations interact.
+        if chosen.len() < MAX_CHANGES_PER_CYCLE && !additions.is_empty() {
+            let candidates: Vec<Candidate<'_>> = additions
+                .iter()
+                .take(crate::search::MAX_EXHAUSTIVE)
+                .filter_map(|(d, s)| {
+                    let meta = registry.meta(d.optimization)?;
+                    Some(Candidate {
+                        key: scope_key(d.optimization, &d.scope),
+                        name: meta.name,
+                        meta,
+                        solo_score: *s,
+                        ram_bytes: 0,
+                    })
+                })
+                .collect();
+            let picked: Vec<String> = match best_combination(&candidates, policy) {
+                Some(c) => c.keys,
+                // Nothing coherent and affordable, or too many candidates to
+                // enumerate exactly — fall back to the greedy order rather
+                // than treat "no combination" as "propose nothing".
+                None => additions
+                    .iter()
+                    .map(|(d, _)| scope_key(d.optimization, &d.scope))
+                    .collect(),
+            };
+            for (d, _) in additions {
+                if chosen.len() >= MAX_CHANGES_PER_CYCLE {
+                    break;
+                }
+                if picked.contains(&scope_key(d.optimization, &d.scope)) {
+                    chosen.push(d);
+                }
             }
-            chosen.push(d);
+        }
+
+        // A configuration is only worth remembering once it has stopped
+        // moving. Remembering a half-converged one would teach the memory a
+        // waypoint as a destination.
+        // "Nothing proposed" is not the same as "settled". A driver can be
+        // quiet because every candidate is in cooldown, or because a change
+        // it already made is still waiting to be measured — both mean it is
+        // mid-decision, and recording the configuration then would teach the
+        // memory a waypoint as a destination. Settled means quiet *and* with
+        // nothing outstanding to learn.
+        if chosen.is_empty() && self.pending.is_empty() {
+            self.stable_cycles = self.stable_cycles.saturating_add(1);
+            if self.stable_cycles >= STABLE_CYCLES_BEFORE_REMEMBERING {
+                self.memory.remember(fingerprint, current.clone());
+            }
+        } else {
+            self.stable_cycles = 0;
         }
 
         for d in &chosen {
@@ -527,5 +642,231 @@ pub fn metrics_from(telemetry: &Snapshot, bytes: u64) -> Metrics {
             bytes,
             ..Default::default()
         },
+    }
+}
+
+#[cfg(test)]
+impl AdaptiveDriver {
+    /// Workload shapes the driver has recorded a configuration for.
+    ///
+    /// A test hook, not public surface: the point of memory is that it
+    /// changes behaviour, and behaviour is what the tests assert — this only
+    /// lets one confirm the memory was populated at all rather than
+    /// inferring it from an absence.
+    pub(crate) fn remembered_shapes(&self) -> usize {
+        self.memory.len()
+    }
+}
+
+/// The wiring tests: memory and joint search have to *change what the driver
+/// does*, not merely exist and pass their own unit tests.
+///
+/// These exist because the first version of M33/M34 shipped both modules
+/// fully tested in isolation and called from nowhere — the same
+/// shipped-but-unreachable shape an audit had just caught elsewhere in this
+/// codebase. A module with green tests and no call site is not a feature.
+#[cfg(test)]
+mod wiring {
+    use super::*;
+    use crate::cost::{AxisEffects, CostEstimate};
+    use crate::optimization::{Applicability, OptMeta, Optimization, ScopeKind};
+    use adabt_core::policy::GuaranteeRequirements;
+    use adabt_telemetry::event::{Event, OpKind, QueryShape};
+    use adabt_telemetry::{CollectingProbe, Probe, Snapshot};
+
+    struct Simple(&'static OptMeta);
+
+    const A_META: OptMeta = OptMeta {
+        name: "a",
+        summary: "a",
+        scope_kind: ScopeKind::Global,
+        min_level: 1,
+        axis_effects: AxisEffects::new(8, -1, 0),
+        requires_guarantees: GuaranteeRequirements::ANY,
+        prerequisites: &[],
+        conflicts_with: &[],
+        reversibility: Reversibility::Instant,
+    };
+
+    impl Optimization for Simple {
+        fn meta(&self) -> &OptMeta {
+            self.0
+        }
+        fn applicability(&self, _: &OptContext<'_>) -> Applicability {
+            Applicability::Applicable
+        }
+        fn estimate(&self, _: &OptContext<'_>) -> CostEstimate {
+            CostEstimate::faster(0.4, 0.4).with_confidence(0.8)
+        }
+        fn plan_enable(
+            &self,
+            _: &OptContext<'_>,
+            _: &str,
+            _: &crate::config::Params,
+        ) -> crate::action::ChangePlan {
+            crate::action::ChangePlan::default()
+        }
+        fn plan_disable(
+            &self,
+            _: &OptContext<'_>,
+            _: &str,
+            _: &crate::config::Params,
+        ) -> crate::action::ChangePlan {
+            crate::action::ChangePlan::default()
+        }
+    }
+
+    fn snap(reads: u32, writes: u32) -> Snapshot {
+        let p = CollectingProbe::new();
+        for _ in 0..reads {
+            p.record(Event::Op {
+                collection: "users",
+                kind: OpKind::Get,
+                shape: QueryShape(1),
+                nanos: 100,
+                rows: 1,
+            });
+        }
+        for _ in 0..writes {
+            p.record(Event::Op {
+                collection: "users",
+                kind: OpKind::Insert,
+                shape: QueryShape(2),
+                nanos: 100,
+                rows: 1,
+            });
+        }
+        p.snapshot()
+    }
+
+    struct Fx {
+        collections: Vec<(String, usize)>,
+        filtered: Vec<(String, String, u64)>,
+        fixed: Vec<String>,
+        max_ids: Vec<(String, u64)>,
+        indexes: Vec<(String, String, adabt_core::index_kind::IndexKind)>,
+    }
+    impl Fx {
+        fn new() -> Self {
+            Self {
+                collections: vec![("users".into(), 50_000)],
+                filtered: vec![],
+                fixed: vec![],
+                max_ids: vec![("users".into(), 49_999)],
+                indexes: vec![],
+            }
+        }
+        fn ctx<'a>(&'a self, p: &'a Policy, s: &'a Snapshot) -> OptContext<'a> {
+            OptContext {
+                policy: p,
+                telemetry: s,
+                collections: &self.collections,
+                filtered_fields: &self.filtered,
+                fixed_size_collections: &self.fixed,
+                max_ids: &self.max_ids,
+                existing_indexes: &self.indexes,
+                current_bytes: 4_000_000,
+            }
+        }
+    }
+
+    #[test]
+    fn a_settled_configuration_is_remembered_after_the_workload_stops_moving() {
+        let mut reg = Registry::new();
+        reg.register(Box::new(Simple(&A_META)));
+        let policy = Policy::conventional();
+        let s = snap(2_000, 0);
+        let fx = Fx::new();
+        let ctx = fx.ctx(&policy, &s);
+        // Already enabled, so nothing is left to propose and the driver is
+        // by definition settled.
+        let mut config = OptimizationConfig::new();
+        config.enable("a", "global", Default::default());
+
+        let mut d = AdaptiveDriver::new();
+        assert_eq!(d.remembered_shapes(), 0);
+        for _ in 0..(STABLE_CYCLES_BEFORE_REMEMBERING + 1) {
+            d.decide(DriverInput {
+                registry: &reg,
+                current: &config,
+                policy: &policy,
+                telemetry: &s,
+                ctx: &ctx,
+                under_experiment: &[],
+                pinned: &[],
+            });
+        }
+        assert_eq!(
+            d.remembered_shapes(),
+            1,
+            "the driver never recorded what this workload settled on"
+        );
+    }
+
+    #[test]
+    fn a_workload_still_converging_is_not_remembered() {
+        // The failure this guards: recording a half-converged configuration
+        // teaches the memory a waypoint as a destination.
+        let mut reg = Registry::new();
+        reg.register(Box::new(Simple(&A_META)));
+        let policy = Policy::conventional();
+        let s = snap(2_000, 0);
+        let fx = Fx::new();
+        let ctx = fx.ctx(&policy, &s);
+        let empty = OptimizationConfig::new();
+
+        let mut d = AdaptiveDriver::new();
+        // Nothing enabled, so every cycle proposes something — never settled.
+        for _ in 0..5 {
+            let out = d.decide(DriverInput {
+                registry: &reg,
+                current: &empty,
+                policy: &policy,
+                telemetry: &s,
+                ctx: &ctx,
+                under_experiment: &[],
+                pinned: &[],
+            });
+            // The driver may fall quiet on later cycles — every candidate
+            // enters cooldown once proposed. Quiet is fine; what must not
+            // happen is that quiet-because-mid-change gets recorded as a
+            // settled configuration.
+            let _ = out;
+        }
+        assert_eq!(
+            d.remembered_shapes(),
+            0,
+            "a configuration that never settled was remembered anyway"
+        );
+    }
+
+    #[test]
+    fn joint_search_still_proposes_an_independent_candidate() {
+        // Search replaced greedy top-N selection; the floor is that a single
+        // clearly-good candidate is still chosen. A search that returned
+        // nothing here would silently disable the whole adaptive path.
+        let mut reg = Registry::new();
+        reg.register(Box::new(Simple(&A_META)));
+        let policy = Policy::conventional();
+        let s = snap(2_000, 0);
+        let fx = Fx::new();
+        let ctx = fx.ctx(&policy, &s);
+        let empty = OptimizationConfig::new();
+
+        let mut d = AdaptiveDriver::new();
+        let out = d.decide(DriverInput {
+            registry: &reg,
+            current: &empty,
+            policy: &policy,
+            telemetry: &s,
+            ctx: &ctx,
+            under_experiment: &[],
+            pinned: &[],
+        });
+        assert!(
+            out.iter()
+                .any(|x| x.optimization == "a" && x.action == DecisionAction::Enable),
+            "joint search dropped a candidate greedy would have taken: {out:?}"
+        );
     }
 }

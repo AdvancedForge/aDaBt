@@ -14,6 +14,7 @@
 //! bigger.
 
 use adabt_core::error::{Error, Result};
+use std::borrow::Cow;
 
 /// Below this, the framing overhead is not worth the CPU.
 const MIN_INPUT: usize = 64;
@@ -67,10 +68,17 @@ pub fn maybe_compress(input: &[u8]) -> (Encoding, Vec<u8>) {
 }
 
 /// Restore a record. Never panics on corrupt input.
-pub fn decompress(encoding: Encoding, data: &[u8]) -> Result<Vec<u8>> {
+///
+/// Borrows when it can. `Encoding::Raw` — the default, and what every record
+/// stores under until compression is switched on — needs no work at all, and
+/// returning an owned `Vec` there meant allocating and copying the whole
+/// payload on every single read to hand back bytes the caller already had.
+/// One of six allocations per row on the scan path, for nothing.
+pub fn decompress(encoding: Encoding, data: &[u8]) -> Result<Cow<'_, [u8]>> {
     match encoding {
-        Encoding::Raw => Ok(data.to_vec()),
+        Encoding::Raw => Ok(Cow::Borrowed(data)),
         Encoding::Lz4 => lz4_flex::decompress_size_prepended(data)
+            .map(Cow::Owned)
             .map_err(|e| Error::Corruption(format!("could not decompress record: {e}"))),
     }
 }

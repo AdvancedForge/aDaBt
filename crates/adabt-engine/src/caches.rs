@@ -109,11 +109,14 @@ impl PlanCache {
         }
     }
 
-    pub fn insert(&mut self, shape: QueryShape, plan: PlanDecision) {
+    /// Cache a decision, producing it only if it will be kept — see
+    /// [`ResultCache::insert`] for why this takes a closure rather than a
+    /// value. Cheaper here than there, and wrong for the same reason.
+    pub fn insert(&mut self, shape: QueryShape, plan: impl FnOnce() -> PlanDecision) {
         if !self.enabled() {
             return;
         }
-        if self.entries.insert(shape, plan).is_none() {
+        if self.entries.insert(shape, plan()).is_none() {
             self.order.push(shape);
             while self.entries.len() > self.capacity {
                 self.evict_one();
@@ -215,7 +218,28 @@ impl ResultCache {
         }
     }
 
-    pub fn insert(&mut self, key: QueryKey, collection: &str, epoch: u64, rows: Rows) {
+    /// Cache a result set, producing it only if it will actually be kept.
+    ///
+    /// `rows` is a closure rather than a value, and that is the whole point:
+    /// the caller's rows are borrowed — they are about to be returned to the
+    /// application — so caching them means cloning them. Taking `Rows` by
+    /// value made every caller clone an entire result set *before* this
+    /// function could decide it was disabled and drop the clone on the floor.
+    ///
+    /// A scan returning 50,000 records paid 50,000 record clones per query for
+    /// a cache that was switched off. The answer was correct, so nothing that
+    /// compares answers could see it.
+    ///
+    /// Taking a closure makes that unrepresentable rather than merely fixed:
+    /// there is no way to write a call site that pays for a result this
+    /// function is going to discard.
+    pub fn insert(
+        &mut self,
+        key: QueryKey,
+        collection: &str,
+        epoch: u64,
+        rows: impl FnOnce() -> Rows,
+    ) {
         if !self.enabled() {
             return;
         }
@@ -226,7 +250,7 @@ impl ResultCache {
                 ResultEntry {
                     collection: collection.to_string(),
                     epoch,
-                    rows,
+                    rows: rows(),
                 },
             )
             .is_none();
@@ -237,7 +261,6 @@ impl ResultCache {
             }
         }
     }
-
     /// Drop every entry for one collection.
     pub fn invalidate_collection(&mut self, collection: &str) {
         let before = self.entries.len();
@@ -271,6 +294,52 @@ impl ResultCache {
 
 #[cfg(test)]
 mod tests {
+
+    /// A disabled cache must not make the caller produce what it will discard.
+    ///
+    /// This is the whole reason `insert` takes a closure. The rows a query
+    /// returns belong to the caller, so handing them to the cache means
+    /// cloning them — and when the cache is off, that clone was built, passed
+    /// in, and dropped. On a 50,000-row scan it was 50,000 record clones per
+    /// query, and it cost roughly half of what a scan cost.
+    ///
+    /// Nothing that checks answers could see it: the rows were correct either
+    /// way. So the assertion is about *work*, and the closure makes the work
+    /// observable — if it runs, the caller paid.
+    #[test]
+    fn a_disabled_cache_never_asks_for_the_rows() {
+        let mut c = ResultCache::new(0);
+        assert!(!c.enabled(), "capacity 0 must mean disabled");
+
+        let asked = std::cell::Cell::new(false);
+        c.insert(QueryKey(1), "users", 0, || {
+            asked.set(true);
+            vec![(RecordId(1), Record::new().with("a", 1i64))]
+        });
+
+        assert!(
+            !asked.get(),
+            "a disabled cache asked the caller to build a result set it then threw away"
+        );
+    }
+
+    /// The other half of the contract: an enabled cache must still ask, and
+    /// must actually keep what it is given. A closure that is never called
+    /// would make the test above pass trivially.
+    #[test]
+    fn an_enabled_cache_asks_once_and_keeps_the_result() {
+        let mut c = ResultCache::new(4);
+        let asked = std::cell::Cell::new(0u32);
+        let rows = vec![(RecordId(1), Record::new().with("a", 1i64))];
+
+        c.insert(QueryKey(1), "users", 7, || {
+            asked.set(asked.get() + 1);
+            rows.clone()
+        });
+
+        assert_eq!(asked.get(), 1, "an enabled cache must ask exactly once");
+        assert_eq!(c.get(QueryKey(1), 7), Some(&rows));
+    }
     use super::*;
     use adabt_exec::planner::AccessDecision;
 
@@ -291,7 +360,7 @@ mod tests {
     fn a_plan_cache_hit_returns_the_stored_plan() {
         let mut c = PlanCache::new(4);
         assert!(c.get(QueryShape(1)).is_none());
-        c.insert(QueryShape(1), plan("users"));
+        c.insert(QueryShape(1), || plan("users"));
         assert!(c.get(QueryShape(1)).is_some());
         assert_eq!(c.stats().hits, 1);
         assert_eq!(c.stats().misses, 1);
@@ -300,7 +369,7 @@ mod tests {
     #[test]
     fn a_zero_capacity_cache_is_disabled_not_broken() {
         let mut c = PlanCache::new(0);
-        c.insert(QueryShape(1), plan("users"));
+        c.insert(QueryShape(1), || plan("users"));
         assert!(c.get(QueryShape(1)).is_none());
         assert!(c.is_empty());
         assert_eq!(c.stats().hits, 0);
@@ -310,7 +379,7 @@ mod tests {
     fn a_plan_cache_evicts_when_full() {
         let mut c = PlanCache::new(2);
         for i in 1..=5 {
-            c.insert(QueryShape(i), plan("users"));
+            c.insert(QueryShape(i), || plan("users"));
         }
         assert_eq!(c.len(), 2);
         assert!(c.stats().evictions >= 3);
@@ -320,7 +389,7 @@ mod tests {
     fn shrinking_a_plan_cache_evicts_down_immediately() {
         let mut c = PlanCache::new(10);
         for i in 1..=10 {
-            c.insert(QueryShape(i), plan("users"));
+            c.insert(QueryShape(i), || plan("users"));
         }
         c.set_capacity(3);
         assert_eq!(c.len(), 3);
@@ -329,7 +398,7 @@ mod tests {
     #[test]
     fn clearing_a_plan_cache_is_recorded() {
         let mut c = PlanCache::new(4);
-        c.insert(QueryShape(1), plan("users"));
+        c.insert(QueryShape(1), || plan("users"));
         c.clear();
         assert!(c.is_empty());
         assert_eq!(c.stats().invalidations, 1);
@@ -338,7 +407,7 @@ mod tests {
     #[test]
     fn a_result_cache_hit_requires_a_matching_epoch() {
         let mut c = ResultCache::new(4);
-        c.insert(QueryKey(1), "users", 7, rows(3));
+        c.insert(QueryKey(1), "users", 7, || rows(3));
         assert_eq!(c.get(QueryKey(1), 7).map(|r| r.len()), Some(3));
         // A write bumped the epoch: the entry must not be served.
         assert!(c.get(QueryKey(1), 8).is_none());
@@ -348,7 +417,7 @@ mod tests {
     #[test]
     fn a_stale_entry_is_dropped_rather_than_rechecked() {
         let mut c = ResultCache::new(4);
-        c.insert(QueryKey(1), "users", 1, rows(3));
+        c.insert(QueryKey(1), "users", 1, || rows(3));
         assert!(c.get(QueryKey(1), 2).is_none());
         assert!(c.is_empty(), "a stale entry was left in place");
     }
@@ -356,8 +425,8 @@ mod tests {
     #[test]
     fn invalidating_one_collection_leaves_the_others_alone() {
         let mut c = ResultCache::new(8);
-        c.insert(QueryKey(1), "users", 1, rows(2));
-        c.insert(QueryKey(2), "orders", 1, rows(2));
+        c.insert(QueryKey(1), "users", 1, || rows(2));
+        c.insert(QueryKey(2), "orders", 1, || rows(2));
         c.invalidate_collection("users");
         assert!(c.get(QueryKey(1), 1).is_none());
         assert!(c.get(QueryKey(2), 1).is_some());
@@ -367,7 +436,7 @@ mod tests {
     fn result_cache_memory_grows_with_content() {
         let mut c = ResultCache::new(64);
         let empty = c.memory_bytes();
-        c.insert(QueryKey(1), "users", 1, rows(500));
+        c.insert(QueryKey(1), "users", 1, || rows(500));
         assert!(c.memory_bytes() > empty + 1000);
         c.clear();
         assert_eq!(c.memory_bytes(), 0);
@@ -377,7 +446,7 @@ mod tests {
     fn hit_rate_is_none_before_any_probe() {
         assert_eq!(CacheStats::default().hit_rate(), None);
         let mut c = PlanCache::new(2);
-        c.insert(QueryShape(1), plan("u"));
+        c.insert(QueryShape(1), || plan("u"));
         c.get(QueryShape(1));
         assert_eq!(c.stats().hit_rate(), Some(1.0));
     }

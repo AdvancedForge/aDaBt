@@ -159,7 +159,22 @@ pub struct Database {
     probe: Arc<CollectingProbe>,
     last_stats: ExecStats,
     /// The change currently being proved against live traffic.
-    experiment: Option<Box<LiveExperiment>>,
+    /// Experiments running right now, on scopes that do not overlap.
+    ///
+    /// A `Vec` rather than an `Option` because there is no reason two changes
+    /// to *different* collections should have to be proved one after the
+    /// other. The reason it was an `Option` was safety, not simplicity: with a
+    /// single global candidate mask and a single global "candidates visible"
+    /// flag, a second experiment would have had its unproven structures
+    /// exposed to the first experiment's canary traffic, and each would have
+    /// been measuring the other. Both of those are now per-experiment, so the
+    /// remaining requirement is only that their scopes are disjoint.
+    experiments: Vec<LiveExperiment>,
+    /// The experiment whose query is being run right now, if any.
+    ///
+    /// Paired with `candidate_visible`: together they name *which* candidate
+    /// is allowed to be seen, rather than merely that some candidate is.
+    experiment_under_test: Option<u64>,
     /// Experiments that reached a verdict, kept so the reasoning survives them.
     finished: Vec<LiveExperiment>,
     /// Fields where two records may not share a value. See `crate::unique`.
@@ -178,7 +193,14 @@ pub struct Database {
     /// Whether *this* query may use the hidden structures.
     candidate_visible: bool,
     /// Whether actions passing through the sink are part of a candidate build.
-    recording_candidate: bool,
+    /// The experiment whose candidate is being built right now, if any.
+    ///
+    /// Carries the id rather than a bare flag because what gets recorded is
+    /// *whose* candidate a structure is. With one experiment the id could be
+    /// looked up; with several running, "the experiment" is not a thing, and
+    /// attributing a structure to the wrong one would mask it for the wrong
+    /// trial.
+    recording_candidate: Option<u64>,
     next_experiment_id: u64,
     /// Set for the duration of one `query_cancellable` call, so `execute`
     /// (reached from many internal call sites — direct queries, canaries,
@@ -324,11 +346,12 @@ impl Database {
             adaptive: adabt_opt::AdaptiveDriver::new(),
             probe: Arc::new(CollectingProbe::new()),
             last_stats: ExecStats::default(),
-            experiment: None,
+            experiments: Vec::new(),
             finished: Vec::new(),
             hidden: Candidates::default(),
             candidate_visible: false,
-            recording_candidate: false,
+            experiment_under_test: None,
+            recording_candidate: None,
             next_experiment_id: 1,
             unique_constraints: crate::unique::UniqueConstraints::default(),
             next_txn_id: 1,
@@ -471,6 +494,78 @@ impl Database {
     pub fn result_cache_stats(&self) -> CacheStats {
         self.result_cache.stats()
     }
+    /// Reconstruct a database directory from a backup made by `backup_to`.
+    ///
+    /// The counterpart `backup_to` never had: an application could back up
+    /// through `Database` but had to drop to `HeapStore` to restore, which
+    /// is an asymmetry nobody would guess at. `HeapStore::restore_from`
+    /// copies the whole directory, so the engine-level sidecar
+    /// (`unique.adabt`) that `backup_to` writes comes back with it.
+    pub fn restore_from(src: &Path, dest: &Path) -> Result<()> {
+        HeapStore::restore_from(src, dest)
+    }
+
+    /// The lsn to restore to for a given wall-clock moment, as nanoseconds
+    /// since the Unix epoch.
+    ///
+    /// This is what turns "restore to 14:32" into something `open_at` can
+    /// act on. Without it that translation lived only in `adabt-storage`,
+    /// so PITR's headline use case was unreachable from the engine API even
+    /// after `open_at` and `set_log_archive` were exposed — two thirds of a
+    /// feature.
+    ///
+    /// `None` means every entry in the log is already after `nanos`: there
+    /// is no prefix of this log ending at or before that moment.
+    pub fn lsn_at_or_before(dir: &Path, nanos: u64) -> Result<Option<adabt_core::ids::Lsn>> {
+        adabt_storage::wal::Wal::lsn_at_or_before(&HeapStore::wal_path(dir), nanos)
+    }
+
+    /// Relocate live records off trailing pages and shrink the heap file.
+    ///
+    /// Returns pages reclaimed. Deleting records returns their slots to the
+    /// free-space map but never shrinks the file; this is the operation that
+    /// actually gives disk back, and it was reachable only from the storage
+    /// crate.
+    pub fn vacuum(&mut self) -> Result<u32> {
+        let freed = self.store.vacuum()?;
+        // Vacuum moves records between pages, so anything addressing them by
+        // physical position is no longer valid. Same invalidation a schema
+        // change needs, for the same reason.
+        self.direct.clear();
+        self.plan_cache.clear();
+        self.compiled.clear();
+        Ok(freed)
+    }
+
+
+    /// Resize the result cache, in entries. Zero disables it.
+    ///
+    /// Operator-facing for the same reason `set_pool_capacity` is: memoizing
+    /// whole result sets is a large win on repeated identical queries and a
+    /// pure loss on a workload that never repeats one, and only the operator
+    /// knows which they have. It was reachable only through an `Action`, which
+    /// means only through the optimizer.
+    pub fn set_result_cache_entries(&mut self, n: usize) {
+        self.result_cache.set_capacity(n);
+    }
+
+    /// Resize the plan cache, in entries. Zero disables it.
+    pub fn set_plan_cache_entries(&mut self, n: usize) {
+        self.plan_cache.set_capacity(n);
+    }
+
+    /// Resize the buffer pool, in 4 KiB pages.
+    ///
+    /// `Database::open` fixes this at 1024 pages — 4 MiB — regardless of how
+    /// much data the database holds, and `HeapStore::set_pool_capacity` was
+    /// reachable from nowhere above the storage crate. Scale measurement
+    /// (M36) showed why that matters: at 1.6M rows the heap is far larger
+    /// than 4 MiB, so nearly every fetch is a cold page read and both scans
+    /// and indexed point lookups degrade with collection size.
+    pub fn set_pool_capacity(&mut self, pages: usize) -> Result<()> {
+        self.store.set_pool_capacity(pages)
+    }
+
     /// Send discarded log segments to `dir` instead of deleting them.
     ///
     /// **Without this, point-in-time recovery cannot reach anything but a
@@ -489,6 +584,21 @@ impl Database {
     /// fix.
     pub fn set_log_archive(&mut self, dir: Option<std::path::PathBuf>) {
         self.store.set_log_archive(dir);
+    }
+
+    /// Buffer pool counters: hits, misses, evictions, reads, read-ahead.
+    ///
+    /// A cache hit rate is a first-class operational metric in every database
+    /// that has a buffer pool, and this one had it — reachable only by holding
+    /// a `HeapStore`, which no application does. Exposed here for the same
+    /// reason as `vacuum` and `restore_from`: a capability nobody can call is
+    /// indistinguishable from one that was never built.
+    ///
+    /// It doubles as the instrument that keeps the fetch path honest. Every
+    /// record read goes through `pool.get`, so `hits + misses` counts record
+    /// reads, and a scan that reads the collection twice says so out loud.
+    pub fn buffer_stats(&self) -> adabt_storage::pager::BufferStats {
+        self.store.buffer_stats()
     }
 
     /// Collections that currently have a columnar copy.
@@ -612,7 +722,11 @@ impl Database {
         let mut decisions = self.propose(&inputs);
         let source = self.decision_source();
 
-        let held = if self.experiment.is_none() {
+        // One new experiment per cycle at most. Several may be *running*, but
+        // starting more than one at a time would mean proposing changes from
+        // one set of inputs and judging them against a database that the other
+        // has already altered.
+        let held = if self.experiments.is_empty() {
             decisions
                 .iter()
                 .position(|d| self.is_shadowable(d, &inputs))
@@ -644,15 +758,15 @@ impl Database {
         // retracts the candidate mid-trial, after which the experiment promotes
         // something that is no longer there.
         let under_experiment: Vec<(&'static str, String)> = self
-            .experiment
-            .as_ref()
+            .experiments
+            .iter()
             .map(|e| {
-                vec![(
+                (
                     e.experiment.decision.optimization,
                     e.experiment.decision.scope.clone(),
-                )]
+                )
             })
-            .unwrap_or_default();
+            .collect();
         let input = adabt_opt::DriverInput {
             registry: &self.registry,
             current: self.controller.config(),
@@ -960,6 +1074,153 @@ impl Database {
         self.create_index_from(collection, field, kind, None)
     }
 
+    /// Build an index over several fields at once.
+    ///
+    /// Serves an equality predicate that constrains *every* covered field —
+    /// `country = 'NO' AND age = 30` for an index over `(country, age)`.
+    /// It does not serve a prefix of them; see `CompositeIndex`. The index
+    /// answers to the joined name `composite_name(fields)`, which cannot
+    /// collide with a single-field index because the separator is a NUL, so
+    /// the existing single-field planner path simply never selects one
+    /// rather than selecting one wrongly.
+    pub fn create_composite_index(&mut self, collection: &str, fields: &[String]) -> Result<()> {
+        if self.store.schema_of(collection).is_err() {
+            return Err(Error::NoSuchCollection(collection.to_string()));
+        }
+        if fields.len() < 2 {
+            return Err(Error::InvalidOptimization(
+                "a composite index needs at least two fields; use create_index for one".into(),
+            ));
+        }
+        let name = adabt_index::composite_name(fields);
+        if self.index_exists(collection, &name, IndexKind::Hash) {
+            return Ok(());
+        }
+        let rows = self.store.scan(collection)?;
+        let idx =
+            adabt_index::CompositeIndex::build(fields.to_vec(), rows.iter().map(|(i, r)| (*i, r)));
+        self.indexes
+            .entry(collection.to_string())
+            .or_default()
+            .push(Box::new(idx));
+        self.store
+            .record_index(collection, &name, IndexKind::Hash.as_str())?;
+        self.bump_epoch(collection);
+        self.plan_cache.clear();
+        Ok(())
+    }
+
+    /// Build an index on `field` that also carries `covers` for every record
+    /// it indexes.
+    ///
+    /// A query that filters on `field` and needs nothing outside `covers` is
+    /// then answered from the index alone — no page directory, no buffer pool,
+    /// no decode. On this engine that removes the majority of what a lookup
+    /// costs rather than trimming it, because the fetch *is* the cost.
+    ///
+    /// The trade is a second copy of the covered data and upkeep on every
+    /// write to any covered field, not just the indexed one. Worth it when the
+    /// read side uses it and a straight loss when it does not, which is why
+    /// this is an explicit request rather than something inferred.
+    pub fn create_covering_index(
+        &mut self,
+        collection: &str,
+        field: &str,
+        covers: &[String],
+        kind: IndexKind,
+    ) -> Result<()> {
+        if self.store.schema_of(collection).is_err() {
+            return Err(Error::NoSuchCollection(collection.to_string()));
+        }
+        if covers.is_empty() {
+            return Err(Error::InvalidOptimization(
+                "a covering index must carry at least one field; use create_index for none".into(),
+            ));
+        }
+        // The indexed field is always carried, whether or not the caller asked
+        // for it. Not a convenience — a correctness requirement. The plan puts
+        // a `Filter` above the lookup, because the predicate may constrain
+        // fields beyond the indexed one, and that filter re-evaluates the
+        // whole predicate against the row the index produced. A row missing
+        // the field the predicate tests on evaluates to `Unknown`, not `True`,
+        // so every row would be dropped — the index would return nothing and
+        // be perfectly consistent about it.
+        let mut covers: Vec<String> = covers.to_vec();
+        covers.push(field.to_string());
+        covers.sort();
+        covers.dedup();
+        let name = adabt_index::covering_name(field, &covers);
+        if self.index_exists(collection, &name, kind) {
+            return Ok(());
+        }
+        let rows = self.store.scan(collection)?;
+        let idx = adabt_index::CoveringIndex::build(
+            field,
+            covers,
+            kind,
+            rows.iter().map(|(i, r)| (*i, r)),
+        );
+        self.indexes
+            .entry(collection.to_string())
+            .or_default()
+            .push(Box::new(idx));
+        self.store.record_index(collection, &name, kind.as_str())?;
+        self.bump_epoch(collection);
+        self.plan_cache.clear();
+        self.compiled.clear();
+        Ok(())
+    }
+
+    /// Build an index on `field` holding only records satisfying `condition`.
+    ///
+    /// Smaller than a full index and cheaper to maintain in proportion to how
+    /// selective the condition is: a write to a record the condition excludes
+    /// touches nothing at all.
+    ///
+    /// The engine will only *use* one for a query whose predicate contains a
+    /// syntactically identical conjunct. That is much weaker than real
+    /// predicate implication — an index conditioned on `age > 18` will not
+    /// serve a query asking `age > 20`, though it plainly could — and it is
+    /// weak on purpose. Being too weak costs a slower plan; being too clever
+    /// costs correct answers.
+    pub fn create_partial_index(
+        &mut self,
+        collection: &str,
+        field: &str,
+        condition: adabt_ir::Expr,
+        kind: IndexKind,
+    ) -> Result<()> {
+        if self.store.schema_of(collection).is_err() {
+            return Err(Error::NoSuchCollection(collection.to_string()));
+        }
+        // Hex, not `Debug` text: the name is the only channel a persisted
+        // index definition has, and a condition that cannot be read back is a
+        // partial index that returns as a *full* one after a restart —
+        // holding a subset of the rows and claiming to hold all of them.
+        let encoded = crate::exprcodec::encode_expr_hex(&condition)?;
+        let name = adabt_index::partial_name(field, &encoded);
+        if self.index_exists(collection, &name, kind) {
+            return Ok(());
+        }
+        let rows = self.store.scan(collection)?;
+        let idx = adabt_index::PartialIndex::build(
+            field,
+            condition,
+            encoded,
+            kind,
+            rows.iter().map(|(i, r)| (*i, r)),
+        );
+        self.indexes
+            .entry(collection.to_string())
+            .or_default()
+            .push(Box::new(idx));
+        self.store.record_index(collection, &name, kind.as_str())?;
+        self.bump_epoch(collection);
+        self.plan_cache.clear();
+        self.compiled.clear();
+        Ok(())
+    }
+
     /// Build an index, from cached entries when they are available.
     ///
     /// The two paths produce the same structure. The difference is what they
@@ -978,12 +1239,53 @@ impl Database {
         if self.index_exists(collection, field, kind) {
             return Ok(());
         }
-        let mut idx: Box<dyn Index> = match kind {
-            IndexKind::Hash => Box::new(HashIndex::new(field)),
-            IndexKind::BTree => Box::new(BTreeIndex::new(field)),
-            IndexKind::Bitmap => Box::new(BitmapIndex::new(field)),
+        // A composite index answers to the NUL-joined name of its fields, so
+        // that name is also how one is recognised when rebuilt at startup.
+        // Without this the restore path constructed a *single-field* index
+        // over a field literally called "country\0age" — a field no record
+        // has — so the index came back empty and every query through it
+        // returned nothing. Silently, since an empty index is a valid index.
+        //
+        // A covering index has the same hazard in a sharper form. Its name
+        // carries the projection after a `\u{1}`, and its payload — the
+        // projected fields — is *not* in the cached key snapshot, which holds
+        // only keys and ids. Restoring one from cache would produce an index
+        // that finds the right ids and has no rows to serve them from. So a
+        // covering index always rebuilds from the heap, and the cache is
+        // ignored rather than half-used.
+        // A partial index carries its condition, hex-encoded, after a
+        // `\u{2}`. Rebuilding one as an ordinary index would produce an index
+        // holding a subset of the rows that claims to hold all of them — the
+        // worst version of the composite restore bug, since the wrong answers
+        // would look like correct ones.
+        let partial = field.contains(adabt_index::PARTIAL_SEP);
+        let covering = field.contains(adabt_index::COVER_SEP);
+        let mut idx: Box<dyn Index> = if partial {
+            let (base, encoded) = adabt_index::partial_parts(field);
+            let encoded = encoded.unwrap_or_default();
+            let condition = crate::exprcodec::decode_expr_hex(&encoded)?;
+            Box::new(adabt_index::PartialIndex::new(
+                base, condition, encoded, kind,
+            ))
+        } else if covering {
+            let (base, covers) = adabt_index::covering_parts(field);
+            Box::new(adabt_index::CoveringIndex::new(base, covers, kind))
+        } else if field.contains(adabt_index::COMPOSITE_SEP) {
+            Box::new(adabt_index::CompositeIndex::new(
+                adabt_index::composite_fields(field),
+            ))
+        } else {
+            match kind {
+                IndexKind::Hash => Box::new(HashIndex::new(field)),
+                IndexKind::BTree => Box::new(BTreeIndex::new(field)),
+                IndexKind::Bitmap => Box::new(BitmapIndex::new(field)),
+            }
         };
-        match cached {
+        // A partial index cannot be restored from the key cache either: the
+        // cache records which keys map to which ids, not which records passed
+        // the condition, and re-inserting every cached entry would admit rows
+        // the condition excludes.
+        match cached.filter(|_| !covering && !partial) {
             Some(entries) => {
                 for (key, ids) in entries {
                     for id in ids {
@@ -1391,32 +1693,97 @@ impl Database {
     /// is hidden is genuinely invisible rather than merely deprioritised. An
     /// index the planner can still find is an index it will use.
     fn masked(&self) -> Option<&Candidates> {
-        if self.candidate_visible || self.hidden.is_empty() {
+        if self.hidden.is_empty() {
             None
         } else {
             Some(&self.hidden)
         }
     }
 
+    /// The one experiment whose candidate this query may see, if any.
+    ///
+    /// `candidate_visible` says a candidate side is being served;
+    /// `experiment_under_test` says whose. Neither alone is enough: the first
+    /// on its own revealed every running experiment's structures at once.
+    fn revealed(&self) -> Option<u64> {
+        if self.candidate_visible {
+            self.experiment_under_test
+        } else {
+            None
+        }
+    }
+
     fn plan_context(&self) -> PlanContext<'_> {
         let masked = self.masked();
+        let revealed = self.revealed();
         let mut m = HashMap::new();
         for (c, list) in &self.indexes {
             m.insert(
                 c.as_str(),
                 list.iter()
                     .map(|i| (i.field(), i.kind()))
-                    .filter(|(f, k)| !masked.is_some_and(|h| h.hides_index(c, f, *k)))
+                    .filter(|(f, k)| !masked.is_some_and(|h| h.hides_index(revealed, c, f, *k)))
                     .collect(),
             );
         }
-        let columnar = if masked.is_some_and(|h| h.hides_column_store()) {
-            Vec::new()
-        } else {
-            self.columns.keys().map(|k| k.as_str()).collect()
-        };
+        // Filtered per collection, not wiped wholesale: an experiment
+        // trialling a column store on one collection must not blind the
+        // planner to another collection's already-promoted one.
+        let columnar: Vec<&str> = self
+            .columns
+            .keys()
+            .map(|k| k.as_str())
+            .filter(|c| !masked.is_some_and(|h| h.hides_column_store(revealed, c)))
+            .collect();
+        // Composite indexes, recognised by their NUL-joined name. Reported
+        // separately because the planner asks a different question of them.
+        //
+        // The covering check comes first and is not optional. A covering
+        // index over two or more fields is named `f\u{1}a\u{0}b`, which also
+        // contains a NUL — so without this guard one would be read as a
+        // *composite* index over the fields `f\u{1}a` and `b`, neither of
+        // which any record has. The planner would then choose it for a
+        // predicate it cannot serve and get nothing back. Exactly the failure
+        // the composite restore path already had once, in a new place.
+        let mut composite: HashMap<&str, Vec<Vec<String>>> = HashMap::new();
+        let mut covering: HashMap<&str, Vec<(&str, Vec<String>)>> = HashMap::new();
+        let mut partial: HashMap<&str, Vec<(&str, adabt_ir::Expr, IndexKind)>> = HashMap::new();
+        for (c, list) in &self.indexes {
+            for i in list {
+                let name = i.field();
+                if let Some(encoded) = i.condition() {
+                    // A condition that will not decode means an index whose
+                    // restriction is unknown. Skipping it costs a slower plan;
+                    // using it would mean reading a subset as if it were the
+                    // whole collection.
+                    if let Ok(cond) = crate::exprcodec::decode_expr_hex(encoded) {
+                        if !masked.is_some_and(|h| h.hides_index(revealed, c, name, i.kind())) {
+                            partial
+                                .entry(c.as_str())
+                                .or_default()
+                                .push((name, cond, i.kind()));
+                        }
+                    }
+                } else if !i.covers().is_empty() {
+                    if !masked.is_some_and(|h| h.hides_index(revealed, c, name, i.kind())) {
+                        covering
+                            .entry(c.as_str())
+                            .or_default()
+                            .push((name, i.covers().to_vec()));
+                    }
+                } else if name.contains(adabt_index::COMPOSITE_SEP) {
+                    composite
+                        .entry(c.as_str())
+                        .or_default()
+                        .push(adabt_index::composite_fields(name));
+                }
+            }
+        }
         PlanContext {
             indexes: m,
+            composite,
+            covering,
+            partial,
             columnar,
         }
     }
@@ -1443,11 +1810,24 @@ impl Database {
         let mut op = Some(&logical.root);
         while let Some(o) = op {
             if let adabt_ir::plan::LogicalOp::Filter { predicate, .. } = o {
-                let equalities: Vec<String> = predicate
+                let mut equalities: Vec<String> = predicate
                     .equality_constraints()
                     .into_iter()
                     .map(|(f, _)| f)
                     .collect();
+                // Sorted and de-duplicated so that `country AND age` and
+                // `age AND country` are recognised as the same shape. A
+                // composite index over a set does not care which order the
+                // predicate wrote them in, and counting the two separately
+                // would halve the evidence for building one.
+                equalities.sort();
+                equalities.dedup();
+                if equalities.len() > 1 {
+                    self.probe.record(Event::FieldsPinnedTogether {
+                        collection,
+                        fields: &equalities,
+                    });
+                }
                 let mut all = Vec::new();
                 predicate.referenced_fields(&mut all);
                 for f in all {
@@ -1484,7 +1864,7 @@ impl Database {
         if logical.root.contains_join() {
             return self.query_join(logical);
         }
-        if self.experiment.is_some() {
+        if !self.experiments.is_empty() {
             return self.experiment_query(logical);
         }
         self.query_in(logical, QueryMode::Normal)
@@ -1721,7 +2101,7 @@ impl Database {
                 }
                 let d = adabt_exec::planner::decide(&logical.root, &self.plan_context());
                 if mode.uses_caches() {
-                    self.plan_cache.insert(shape, d.clone());
+                    self.plan_cache.insert(shape, || d.clone());
                 }
                 d
             }
@@ -1774,7 +2154,7 @@ impl Database {
         self.maybe_materialize(&logical.root)?;
         if mode.uses_caches() {
             self.result_cache
-                .insert(key, &collection, epoch, rows.clone());
+                .insert(key, &collection, epoch, || rows.clone());
         }
         if mode.is_counted() {
             self.observe_shape(&collection, shape, started, rows.len() as u64);
@@ -1784,17 +2164,19 @@ impl Database {
 
     // -- experiments -------------------------------------------------------
 
+    /// Find a running experiment by id.
+    fn experiment_index(&self, id: u64) -> Option<usize> {
+        self.experiments.iter().position(|e| e.experiment.id == id)
+    }
+
     /// Begin proving a change against live traffic.
     ///
     /// Nothing is built yet: the experiment starts in `Proposed` and each call
-    /// to [`Database::advance_experiment`] moves it one step, so the caller
+    /// to [`Database::advance_experiments`] moves it one step, so the caller
     /// controls the pace at which evidence is demanded.
+    ///
+    /// Several may run at once, as long as their scopes do not overlap.
     pub fn begin_experiment(&mut self, decision: Decision, guardrails: Guardrails) -> Result<u64> {
-        if self.experiment.is_some() {
-            return Err(Error::InvalidOptimization(
-                "an experiment is already running; two at once would each measure the other".into(),
-            ));
-        }
         if decision.action != DecisionAction::Enable {
             return Err(Error::InvalidOptimization(format!(
                 "only an enable can be experimented on, not a {}",
@@ -1832,19 +2214,50 @@ impl Database {
             .unwrap_or("")
             .to_string();
 
+        if let Some(clash) = self
+            .experiments
+            .iter()
+            .find(|e| crate::experiment::scopes_overlap(&e.collection, &candidate_collection))
+        {
+            let where_ = if candidate_collection.is_empty() {
+                "globally".to_string()
+            } else {
+                format!("on {candidate_collection}")
+            };
+            return Err(Error::InvalidOptimization(format!(
+                "experiment #{} already covers the same traffic ({}), so running \
+                 one {where_} too would make each measure the other",
+                clash.experiment.id,
+                if clash.collection.is_empty() {
+                    "every collection".to_string()
+                } else {
+                    clash.collection.clone()
+                }
+            )));
+        }
+
         let id = self.next_experiment_id;
         self.next_experiment_id += 1;
-        self.experiment = Some(Box::new(LiveExperiment::new(
+        self.experiments.push(LiveExperiment::new(
             id,
             decision,
             candidate_collection,
             guardrails,
-        )));
+        ));
         Ok(id)
     }
 
+    /// The oldest running experiment, if any.
+    ///
+    /// Kept for the common case of driving one at a time; see
+    /// [`Database::experiments`] when several may be running.
     pub fn experiment(&self) -> Option<&LiveExperiment> {
-        self.experiment.as_deref()
+        self.experiments.first()
+    }
+
+    /// Every experiment running right now, oldest first.
+    pub fn experiments(&self) -> impl Iterator<Item = &LiveExperiment> {
+        self.experiments.iter()
     }
 
     /// Changes the controller accepted, over the database's whole life.
@@ -1857,22 +2270,27 @@ impl Database {
             .count()
     }
 
-    /// Experiments begun, whether or not they finished.
+    /// Experiments that have ever been started.
+    ///
+    /// Counted from the id allocator rather than from a list, so it includes
+    /// the ones already retired and does not grow a structure to answer.
     pub fn experiments_started(&self) -> usize {
         (self.next_experiment_id - 1) as usize
     }
 
+    /// Experiments that ended by being promoted.
     pub fn promoted_count(&self) -> usize {
         self.finished
             .iter()
-            .filter(|e| e.experiment.phase == Phase::Promoted)
+            .filter(|e| e.phase() == Phase::Promoted)
             .count()
     }
 
+    /// Experiments that ended by being reverted.
     pub fn reverted_count(&self) -> usize {
         self.finished
             .iter()
-            .filter(|e| e.experiment.phase == Phase::Reverted)
+            .filter(|e| e.phase() == Phase::Reverted)
             .count()
     }
 
@@ -1882,102 +2300,119 @@ impl Database {
     }
 
     pub fn explain_experiment(&self) -> String {
-        match self.experiment.as_ref() {
-            Some(e) => e.explain(),
-            None => match self.finished.last() {
+        if self.experiments.is_empty() {
+            return match self.finished.last() {
                 Some(e) => e.explain(),
                 None => "no experiments\n".to_string(),
-            },
+            };
         }
+        self.experiments
+            .iter()
+            .map(|e| e.explain())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
-    /// Fold in the evidence so far and let the state machine act on it.
+    /// Fold in the evidence so far and let every experiment's state machine
+    /// act on it.
     ///
-    /// Returns the phase now in effect. Each call is one opportunity to move,
-    /// and the machine holds where it is when the evidence is not yet enough —
-    /// so calling this on a timer is safe and calling it too often merely
-    /// produces `Inconclusive` until the samples arrive.
+    /// Returns each experiment's id and the phase now in effect. Each call is
+    /// one opportunity to move, and a machine holds where it is when the
+    /// evidence is not yet enough — so calling this on a timer is safe and
+    /// calling it too often merely produces `Inconclusive` until the samples
+    /// arrive.
+    pub fn advance_experiments(&mut self) -> Result<Vec<(u64, Phase)>> {
+        let ids: Vec<u64> = self.experiments.iter().map(|e| e.experiment.id).collect();
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            // Re-found each time: retiring one experiment removes it from the
+            // vector, so an index taken before the loop would drift.
+            let Some(i) = self.experiment_index(id) else {
+                continue;
+            };
+            let ram = self.derived_memory_bytes() as u64;
+            let live = &mut self.experiments[i];
+            live.fold(ram);
+            let before = live.phase();
+            let after = live.experiment.advance();
+            if after != before {
+                self.enter_phase(id, after)?;
+            }
+            out.push((id, after));
+        }
+        Ok(out)
+    }
+
+    /// Advance the oldest running experiment, for callers driving one.
     pub fn advance_experiment(&mut self) -> Result<Option<Phase>> {
-        let Some(mut live) = self.experiment.take() else {
-            return Ok(None);
-        };
-        let ram = self.derived_memory_bytes() as u64;
-        live.fold(ram);
-        let before = live.phase();
-        let after = live.experiment.advance();
-        self.experiment = Some(live);
-        if after != before {
-            self.enter_phase(after)?;
-        }
-        Ok(Some(after))
+        Ok(self.advance_experiments()?.first().map(|(_, p)| *p))
     }
 
-    /// Stop an experiment and undo whatever it built.
+    /// Stop every running experiment and undo whatever each built.
     pub fn abort_experiment(&mut self, why: &str) -> Result<()> {
-        if let Some(live) = self.experiment.as_mut() {
-            live.experiment.abort(why);
+        let ids: Vec<u64> = self.experiments.iter().map(|e| e.experiment.id).collect();
+        for id in ids {
+            self.abort_experiment_by_id(id, why)?;
         }
-        self.retire_experiment(why.to_string(), false)
+        Ok(())
     }
 
-    fn enter_phase(&mut self, phase: Phase) -> Result<()> {
+    /// Stop one experiment and undo whatever it built.
+    pub fn abort_experiment_by_id(&mut self, id: u64, why: &str) -> Result<()> {
+        if let Some(i) = self.experiment_index(id) {
+            self.experiments[i].experiment.abort(why);
+        }
+        self.retire_experiment(id, why.to_string(), false)
+    }
+
+    fn enter_phase(&mut self, id: u64, phase: Phase) -> Result<()> {
         if phase.is_measuring() {
-            if let Some(e) = self.experiment.as_mut() {
-                e.reset_measurements();
+            if let Some(i) = self.experiment_index(id) {
+                self.experiments[i].reset_measurements();
             }
         }
         match phase {
-            Phase::Building => self.build_candidate(),
-            Phase::Promoted => self.retire_experiment("promoted".into(), true),
+            Phase::Building => self.build_candidate(id),
+            Phase::Promoted => self.retire_experiment(id, "promoted".into(), true),
             Phase::Reverted => {
                 // The reason is read from the experiment, which recorded it when
                 // it aborted. Re-assessing here would ask a reverted experiment
                 // how it is doing and be told, accurately and uselessly, that it
                 // is serving no traffic.
                 let why = self
-                    .experiment
-                    .as_ref()
-                    .map(|e| e.experiment.outcome())
+                    .experiment_index(id)
+                    .map(|i| self.experiments[i].experiment.outcome())
                     .unwrap_or_else(|| "reverted".into());
-                self.retire_experiment(why, false)
+                self.retire_experiment(id, why, false)
             }
             _ => Ok(()),
         }
     }
 
-    /// Build the candidate where the planner cannot see it.
-    fn build_candidate(&mut self) -> Result<()> {
-        let Some(decision) = self
-            .experiment
-            .as_ref()
-            .map(|e| e.experiment.decision.clone())
-        else {
+    /// Build one experiment's candidate where the planner cannot see it.
+    fn build_candidate(&mut self, id: u64) -> Result<()> {
+        let Some(i) = self.experiment_index(id) else {
             return Ok(());
         };
+        let decision = self.experiments[i].experiment.decision.clone();
         let ram_before = self.derived_memory_bytes() as u64;
-        if let Some(e) = self.experiment.as_mut() {
-            e.set_ram_before(ram_before);
-        }
+        self.experiments[i].set_ram_before(ram_before);
         // Mask first, build second. The other order would leave a window in
         // which the structure exists and is usable, and one query through it is
         // one query the experiment was supposed to be protecting.
         self.candidate_visible = false;
-        self.recording_candidate = true;
+        self.recording_candidate = Some(id);
         let inputs = self.opt_inputs()?;
         let mut trial = decision.clone();
-        trial.trigger = format!(
-            "trialled by experiment #{}: {}",
-            self.experiment
-                .as_ref()
-                .map(|e| e.experiment.id)
-                .unwrap_or(0),
-            decision.trigger
-        );
+        trial.trigger = format!("trialled by experiment #{id}: {}", decision.trigger);
         let report = self.run_decisions(vec![trial], DecisionSource::Adaptive, inputs);
-        self.recording_candidate = false;
+        self.recording_candidate = None;
         let report = report?;
 
-        if !report.all_applied() || self.hidden.is_empty() {
+        // Asked of *this* experiment, not of the mask as a whole: with another
+        // experiment running, a globally non-empty mask says nothing about
+        // whether this one built anything worth comparing.
+        if !report.all_applied() || self.hidden.is_empty_for(id) {
             // Either the controller refused, or it applied something with
             // nothing to mask. Both mean there is no comparison to run, and
             // measuring one anyway would compare the database against itself
@@ -1993,45 +2428,52 @@ impl Database {
                     .collect();
                 format!("the controller refused it ({})", refused.join("; "))
             };
-            self.abort_experiment(&why)?;
+            self.abort_experiment_by_id(id, &why)?;
         }
         Ok(())
     }
 
-    /// End an experiment, keeping or undoing what it built.
-    fn retire_experiment(&mut self, why: String, promoted: bool) -> Result<()> {
-        let Some(mut live) = self.experiment.take() else {
+    /// End one experiment, keeping or undoing what it built.
+    fn retire_experiment(&mut self, id: u64, why: String, promoted: bool) -> Result<()> {
+        let Some(i) = self.experiment_index(id) else {
             return Ok(());
         };
+        let mut live = self.experiments.remove(i);
         live.candidates = self.hidden.clone();
         let decision = live.experiment.decision.clone();
 
-        if !promoted && !self.hidden.is_empty() {
+        if !promoted && !self.hidden.is_empty_for(id) {
             // Undo through the controller, which knows the exact inverse of what
             // it applied. Reverting is instant because every candidate is a
             // derived representation: dropping one costs a deallocation and
             // loses nothing that cannot be rebuilt from the primary.
             let mut undo = decision.clone();
             undo.action = DecisionAction::Disable;
-            undo.trigger = format!("experiment #{} reverted: {why}", live.experiment.id);
+            undo.trigger = format!("experiment #{id} reverted: {why}");
             let inputs = self.opt_inputs()?;
             self.run_decisions(vec![undo], DecisionSource::Adaptive, inputs)?;
         }
-        // Clearing the mask is what promotion *is*. Nothing is rebuilt and
-        // nothing moves: the structure was real the whole time, and all that
-        // changes is that the planner is now allowed to know about it.
-        self.hidden = Candidates::default();
+        // Unmasking is what promotion *is*. Nothing is rebuilt and nothing
+        // moves: the structure was real the whole time, and all that changes
+        // is that the planner is now allowed to know about it.
+        //
+        // Only *this* experiment's entries are dropped. Clearing the whole
+        // mask — which is what this did — would unmask any other running
+        // experiment's unproven structure the instant an unrelated
+        // experiment finished, exposing it to live traffic it was
+        // specifically being kept away from.
+        self.hidden.forget(id);
         self.candidate_visible = false;
+        self.experiment_under_test = None;
 
         let detail = if promoted {
             format!(
-                "experiment #{} promoted — {}, {} canary queries on the candidate",
-                live.experiment.id,
+                "experiment #{id} promoted — {}, {} canary queries on the candidate",
                 live.shadow.describe(),
                 live.experiment.candidate.samples
             )
         } else {
-            format!("experiment #{} reverted — {why}", live.experiment.id)
+            format!("experiment #{id} reverted — {why}")
         };
         let verdict = if promoted {
             Verdict::Applied
@@ -2040,22 +2482,39 @@ impl Database {
         };
         self.controller
             .note(decision, verdict, detail, DecisionSource::Adaptive);
-        self.finished.push(*live);
+        self.finished.push(live);
         Ok(())
     }
 
-    /// Route one query according to the phase the experiment is in.
+    /// The experiment, if any, that this query is evidence for.
+    ///
+    /// At most one: `begin_experiment` refuses overlapping scopes, so a query
+    /// on a collection can match a collection-scoped experiment or a global
+    /// one but never both.
+    fn experiment_for(&self, collection: &str) -> Option<u64> {
+        self.experiments
+            .iter()
+            .find(|e| {
+                e.phase().is_measuring() && (e.collection.is_empty() || e.collection == collection)
+            })
+            .map(|e| e.experiment.id)
+    }
+
+    /// Route one query according to the phase its experiment is in.
     fn experiment_query(&mut self, logical: &LogicalPlan) -> Result<Vec<(RecordId, Record)>> {
-        let Some(mut live) = self.experiment.take() else {
+        let Some(id) = self.experiment_for(logical.collection()) else {
             return self.query_in(logical, QueryMode::Normal);
         };
-        let participates = live.phase().is_measuring()
-            && (live.collection.is_empty() || logical.collection() == live.collection);
-        if !participates {
-            let out = self.query_in(logical, QueryMode::Normal);
-            self.experiment = Some(live);
-            return out;
-        }
+        let Some(i) = self.experiment_index(id) else {
+            return self.query_in(logical, QueryMode::Normal);
+        };
+        // Taken out for the duration so the query path can borrow `self`
+        // mutably, and put back before returning on every path.
+        let mut live = self.experiments.remove(i);
+        // Names whose candidate may be revealed while this query runs. Without
+        // it, `candidate_visible` would expose every running experiment's
+        // structures at once and each would be measuring the others.
+        self.experiment_under_test = Some(id);
 
         let out = match live.phase() {
             // Both paths, same query, same state. The caller receives the
@@ -2087,7 +2546,10 @@ impl Database {
             }
             _ => self.query_in(logical, QueryMode::Normal),
         };
-        self.experiment = Some(live);
+        self.experiment_under_test = None;
+        // Back where it was, so age order — and therefore `experiment()` —
+        // stays stable across queries.
+        self.experiments.insert(i.min(self.experiments.len()), live);
         out
     }
 
@@ -2150,8 +2612,12 @@ impl ActionSink for Database {
         // the engine actually did would mask the wrong structure — and masking
         // the wrong structure means the "baseline" measurement is quietly taken
         // through the candidate.
-        if self.recording_candidate {
-            self.hidden.record(action);
+        if let Some(id) = self.recording_candidate {
+            let for_collection = self
+                .experiment_index(id)
+                .map(|i| self.experiments[i].collection.clone())
+                .unwrap_or_default();
+            self.hidden.record(id, action, &for_collection);
         }
         match action {
             Action::CreateIndex {
@@ -2222,7 +2688,10 @@ impl Source for Database {
         // The Level 10 path: no page directory, no slot table, just an address
         // calculation. Falls through to the heap when no array exists — or when
         // one exists but is a candidate this query is not allowed to see.
-        if !self.masked().is_some_and(|h| h.hides_direct()) {
+        if !self
+            .masked()
+            .is_some_and(|h| h.hides_direct(self.revealed(), collection))
+        {
             if let Some(d) = self.direct.get(collection) {
                 return d.get(id);
             }
@@ -2231,12 +2700,10 @@ impl Source for Database {
     }
 
     fn all_ids(&mut self, collection: &str) -> Result<Vec<RecordId>> {
-        Ok(self
-            .store
-            .scan(collection)?
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect())
+        // Ids only. Routing this through `scan` decoded every record in the
+        // collection so the executor could re-fetch and re-decode each one
+        // immediately after — a full scan paying for itself twice.
+        self.store.ids(collection)
     }
 
     fn column_aggregate(
@@ -2324,6 +2791,65 @@ impl Source for Database {
             .indexes
             .get(collection)
             .and_then(|l| l.iter().find(|i| i.field() == field))
+            .map(|i| i.lookup(key)))
+    }
+
+    /// Rows straight from a covering index, or `None` when none covers this
+    /// query.
+    ///
+    /// Two conditions, and both are refusals rather than approximations. The
+    /// index must be on `field`, and its projection must contain *every* field
+    /// the plan above will read. A projection that covers most of what is
+    /// needed is not a partial answer to be topped up — it is not an answer,
+    /// and saying `None` sends the query down the ordinary indexed path.
+    fn covering_lookup(
+        &mut self,
+        collection: &str,
+        field: &str,
+        key: &Value,
+        needed: &[String],
+    ) -> Result<Option<Vec<(RecordId, Record)>>> {
+        let Some(list) = self.indexes.get(collection) else {
+            return Ok(None);
+        };
+        let found = list.iter().find(|i| {
+            let covers = i.covers();
+            !covers.is_empty()
+                && adabt_index::covering_parts(i.field()).0 == field
+                && needed.iter().all(|n| covers.contains(n))
+        });
+        let Some(idx) = found else {
+            return Ok(None);
+        };
+        let mut rows = Vec::new();
+        for id in idx.lookup(key) {
+            // An id from the index with no projection beside it would mean the
+            // two halves had drifted apart. `CoveringIndex` maintains them
+            // together precisely so this cannot happen; skipping rather than
+            // fabricating an empty record keeps that a missing row rather than
+            // a wrong one if it ever does.
+            if let Some(rec) = idx.covered(id) {
+                rows.push((id, rec.clone()));
+            }
+        }
+        Ok(Some(rows))
+    }
+
+    /// A composite index answers to the NUL-joined name of its fields, so
+    /// finding one is the same lookup by a different name — no separate
+    /// registry, and no way for a single-field probe to reach one by
+    /// accident.
+    fn composite_lookup(
+        &mut self,
+        collection: &str,
+        fields: &[String],
+        key: &Value,
+    ) -> Result<Option<Vec<RecordId>>> {
+        let name = adabt_index::composite_name(fields);
+        Ok(self
+            .indexes
+            .get(collection)
+            .and_then(|l| l.iter().find(|i| i.field() == name))
             .map(|i| i.lookup(key)))
     }
 
@@ -2464,5 +2990,14 @@ impl LogicalStore for Database {
         let n = self.store.count(collection)?;
         self.observe(collection, OpKind::Count, t, n as u64);
         Ok(n)
+    }
+
+    /// Delegated, so the engine's own callers get the cheap path too.
+    ///
+    /// Without this the trait default applies and `Database::ids` quietly
+    /// costs a full decode of the collection — the exact expense the override
+    /// exists to remove, reintroduced one layer up.
+    fn ids(&mut self, collection: &str) -> Result<Vec<RecordId>> {
+        self.store.ids(collection)
     }
 }

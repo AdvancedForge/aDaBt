@@ -347,3 +347,70 @@ engine cannot execute.
 
 Both are recorded here rather than quietly skipped, so nothing downstream
 reads Track C as complete.
+
+---
+
+# Wiring M33/M34, and M30 — partial
+
+## M33/M34 are now actually reachable
+
+They were not. Both modules shipped fully unit-tested and **called from
+nowhere** — the same shipped-but-unreachable shape an audit had just caught
+for `set_log_archive`. A module with green tests and no call site is not a
+feature, and writing them up as done was wrong.
+
+Now, in `AdaptiveDriver::decide`:
+
+- **Recall reorders, never admits.** Every candidate has already cleared
+  `MIN_SCORE` on its own merits; a remembered configuration only decides
+  which of those to try *first*. Lowering a bar on the strength of memory
+  would let a stale configuration reapply itself to a workload that has
+  moved on. The trigger records why — *"tried first — a workload 91% like
+  this one used it"* — so a recalled decision is explainable rather than
+  unexplained.
+- **Joint search replaces greedy top-N**, so conflicts, prerequisites and the
+  shared memory budget are judged against the combination being proposed. It
+  falls back to greedy order when no combination is feasible, rather than
+  treating "no combination" as "propose nothing" — which would silently
+  disable the adaptive path entirely.
+
+**A flaw the wiring tests found:** the first version treated "no change
+proposed" as "settled" and remembered the configuration. But a driver is
+routinely quiet because candidates are in *cooldown*, or because a change it
+already made is still awaiting measurement — both mean mid-decision.
+Remembering then teaches the memory a waypoint as a destination. Settled now
+means quiet **and** with nothing pending.
+
+## M30 — the masking defect fixed, concurrency still blocked
+
+Attempting M30 surfaced a **live bug**, not merely a missing feature.
+
+`Candidates` held `column_store: bool` and `direct: bool` — *global* flags —
+while `Action::SetColumnStore`/`SetDirectLookup` are engine-wide actions
+carrying no collection. So an experiment trialling a column store for
+`users` masked the column store for **every** collection, including ones
+whose column store had been promoted long before. Two consequences, both
+real: unrelated queries silently lost an optimization for the experiment's
+duration, and the baseline those queries were measured against moved while
+an experiment elsewhere was running — contaminating exactly the measurement
+the experiment machinery exists to keep clean.
+
+Both are now per-collection lists scoped to the experiment's own collection,
+with `a_candidate_on_one_collection_does_not_mask_another_collections_structures`
+as the regression test. An experiment with no collection records nothing
+rather than masking everything — the safe direction, since masking the wrong
+structure takes the "baseline" reading through the candidate itself.
+
+**Concurrency itself is still not done, and here is precisely what blocks
+it.** `retire_experiment` does `self.hidden = Candidates::default()` —
+clearing the *whole* mask. With two experiments live, retiring one would
+unmask the other's candidate mid-flight, exposing an unproven structure to
+real traffic. Fixing that means attributing every masked entry to the
+experiment that built it, which is a change to the mechanism that guarantees
+"a candidate is invisible until proven" — the core of this project's safety
+story. The plan's own note applies exactly here: *"Soak-gated: running N
+experiments concurrently without it repeats M15's mistake with a larger N."*
+
+Per-collection masking was the necessary precondition and is done. The
+attribution change, and the shadow-copy mechanism for non-derived changes
+(the other half of M30), are not.

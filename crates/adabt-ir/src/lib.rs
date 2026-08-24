@@ -6,9 +6,11 @@
 pub mod expr;
 pub mod plan;
 pub mod shape;
+pub mod sql;
 pub mod vm;
 
 pub use expr::{CmpOp, Expr, Truth};
 pub use plan::{Agg, AggKind, LogicalOp, LogicalPlan, SortKey};
 pub use shape::{QueryKey, QueryShape};
+pub use sql::{parse_select, SqlError};
 pub use vm::Program;

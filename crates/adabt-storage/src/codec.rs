@@ -135,6 +135,18 @@ impl<'a> Cursor<'a> {
         Ok(v)
     }
 
+    /// The same bytes as `string`, without owning them.
+    ///
+    /// A `Dynamic` record carries its own field names, so decoding one used
+    /// to allocate a `String` per field per row before anything looked at it.
+    /// Borrowing lets the caller decide whether a fresh allocation is needed
+    /// at all — usually it is not, because the same names repeat on every row.
+    fn str_ref(&mut self, n: usize) -> Result<&'a str> {
+        let b = self.take(n)?;
+        std::str::from_utf8(b)
+            .map_err(|e| Error::Corruption(format!("invalid utf-8 in record: {e}")))
+    }
+
     fn string(&mut self, n: usize) -> Result<String> {
         let b = self.take(n)?;
         String::from_utf8(b.to_vec())
@@ -578,6 +590,27 @@ pub struct RecordCodec {
     /// Byte offset of each fixed field within the fixed region.
     fixed_offsets: Vec<u32>,
     fixed_region_len: u32,
+    /// One shared `Arc` per schema field name, made once per collection.
+    ///
+    /// Decoding used to clone each name into a fresh `String` for every field
+    /// of every row. The names are fixed for the life of the collection, so
+    /// the clone was pure waste — three of the five heap allocations a
+    /// three-field row cost on the scan path. These are cloned as refcounts
+    /// instead.
+    names: Vec<std::sync::Arc<str>>,
+    /// Names seen in `Dynamic` records, shared across rows.
+    ///
+    /// A `Dynamic` schema carries field names in the record itself, so the
+    /// schema cannot supply them. But the *names* still repeat: a collection
+    /// of dynamic records overwhelmingly reuses the same handful of keys row
+    /// after row. Interning turns a per-field allocation into a hash lookup
+    /// and a refcount bump.
+    ///
+    /// Capped, because a `Dynamic` collection is allowed to have unbounded
+    /// distinct field names and an uncapped table would be a slow leak. Past
+    /// the cap this degrades to what it did before — an allocation per field —
+    /// which is a performance cliff and never a wrong answer.
+    interned: std::cell::RefCell<std::collections::HashMap<Box<str>, std::sync::Arc<str>>>,
 }
 
 impl RecordCodec {
@@ -596,13 +629,38 @@ impl RecordCodec {
                 None => variable.push(i),
             }
         }
+        let names = schema
+            .fields()
+            .iter()
+            .map(|f| std::sync::Arc::from(f.name.as_str()))
+            .collect();
         Self {
             schema,
             fixed,
             variable,
             fixed_offsets,
             fixed_region_len: off,
+            names,
+            interned: Default::default(),
         }
+    }
+
+    /// Cap on distinct interned `Dynamic` field names. Well above any real
+    /// record shape, low enough that a pathological collection cannot grow
+    /// this without bound.
+    const MAX_INTERNED: usize = 4096;
+
+    /// A shared handle for `name`, allocating only the first time it is seen.
+    fn intern(&self, name: &str) -> std::sync::Arc<str> {
+        let mut map = self.interned.borrow_mut();
+        if let Some(a) = map.get(name) {
+            return std::sync::Arc::clone(a);
+        }
+        let a: std::sync::Arc<str> = std::sync::Arc::from(name);
+        if map.len() < Self::MAX_INTERNED {
+            map.insert(Box::from(name), std::sync::Arc::clone(&a));
+        }
+        a
     }
 
     pub fn schema(&self) -> &Schema {
@@ -739,6 +797,8 @@ impl RecordCodec {
     pub fn decode_with_header(&self, buf: &[u8]) -> Result<(RecordHeader, Record)> {
         let header = RecordHeader::read(buf)?;
         let mut rec = Record::new();
+        // One allocation for the whole record rather than a regrow per field.
+        rec.reserve(self.schema.fields().len().max(1));
 
         if self.schema.mode() == SchemaMode::Dynamic {
             let mut c = Cursor::new(buf);
@@ -752,9 +812,9 @@ impl RecordCodec {
             }
             for _ in 0..n {
                 let klen = c.varint()? as usize;
-                let name = c.string(klen)?;
+                let name = self.intern(c.str_ref(klen)?);
                 let v = read_tlv_value(&mut c, 0)?;
-                rec.set(name, v);
+                rec.set_shared(name, v);
             }
             return Ok((header, rec));
         }
@@ -783,7 +843,10 @@ impl RecordCodec {
                     "fixed field {k} extends past the record"
                 )));
             }
-            rec.set(f.name.clone(), read_fixed_field(&f.ty, &buf[at..end])?);
+            rec.set_shared(
+                std::sync::Arc::clone(&self.names[i]),
+                read_fixed_field(&f.ty, &buf[at..end])?,
+            );
         }
 
         if self.schema.mode() == SchemaMode::Fixed {
@@ -797,23 +860,26 @@ impl RecordCodec {
                 "record too short for its offset table".to_string(),
             ));
         }
-        let mut offsets = Vec::with_capacity(entries);
-        for k in 0..entries {
+        // Read straight out of the buffer rather than materialising the table.
+        // It was one `Vec` per record decoded — the last allocation on this
+        // path that the record itself does not need.
+        let offset_at = |k: usize| -> usize {
             let at = table_at + 4 * k;
-            offsets.push(
-                u32::from_le_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]) as usize,
-            );
-        }
+            u32::from_le_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]) as usize
+        };
         // Offsets come from the buffer, so they are untrusted: verify they are
         // ordered and in range before slicing with them.
-        for w in offsets.windows(2) {
-            if w[0] > w[1] {
+        let mut last_offset = offset_at(0);
+        for k in 1..entries {
+            let next = offset_at(k);
+            if last_offset > next {
                 return Err(Error::Corruption(
                     "offset table is not monotonically increasing".to_string(),
                 ));
             }
+            last_offset = next;
         }
-        if *offsets.last().unwrap() > buf.len() {
+        if last_offset > buf.len() {
             return Err(Error::Corruption(
                 "offset table points past the end of the record".to_string(),
             ));
@@ -823,13 +889,16 @@ impl RecordCodec {
             if !bit_get(bitmap, i) {
                 continue;
             }
-            let (lo, hi) = (offsets[k], offsets[k + 1]);
+            let (lo, hi) = (offset_at(k), offset_at(k + 1));
             let mut c = Cursor::new(&buf[lo..hi]);
-            rec.set(fields[i].name.clone(), read_tlv_value(&mut c, 0)?);
+            rec.set_shared(
+                std::sync::Arc::clone(&self.names[i]),
+                read_tlv_value(&mut c, 0)?,
+            );
         }
 
         if header.flags & flags::HAS_OVERFLOW != 0 {
-            let start = *offsets.last().unwrap();
+            let start = last_offset;
             let mut c = Cursor::new(&buf[start..]);
             let count = c.varint()? as usize;
             if count > c.remaining() {
@@ -840,9 +909,9 @@ impl RecordCodec {
             }
             for _ in 0..count {
                 let klen = c.varint()? as usize;
-                let name = c.string(klen)?;
+                let name = self.intern(c.str_ref(klen)?);
                 let v = read_tlv_value(&mut c, 0)?;
-                rec.set(name, v);
+                rec.set_shared(name, v);
             }
         }
 

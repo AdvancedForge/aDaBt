@@ -48,6 +48,26 @@ pub enum PhysicalOp {
         lo: Bound<Value>,
         hi: Bound<Value>,
     },
+    /// Rows from a covering index, with no fetch at all.
+    ///
+    /// `needed` is what the plan above will actually read. The planner only
+    /// emits this when the index carries every one of them, so the rows the
+    /// index holds are a complete answer rather than a partial one that would
+    /// have to be topped up from the heap.
+    CoveringLookup {
+        collection: String,
+        field: String,
+        key: Value,
+        needed: Vec<String>,
+    },
+    /// Ids from a composite index, then a fetch per id. `key` is the
+    /// `Value::List` of the pinned field values, in the index's own field
+    /// order.
+    CompositeLookup {
+        collection: String,
+        fields: Vec<String>,
+        key: Value,
+    },
     Filter {
         input: Box<PhysicalOp>,
         predicate: Expr,
@@ -92,7 +112,9 @@ impl PhysicalOp {
             | PhysicalOp::HeapScan { .. }
             | PhysicalOp::ColumnScan { .. }
             | PhysicalOp::IndexLookup { .. }
-            | PhysicalOp::IndexRange { .. } => None,
+            | PhysicalOp::IndexRange { .. }
+            | PhysicalOp::CompositeLookup { .. }
+            | PhysicalOp::CoveringLookup { .. } => None,
             PhysicalOp::Filter { input, .. }
             | PhysicalOp::Project { input, .. }
             | PhysicalOp::Sort { input, .. }
@@ -119,7 +141,9 @@ impl PhysicalOp {
             | PhysicalOp::HeapScan { collection }
             | PhysicalOp::ColumnScan { collection, .. }
             | PhysicalOp::IndexLookup { collection, .. }
-            | PhysicalOp::IndexRange { collection, .. } => collection,
+            | PhysicalOp::IndexRange { collection, .. }
+            | PhysicalOp::CompositeLookup { collection, .. }
+            | PhysicalOp::CoveringLookup { collection, .. } => collection,
             other => other.child().expect("non-leaf has a child").collection(),
         }
     }
@@ -132,6 +156,8 @@ impl PhysicalOp {
             PhysicalOp::ColumnScan { .. } => "ColumnScan",
             PhysicalOp::IndexLookup { .. } => "IndexLookup",
             PhysicalOp::IndexRange { .. } => "IndexRange",
+            PhysicalOp::CompositeLookup { .. } => "CompositeLookup",
+            PhysicalOp::CoveringLookup { .. } => "CoveringLookup",
             PhysicalOp::Filter { .. } => "Filter",
             PhysicalOp::Project { .. } => "Project",
             PhysicalOp::Sort { .. } => "Sort",
@@ -189,9 +215,21 @@ impl PhysicalOp {
                     kind,
                     ..
                 } => format!("IndexLookup({collection}.{field} via {})", kind.as_str()),
+                PhysicalOp::CoveringLookup {
+                    collection,
+                    field,
+                    needed,
+                    ..
+                } => format!(
+                    "CoveringLookup({collection}.{field} covering {})",
+                    needed.join(", ")
+                ),
                 PhysicalOp::IndexRange {
                     collection, field, ..
                 } => format!("IndexRange({collection}.{field} via btree)"),
+                PhysicalOp::CompositeLookup {
+                    collection, fields, ..
+                } => format!("CompositeLookup({collection}: {})", fields.join(", ")),
                 PhysicalOp::Filter { predicate, .. } => format!("Filter({predicate:?})"),
                 PhysicalOp::Project { fields, .. } => format!("Project({})", fields.join(", ")),
                 PhysicalOp::Sort { keys, .. } => format!(

@@ -347,8 +347,15 @@ fn a_change_that_rewrites_the_primary_cannot_be_experimented_on() {
     assert!(db.experiment().is_none());
 }
 
+/// Two experiments on the *same* collection would each measure the other.
+///
+/// This used to be the rule for every pair, because the mask and the
+/// "candidates are visible" flag were both global: a second experiment's
+/// unproven structures were exposed to the first's canary traffic. Both are
+/// now per-experiment, so the remaining requirement is only that the two
+/// scopes do not overlap — which this checks is still enforced.
 #[test]
-fn only_one_experiment_runs_at_a_time() {
+fn two_experiments_on_the_same_collection_are_refused() {
     let t = Tmp::new("solo");
     let mut db = seeded(t.path());
     db.begin_experiment(index_decision(), guardrails()).unwrap();
@@ -358,7 +365,165 @@ fn only_one_experiment_runs_at_a_time() {
             guardrails(),
         )
         .unwrap_err();
-    assert!(err.to_string().contains("already running"), "{err}");
+    assert!(
+        err.to_string().contains("same traffic"),
+        "the refusal should explain the overlap, not just decline: {err}"
+    );
+}
+
+/// The feature: two experiments on collections that share no traffic run at
+/// the same time, and each one's candidate stays hidden from the other's
+/// queries.
+#[test]
+fn experiments_on_separate_collections_run_together() {
+    let t = Tmp::new("concurrent");
+    let mut db = seeded(t.path());
+    db.create_collection("orders", Schema::dynamic()).unwrap();
+    for i in 0..2_000u64 {
+        db.insert(
+            "orders",
+            RecordId(i),
+            Record::new()
+                .with("region", if i % 2 == 0 { "north" } else { "south" })
+                .with("total", (i % 100) as i64),
+        )
+        .unwrap();
+    }
+
+    let a = db.begin_experiment(index_decision(), guardrails()).unwrap();
+    let b = db
+        .begin_experiment(
+            Decision::new(
+                "auto_index",
+                "orders.region",
+                DecisionAction::Enable,
+                "test",
+            ),
+            guardrails(),
+        )
+        .expect("a disjoint scope must be allowed");
+
+    assert_ne!(a, b);
+    assert_eq!(
+        db.experiments().count(),
+        2,
+        "both experiments should be running"
+    );
+
+    // Drive both to a verdict together. Neither may see the other's
+    // structures, and both must still return correct answers throughout.
+    let users_plan = LogicalPlan::new(LogicalOp::scan("users").filter(Expr::eq("country", "NO")));
+    let orders_plan =
+        LogicalPlan::new(LogicalOp::scan("orders").filter(Expr::eq("region", "north")));
+    // Derived, not assumed: `seeded` spreads users over four countries, and
+    // a hardcoded count here would fail for a reason that has nothing to do
+    // with what is being tested.
+    let users_expected = db.query(&users_plan).unwrap().len();
+    let orders_expected = db.query(&orders_plan).unwrap().len();
+    assert!(users_expected > 0 && orders_expected > 0);
+
+    for round in 0..60 {
+        db.advance_experiments().unwrap();
+        if db.experiments().count() == 0 {
+            break;
+        }
+        // Drive as much traffic as the *slowest* running phase needs. A 1%
+        // canary wants a thousand queries for ten candidate samples, so a flat
+        // loop never reaches a verdict — it stalls at the bottom of the ramp
+        // with the experiment permanently `Inconclusive`.
+        let needed = db
+            .experiments()
+            .map(|e| match e.phase() {
+                Phase::Shadow => 30usize,
+                Phase::Canary(p) => 20 * 100 / p as usize,
+                _ => 0,
+            })
+            .max()
+            .unwrap_or(0);
+        for i in 0..needed.max(1) {
+            assert_eq!(
+                db.query(&users_plan).unwrap().len(),
+                users_expected,
+                "users answer changed at round {round}, query {i}"
+            );
+            assert_eq!(
+                db.query(&orders_plan).unwrap().len(),
+                orders_expected,
+                "orders answer changed at round {round}, query {i}"
+            );
+        }
+    }
+
+    assert_eq!(
+        db.experiments().count(),
+        0,
+        "both experiments should have reached a verdict"
+    );
+    assert_eq!(
+        db.finished_experiments().len(),
+        2,
+        "both should be recorded as finished"
+    );
+    // Whatever each decided, the answers never moved — which is the invariant
+    // that two concurrent experiments were previously forbidden to protect.
+    assert_eq!(db.query(&users_plan).unwrap().len(), users_expected);
+    assert_eq!(db.query(&orders_plan).unwrap().len(), orders_expected);
+}
+
+/// Retiring one experiment must not unmask the other's unproven structure.
+///
+/// This is the concrete hazard that made concurrency unsafe. It is asserted
+/// through the planner rather than the mask, because what matters is whether a
+/// query can *reach* the structure.
+#[test]
+fn retiring_one_experiment_leaves_the_others_candidate_hidden() {
+    let t = Tmp::new("retire-one");
+    let mut db = seeded(t.path());
+    db.create_collection("orders", Schema::dynamic()).unwrap();
+    for i in 0..2_000u64 {
+        db.insert(
+            "orders",
+            RecordId(i),
+            Record::new().with("region", if i % 2 == 0 { "north" } else { "south" }),
+        )
+        .unwrap();
+    }
+
+    let a = db.begin_experiment(index_decision(), guardrails()).unwrap();
+    let b = db
+        .begin_experiment(
+            Decision::new(
+                "auto_index",
+                "orders.region",
+                DecisionAction::Enable,
+                "test",
+            ),
+            guardrails(),
+        )
+        .unwrap();
+
+    // Get both to the point where their candidates exist but are masked.
+    let orders_plan =
+        LogicalPlan::new(LogicalOp::scan("orders").filter(Expr::eq("region", "north")));
+    for _ in 0..40 {
+        db.advance_experiments().unwrap();
+        db.query(&orders_plan).unwrap();
+    }
+
+    // Abort one. The other's candidate must stay invisible to the planner.
+    db.abort_experiment_by_id(a, "test").unwrap();
+    assert!(
+        !db.experiments().any(|e| e.experiment.id == a),
+        "the aborted experiment should no longer be running"
+    );
+
+    if db.experiments().any(|e| e.experiment.id == b) {
+        let explain = db.explain(&orders_plan);
+        assert!(
+            !explain.contains("IndexLookup"),
+            "aborting experiment #{a} exposed experiment #{b}'s unproven index:\n{explain}"
+        );
+    }
 }
 
 #[test]

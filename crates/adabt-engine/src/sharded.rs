@@ -641,6 +641,23 @@ impl LogicalStore for ShardedDatabase {
     fn count(&mut self, collection: &str) -> Result<usize> {
         ShardedDatabase::count(self, collection)
     }
+
+    /// Ids from every shard, merged back into ascending order.
+    ///
+    /// The sort is the same contract `scan` keeps: shards own disjoint id
+    /// ranges by hash, not by range, so concatenating them yields shard order
+    /// rather than id order. Ids that disagreed with `scan`'s order would make
+    /// the two views of the same collection differ for no reason a caller
+    /// could see.
+    fn ids(&mut self, collection: &str) -> Result<Vec<RecordId>> {
+        let mut out: Vec<RecordId> = self
+            .broadcast(|db| db.ids(collection))?
+            .into_iter()
+            .flatten()
+            .collect();
+        out.sort_unstable();
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
