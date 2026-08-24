@@ -1,0 +1,12 @@
+[package]
+name = "adabt-index"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+adabt-core.workspace = true
+
+[dev-dependencies]
+adabt-testkit.workspace = true

@@ -47,10 +47,21 @@ pub enum FieldType {
     I64,
     U64,
     F64,
-    /// Fixed-width, space-padded text of exactly `width` bytes.
+    /// Fixed-width text occupying exactly `width` bytes, of which a small
+    /// inline length prefix is overhead. See `content_capacity`.
     Char(u32),
-    /// Fixed-width byte array of exactly `len` bytes.
+    /// Fixed-width byte array occupying exactly `len` bytes, length-prefixed.
     FixedBytes(u32),
+    /// Base-ten fixed point at a declared scale. Sixteen bytes, always.
+    ///
+    /// The scale is part of the *type*, so a `Fixed` collection can address a
+    /// price field arithmetically, while the value carries its own scale too so
+    /// that a `Dynamic` collection can hold one at all.
+    Decimal {
+        scale: u8,
+    },
+    /// Nanoseconds since the Unix epoch.
+    Timestamp,
     /// Variable-length UTF-8, optionally capped.
     Str {
         max_len: Option<u32>,
@@ -73,7 +84,8 @@ impl FieldType {
     pub fn fixed_width(&self) -> Option<u32> {
         match self {
             FieldType::Bool => Some(1),
-            FieldType::I64 | FieldType::U64 | FieldType::F64 => Some(8),
+            FieldType::I64 | FieldType::U64 | FieldType::F64 | FieldType::Timestamp => Some(8),
+            FieldType::Decimal { .. } => Some(16),
             FieldType::Char(n) | FieldType::FixedBytes(n) => Some(*n),
             FieldType::Str { .. }
             | FieldType::Bytes { .. }
@@ -83,12 +95,42 @@ impl FieldType {
         }
     }
 
+    /// Bytes of a fixed-width slot consumed by its inline length prefix.
+    ///
+    /// A `Char(n)` field must hold a variable-length string in a constant-size
+    /// slot. Zero-padding would lose trailing NULs and space-padding would lose
+    /// trailing spaces; storing the length inline is the only lossless option,
+    /// and silent truncation is not acceptable in a layout that Level 10 hands
+    /// out raw pointers into.
+    pub const fn length_prefix_bytes(width: u32) -> u32 {
+        if width <= u8::MAX as u32 + 1 {
+            1
+        } else if width <= u16::MAX as u32 + 1 {
+            2
+        } else {
+            4
+        }
+    }
+
+    /// Bytes of *content* a fixed-width slot can hold, which is less than
+    /// `fixed_width` for text and byte fields by the size of the length prefix.
+    pub fn content_capacity(&self) -> Option<u32> {
+        match self {
+            FieldType::Char(n) | FieldType::FixedBytes(n) => {
+                n.checked_sub(Self::length_prefix_bytes(*n))
+            }
+            other => other.fixed_width(),
+        }
+    }
+
     pub fn name(&self) -> String {
         match self {
             FieldType::Bool => "bool".into(),
             FieldType::I64 => "i64".into(),
             FieldType::U64 => "u64".into(),
             FieldType::F64 => "f64".into(),
+            FieldType::Decimal { scale } => format!("decimal[{scale}]"),
+            FieldType::Timestamp => "timestamp".into(),
             FieldType::Char(n) => format!("char[{n}]"),
             FieldType::FixedBytes(n) => format!("bytes[{n}]"),
             FieldType::Str { .. } => "str".into(),
@@ -112,6 +154,21 @@ impl FieldType {
             (FieldType::U64, Value::U64(_)) => true,
             (FieldType::U64, Value::I64(n)) => *n >= 0,
             (FieldType::F64, Value::F64(_) | Value::I64(_) | Value::U64(_)) => true,
+            // A decimal field takes a decimal, or an integer — which is a
+            // decimal at scale zero and converts exactly. It does *not* take a
+            // float: that conversion is the one this type exists to prevent, and
+            // accepting it silently would put a rounded price in a column chosen
+            // precisely so prices are not rounded.
+            (FieldType::Decimal { scale }, Value::Decimal { units, scale: s }) => {
+                crate::value::rescale(*units, *s, *scale).is_some()
+            }
+            (FieldType::Decimal { scale }, Value::I64(n)) => {
+                crate::value::rescale(*n as i128, 0, *scale).is_some()
+            }
+            (FieldType::Decimal { scale }, Value::U64(n)) => {
+                crate::value::rescale(*n as i128, 0, *scale).is_some()
+            }
+            (FieldType::Timestamp, Value::Timestamp(_)) => true,
             (FieldType::Char(_) | FieldType::Str { .. }, Value::Str(_)) => true,
             (FieldType::FixedBytes(_) | FieldType::Bytes { .. }, Value::Bytes(_)) => true,
             (FieldType::List(inner), Value::List(items)) => items.iter().all(|i| inner.accepts(i)),
@@ -185,6 +242,16 @@ impl Schema {
             if self.mode == SchemaMode::Fixed && f.ty.fixed_width().is_none() {
                 return Err(SchemaError::NotFixedWidth(f.name.clone()));
             }
+            // A slot too small to hold its own length prefix has no room for
+            // content, so it is a declaration error rather than a write error.
+            if matches!(f.ty, FieldType::Char(_) | FieldType::FixedBytes(_))
+                && f.ty.content_capacity().unwrap_or(0) == 0
+            {
+                return Err(SchemaError::ZeroCapacity {
+                    field: f.name.clone(),
+                    width: f.ty.fixed_width().unwrap_or(0),
+                });
+            }
         }
         Ok(())
     }
@@ -256,14 +323,16 @@ impl Schema {
                             actual: v.type_name().to_string(),
                         });
                     }
-                    if let (Some(w), Some(len)) = (def.ty.fixed_width(), FieldType::encoded_len(v))
+                    // Compare against *content* capacity, not slot width: part of
+                    // a fixed-width slot is spent on its inline length prefix.
+                    if let (Some(cap), Some(len)) =
+                        (def.ty.content_capacity(), FieldType::encoded_len(v))
                     {
-                        // Char/FixedBytes pad up to width; overflowing it is an error.
-                        if len > w as usize {
+                        if len > cap as usize {
                             return Err(SchemaError::TooWide {
                                 field: def.name.clone(),
                                 len,
-                                width: w,
+                                width: cap,
                             });
                         }
                     }
@@ -399,7 +468,7 @@ mod tests {
         assert!(matches!(
             s.validate_record(&r).unwrap_err(),
             SchemaError::TooWide {
-                width: 32,
+                width: 31,
                 len: 33,
                 ..
             }
@@ -412,5 +481,60 @@ mod tests {
         assert!(!FieldType::I64.accepts(&Value::F64(3.0)));
         assert!(!FieldType::U64.accepts(&Value::I64(-1)));
         assert!(FieldType::U64.accepts(&Value::I64(1)));
+    }
+
+    #[test]
+    fn content_capacity_reserves_room_for_the_length_prefix() {
+        assert_eq!(FieldType::Char(32).fixed_width(), Some(32));
+        assert_eq!(FieldType::Char(32).content_capacity(), Some(31));
+        // Above 256 the prefix needs two bytes, above 65536 four.
+        assert_eq!(FieldType::Char(1000).content_capacity(), Some(998));
+        assert_eq!(FieldType::Char(100_000).content_capacity(), Some(99_996));
+    }
+
+    #[test]
+    fn non_text_fields_have_capacity_equal_to_width() {
+        for ty in [
+            FieldType::Bool,
+            FieldType::I64,
+            FieldType::U64,
+            FieldType::F64,
+        ] {
+            assert_eq!(ty.content_capacity(), ty.fixed_width());
+        }
+    }
+
+    #[test]
+    fn a_slot_too_small_for_its_prefix_is_a_declaration_error() {
+        let err = Schema::new(
+            SchemaMode::Fixed,
+            vec![FieldDef::new("t", FieldType::Char(1))],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, SchemaError::ZeroCapacity { width: 1, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_value_filling_the_slot_exactly_is_rejected_because_of_the_prefix() {
+        let s = fixed_schema();
+        let mut r = Record::new();
+        r.set("id", Value::U64(1));
+        r.set("balance", Value::I64(0));
+        // 32 bytes into a Char(32) slot does not fit: one byte holds the length.
+        r.set("name", Value::Str("x".repeat(32)));
+        assert!(matches!(
+            s.validate_record(&r).unwrap_err(),
+            SchemaError::TooWide {
+                width: 31,
+                len: 32,
+                ..
+            }
+        ));
+        // 31 does fit.
+        r.set("name", Value::Str("x".repeat(31)));
+        assert!(s.validate_record(&r).is_ok());
     }
 }

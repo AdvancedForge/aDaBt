@@ -7,6 +7,7 @@
 
 pub mod error;
 pub mod ids;
+pub mod index_kind;
 pub mod policy;
 pub mod record;
 pub mod schema;
@@ -15,11 +16,12 @@ pub mod value;
 
 pub use error::{Error, Result, SchemaError};
 pub use ids::{CollectionId, IndexId, Lsn, RecordId, RepId, TxnId, ViewId};
+pub use index_kind::IndexKind;
 pub use policy::{
     Consistency, Constraints, Durability, GuaranteeRequirements, Guarantees, Mode, Policy,
     Priorities,
 };
 pub use record::Record;
 pub use schema::{FieldDef, FieldType, Schema, SchemaMode};
-pub use store::LogicalStore;
+pub use store::{normalize_for_storage, LogicalStore};
 pub use value::Value;

@@ -188,15 +188,25 @@ pub fn run<S: LogicalStore>(
 pub fn format_table(reports: &[RunReport]) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "{:<18} {:>3} {:>10} {:>12} {:>10} {:>10} {:>10} {:>9} {:>10}\n",
-        "workload", "lvl", "ops", "ops/sec", "p50 ns", "p99 ns", "p999 ns", "cpu/Mop", "peak RSS"
+        "{:<18} {:<10} {:>3} {:>10} {:>12} {:>10} {:>10} {:>10} {:>9} {:>10}\n",
+        "workload",
+        "engine",
+        "lvl",
+        "ops",
+        "ops/sec",
+        "p50 ns",
+        "p99 ns",
+        "p999 ns",
+        "cpu/Mop",
+        "peak RSS"
     ));
-    out.push_str(&"-".repeat(100));
+    out.push_str(&"-".repeat(112));
     out.push('\n');
     for r in reports {
         out.push_str(&format!(
-            "{:<18} {:>3} {:>10} {:>12.0} {:>10} {:>10} {:>10} {:>9.3} {:>9.1}M\n",
+            "{:<18} {:<10} {:>3} {:>10} {:>12.0} {:>10} {:>10} {:>10} {:>9.3} {:>9.1}M\n",
             r.workload.as_str(),
+            r.engine,
             r.level,
             r.ops,
             r.throughput(),

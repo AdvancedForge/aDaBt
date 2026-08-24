@@ -109,12 +109,30 @@ impl<'a> Generator<'a> {
             FieldType::I64 => Value::I64(self.rng.below(1000) as i64 - 500),
             FieldType::U64 => Value::U64(self.rng.below(1000)),
             FieldType::F64 => Value::F64(self.rng.below(1000) as f64 / 8.0),
+            FieldType::Timestamp => Value::Timestamp(self.rng.below(1 << 40) as i64),
+            // Occasionally an integer, because a decimal field accepts one and
+            // the conversion is exactly the kind of thing worth exercising.
+            FieldType::Decimal { scale } => {
+                if self.rng.chance(0.2) {
+                    Value::I64(self.rng.below(1000) as i64 - 500)
+                } else {
+                    Value::Decimal {
+                        units: self.rng.below(1_000_000) as i128 - 500_000,
+                        scale: *scale,
+                    }
+                }
+            }
+            // Draw against content capacity, not slot width: part of a
+            // fixed-width slot is spent on its inline length prefix, so
+            // generating up to `w` would silently inflate the invalid rate.
             FieldType::Char(w) => {
-                let n = self.rng.below(*w as u64 + 1) as usize;
+                let cap = FieldType::Char(*w).content_capacity().unwrap_or(0) as u64;
+                let n = self.rng.below(cap + 1) as usize;
                 Value::Str("x".repeat(n))
             }
             FieldType::FixedBytes(w) => {
-                let n = self.rng.below(*w as u64 + 1) as usize;
+                let cap = FieldType::FixedBytes(*w).content_capacity().unwrap_or(0) as u64;
+                let n = self.rng.below(cap + 1) as usize;
                 Value::Bytes(vec![7u8; n])
             }
             FieldType::Str { max_len } => {
@@ -170,6 +188,13 @@ impl<'a> Generator<'a> {
             // Occasionally omit a nullable field; omitting a required one is a
             // schema violation the generator produces only via `corrupt_idx`.
             if nullable && self.rng.chance(0.15) {
+                continue;
+            }
+            // And occasionally set it to an *explicit* null. Whether that is
+            // distinguishable from omission is a real semantic question, so the
+            // generator must actually ask it rather than quietly never trying.
+            if nullable && self.rng.chance(0.15) {
+                r.set(name, Value::Null);
                 continue;
             }
             let v = self.value_for(&ty, true);

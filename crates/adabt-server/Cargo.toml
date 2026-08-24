@@ -1,0 +1,17 @@
+[package]
+name = "adabt-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+adabt-core.workspace = true
+adabt-engine.workspace = true
+adabt-ir.workspace = true
+adabt-storage.workspace = true
+adabt-telemetry.workspace = true
+
+[[bin]]
+name = "adabt-server"
+path = "src/main.rs"

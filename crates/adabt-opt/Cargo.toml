@@ -1,0 +1,11 @@
+[package]
+name = "adabt-opt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+adabt-core.workspace = true
+adabt-ir.workspace = true
+adabt-telemetry.workspace = true

@@ -132,3 +132,80 @@ mod tests {
         assert_eq!(b.since(&a).disk_write_bytes, 0);
     }
 }
+
+/// Filesystem type backing `path`, from `/proc/self/mounts`.
+///
+/// The benchmark needs this because a scratch directory on tmpfs makes `fsync`
+/// a no-op, which silently turns a durability measurement into a memory
+/// measurement. That failure is invisible in the results: strict durability
+/// simply looks nearly free, and every conclusion drawn from it is wrong.
+pub fn filesystem_type(path: &std::path::Path) -> Option<String> {
+    let target = path
+        .canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    let mounts = fs::read_to_string("/proc/self/mounts").ok()?;
+    let mut best: Option<(usize, String)> = None;
+    for line in mounts.lines() {
+        let mut f = line.split_whitespace();
+        let _dev = f.next()?;
+        let mount_point = f.next()?;
+        let fstype = f.next()?;
+        // The mount whose path is the longest prefix of the target owns it.
+        let is_prefix = target == mount_point
+            || (target.starts_with(mount_point)
+                && (mount_point == "/" || target.as_bytes().get(mount_point.len()) == Some(&b'/')));
+        if is_prefix
+            && best
+                .as_ref()
+                .is_none_or(|(len, _)| mount_point.len() > *len)
+        {
+            best = Some((mount_point.len(), fstype.to_string()));
+        }
+    }
+    best.map(|(_, t)| t)
+}
+
+/// Whether writes to `path` can actually reach stable storage.
+pub fn is_memory_backed(path: &std::path::Path) -> bool {
+    matches!(
+        filesystem_type(path).as_deref(),
+        Some("tmpfs") | Some("ramfs")
+    )
+}
+
+#[cfg(test)]
+mod fs_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn the_root_filesystem_is_identified() {
+        assert!(filesystem_type(Path::new("/")).is_some());
+    }
+
+    #[test]
+    fn tmpfs_is_recognised_as_memory_backed() {
+        // Skip rather than fail where /dev/shm is absent or not tmpfs.
+        let shm = Path::new("/dev/shm");
+        if shm.exists() && filesystem_type(shm).as_deref() == Some("tmpfs") {
+            assert!(is_memory_backed(shm));
+        }
+    }
+
+    #[test]
+    fn a_real_disk_is_not_memory_backed() {
+        // The root filesystem is ext4/overlay/9p in every environment this runs
+        // in; none of those are memory-backed.
+        assert!(!is_memory_backed(Path::new("/")));
+    }
+
+    #[test]
+    fn the_longest_matching_mount_wins() {
+        // /proc is its own mount, so it must not be attributed to /.
+        if Path::new("/proc").exists() {
+            assert_eq!(filesystem_type(Path::new("/proc")).as_deref(), Some("proc"));
+        }
+    }
+}

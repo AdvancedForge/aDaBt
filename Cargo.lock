@@ -7,6 +7,10 @@ name = "adabt-bench"
 version = "0.0.1"
 dependencies = [
  "adabt-core",
+ "adabt-engine",
+ "adabt-ir",
+ "adabt-opt",
+ "adabt-storage",
  "adabt-telemetry",
  "adabt-testkit",
 ]
@@ -16,6 +20,76 @@ name = "adabt-core"
 version = "0.0.1"
 dependencies = [
  "thiserror",
+]
+
+[[package]]
+name = "adabt-engine"
+version = "0.0.1"
+dependencies = [
+ "adabt-core",
+ "adabt-exec",
+ "adabt-index",
+ "adabt-ir",
+ "adabt-opt",
+ "adabt-storage",
+ "adabt-telemetry",
+ "adabt-testkit",
+]
+
+[[package]]
+name = "adabt-exec"
+version = "0.0.1"
+dependencies = [
+ "adabt-core",
+ "adabt-index",
+ "adabt-ir",
+ "adabt-telemetry",
+ "adabt-testkit",
+]
+
+[[package]]
+name = "adabt-index"
+version = "0.0.1"
+dependencies = [
+ "adabt-core",
+ "adabt-testkit",
+]
+
+[[package]]
+name = "adabt-ir"
+version = "0.0.1"
+dependencies = [
+ "adabt-core",
+]
+
+[[package]]
+name = "adabt-opt"
+version = "0.0.1"
+dependencies = [
+ "adabt-core",
+ "adabt-ir",
+ "adabt-telemetry",
+]
+
+[[package]]
+name = "adabt-server"
+version = "0.0.1"
+dependencies = [
+ "adabt-core",
+ "adabt-engine",
+ "adabt-ir",
+ "adabt-storage",
+ "adabt-telemetry",
+]
+
+[[package]]
+name = "adabt-storage"
+version = "0.0.1"
+dependencies = [
+ "adabt-core",
+ "adabt-telemetry",
+ "adabt-testkit",
+ "lz4_flex",
 ]
 
 [[package]]
@@ -31,6 +105,12 @@ version = "0.0.1"
 dependencies = [
  "adabt-core",
 ]
+
+[[package]]
+name = "lz4_flex"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
 
 [[package]]
 name = "proc-macro2"

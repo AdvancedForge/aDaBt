@@ -7,10 +7,14 @@
 
 pub mod collector;
 pub mod event;
+pub mod export;
 pub mod histogram;
 pub mod probe;
+pub mod sketch;
 
-pub use collector::{CollectingProbe, OpStats, Snapshot};
+pub use collector::{CollectingProbe, OpStats, ShapeStats, Snapshot};
 pub use event::{Event, OpKind, QueryShape};
+pub use export::to_prometheus_text;
 pub use histogram::Histogram;
 pub use probe::{NoopProbe, Probe};
+pub use sketch::TemperatureSketch;

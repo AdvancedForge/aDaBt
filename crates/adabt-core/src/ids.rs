@@ -40,7 +40,16 @@ id_type!(/// Identity of a secondary index.
     IndexId, u32);
 id_type!(/// Identity of a materialized view.
     ViewId, u32);
-id_type!(/// Transaction identity.
+id_type!(/// A monotonic write/visibility stamp, assigned fresh to every physical
+    /// write for MVCC ordering. Despite the name, this is not a multi-statement
+    /// transaction's identity — see [`TransactionId`] for that — it predates
+    /// multi-statement transactions and named the closest concept available at
+    /// the time: "the write that is happening now."
     TxnId, u64);
+id_type!(/// The identity of a multi-statement transaction, as the caller sees
+    /// it — allocated once at `begin`, held for the transaction's lifetime, and
+    /// never itself written to a version chain. Distinct from [`TxnId`], which
+    /// stamps each individual physical write.
+    TransactionId, u64);
 id_type!(/// Write-ahead log sequence number.
     Lsn, u64);

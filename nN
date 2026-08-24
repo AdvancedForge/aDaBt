@@ -1,0 +1,11 @@
+    /// Bytes after which a log segment is sealed. See [`crate::wal::Wal::set_segment_bytes`].
+    pub fn set_segment_bytes(&mut self, bytes: u64) {
+        self.wal.set_segment_bytes(bytes);
+    }
+
+    /// Send discarded log segments here rather than deleting them.
+    pub fn set_log_archive(&mut self, dir: Option<std::path::PathBuf>) {
+        self.wal.set_archive(dir);
+    }
+
+    /// Turn sequential read-ahead on or off in the buffer pool.

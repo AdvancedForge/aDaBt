@@ -14,7 +14,7 @@ use adabt_core::error::{Error, Result};
 use adabt_core::ids::RecordId;
 use adabt_core::record::Record;
 use adabt_core::schema::Schema;
-use adabt_core::store::LogicalStore;
+use adabt_core::store::{normalize_for_storage, LogicalStore};
 use std::collections::BTreeMap;
 
 struct Collection {
@@ -75,7 +75,8 @@ impl LogicalStore for ReferenceStore {
         Ok(&self.coll(collection)?.schema)
     }
 
-    fn insert(&mut self, collection: &str, id: RecordId, rec: Record) -> Result<()> {
+    fn insert(&mut self, collection: &str, id: RecordId, mut rec: Record) -> Result<()> {
+        normalize_for_storage(&mut rec);
         let c = self.coll_mut(collection)?;
         // Validate before the existence check so that a schema-invalid insert
         // reports the schema problem regardless of whether the id is taken.
@@ -87,11 +88,12 @@ impl LogicalStore for ReferenceStore {
         Ok(())
     }
 
-    fn get(&self, collection: &str, id: RecordId) -> Result<Option<Record>> {
+    fn get(&mut self, collection: &str, id: RecordId) -> Result<Option<Record>> {
         Ok(self.coll(collection)?.records.get(&id).cloned())
     }
 
-    fn update(&mut self, collection: &str, id: RecordId, rec: Record) -> Result<bool> {
+    fn update(&mut self, collection: &str, id: RecordId, mut rec: Record) -> Result<bool> {
+        normalize_for_storage(&mut rec);
         let c = self.coll_mut(collection)?;
         c.schema.validate_record(&rec)?;
         Ok(c.records.insert(id, rec).is_some())
@@ -101,7 +103,7 @@ impl LogicalStore for ReferenceStore {
         Ok(self.coll_mut(collection)?.records.remove(&id).is_some())
     }
 
-    fn scan(&self, collection: &str) -> Result<Vec<(RecordId, Record)>> {
+    fn scan(&mut self, collection: &str) -> Result<Vec<(RecordId, Record)>> {
         Ok(self
             .coll(collection)?
             .records
@@ -110,7 +112,7 @@ impl LogicalStore for ReferenceStore {
             .collect())
     }
 
-    fn count(&self, collection: &str) -> Result<usize> {
+    fn count(&mut self, collection: &str) -> Result<usize> {
         Ok(self.coll(collection)?.records.len())
     }
 }

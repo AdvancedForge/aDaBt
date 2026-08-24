@@ -1,0 +1,23 @@
+    let mut h = HeapStore::open(t.path(), Durability::Relaxed, 256).unwrap();
+    h.create_collection("c", Schema::dynamic()).unwrap();
+
+    // Write enough to fill several segments, checkpointing as we go.
+    let mut peak = 0u64;
+    for round in 0..6u64 {
+        for i in 0..8_000u64 {
+            h.insert("c", RecordId(round * 8_000 + i), rec(i)).unwrap();
+        }
+        h.checkpoint().unwrap();
+        peak = peak.max(log_bytes(t.path()));
+    }
+    let settled = log_bytes(t.path());
+    assert!(
+        settled < peak,
+        "the log never shrank: peak {peak}, settled {settled}"
+    );
+    // And what it settles at is bounded by a segment or two, not by history.
+    assert!(
+        settled <= 3 * SEGMENT_BYTES,
+        "the log settled at {settled} bytes, which is not bounded"
+    );
+    assert_eq!(h.count("c").unwrap(), 48_000);

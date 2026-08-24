@@ -2,20 +2,33 @@
 resolver = "2"
 members = [
     "crates/adabt-core",
+    "crates/adabt-ir",
     "crates/adabt-telemetry",
+    "crates/adabt-storage",
+    "crates/adabt-index",
+    "crates/adabt-exec",
+    "crates/adabt-opt",
+    "crates/adabt-engine",
     "crates/adabt-testkit",
     "crates/adabt-bench",
+    "crates/adabt-server",
 ]
 
 [workspace.package]
 version = "0.0.1"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.82"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 adabt-core = { path = "crates/adabt-core" }
+adabt-ir = { path = "crates/adabt-ir" }
 adabt-telemetry = { path = "crates/adabt-telemetry" }
+adabt-storage = { path = "crates/adabt-storage" }
+adabt-index = { path = "crates/adabt-index" }
+adabt-exec = { path = "crates/adabt-exec" }
+adabt-opt = { path = "crates/adabt-opt" }
+adabt-engine = { path = "crates/adabt-engine" }
 adabt-testkit = { path = "crates/adabt-testkit" }
 thiserror = "1"
 

@@ -1,0 +1,18 @@
+[package]
+name = "adabt-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+adabt-core.workspace = true
+adabt-ir.workspace = true
+adabt-index.workspace = true
+adabt-exec.workspace = true
+adabt-storage.workspace = true
+adabt-telemetry.workspace = true
+adabt-opt.workspace = true
+
+[dev-dependencies]
+adabt-testkit.workspace = true

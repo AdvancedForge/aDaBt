@@ -2,73 +2,161 @@
 
 A database whose **logical interface stays fixed while its physical
 implementation ranges from completely conventional to radically specialized** —
-and where the choice of specialization can be made by a human or, later, by the
-database itself, through the same mechanism.
+and where the choice of specialization can be made by a human or by the database
+itself, through the same mechanism.
 
-Status: **M0 — foundation.** No storage engine yet. See
-`~/.claude/plans/alright-you-will-be-linked-peacock.md` for the full plan.
+Status: **M0–M15 complete** (M13's per-core work landed in M15 as shared-nothing
+partitioning; thread-per-core proper is still not built). 708 tests, 34,857 lines.
+
+Start with **`docs/diagnosis.md`** — what this actually does, where it is useful,
+and how far it is from being a normal, a good, a manually optimal and an
+automatically optimal database. Milestone notes and measurements are in `docs/`.
 
 ## Layout
 
 | Crate | Role |
 |---|---|
-| `adabt-core` | Logical vocabulary: `Value`, `Record`, `Schema`, ids, `Policy`, and the `LogicalStore` contract. No storage or execution code. |
-| `adabt-telemetry` | Probes, events, log-linear latency histograms. Compiles away entirely when disabled. |
-| `adabt-testkit` | Reference model, deterministic op generator, differential runner. |
-| `adabt-bench` | Workloads and the level x workload measurement harness. |
+| `adabt-core` | Logical vocabulary: `Value`, `Record`, `Schema`, ids, `Policy`, `LogicalStore`. No physical code. |
+| `adabt-ir` | Logical plans, expressions, `QueryShape` / `QueryKey`. Pure. |
+| `adabt-telemetry` | Sharded probes, per-shape stats, log-linear histograms, decaying temperature sketch. |
+| `adabt-storage` | Slotted pages, buffer pool, WAL, recovery, codecs, compression, version chains, heap. |
+| `adabt-index` | Hash and B-tree secondary indexes. |
+| `adabt-exec` | Batched operators, planner, shape-invariant access decisions. |
+| `adabt-opt` | `Optimization`, registry, levels, controller, decision log, scoring, calibrated cost model, adaptive driver, experiments. **Depends on nothing physical.** |
+| `adabt-engine` | `Database`: heap + indexes + caches + column store + direct arrays + compiled paths + schema inference + materialized views + the live experiment runner. |
+| `adabt-testkit` | Reference model, deterministic generator, differential runner. |
+| `adabt-bench` | Workloads and measurement harnesses. |
+| `adabt-server` | TCP listener, binary protocol, blocking client. No lock around the engine — the shards hold their own. |
 
-## Three ideas that carry the design
+## What the measurements say
 
-**The schema-mode spectrum.** How rigid a collection is, is a declared dial:
-`Dynamic → Declared → Strict → Fixed`. `Dynamic` is the freedom endpoint;
-`Fixed` gives constant-size records, which is the precondition that makes
-`address = BASE + id * RECORD_SIZE` legal at Level 10+. The logical call is
-`store.get("users", id)` in every mode — only the physical path differs.
+Every number below is reproducible from `adabt-bench`; the caveats are in `docs/`.
 
-**Derived representations are rebuildable.** Each collection will hold one
-authoritative *primary* representation and N *derived* ones (indexes, caches,
-column stores, fixed arrays), every derived one fully rebuildable from the
-primary. Adding one can never lose data, rollback is a drop, and any divergence
-is a bug to hard-fail on rather than a data-loss event to reconcile.
+| | |
+|---|---|
+| Strict vs relaxed durability, writes | **5,900×** — which is why guarantees filter rather than score |
+| `auto_index` on an equality filter | **10.5×** |
+| Column store on aggregates | **9.6×** |
+| Record compression, stored bytes | **>2× smaller** |
+| Compiled path vs general query path | **3.0×** (p50 1280ns → 432ns) |
+| Single field from a computed address | **14×** (p50 1280ns → 92ns) |
+| Materialized view vs recomputing the aggregate | **>10×** — groups instead of rows |
+| Sequential scan with read-ahead | **>8×** fewer reads (160 pages, 160 → under 20) |
+| Opening a database, both caches vs neither | **2.4×** (1,854 → 768 ms at 200k records) |
+
+And what it does unaided, from `adabt-bench soak` — five workloads in sequence,
+123,801 queries, adaptive mode, nothing configured:
+
+| phase | p50 at start | p50 at end | |
+|---|---|---|---|
+| identity lookups | 1,099 ns | 436 ns | **−60%** |
+| point filters | 7,079 µs | 1,069 µs | **−85%** |
+| range filters | 12,373 µs | 490 µs | **−96%** |
+| grouped aggregates | 1,824 µs | 1,850 µs | −1% |
+
+The last row is not padding. It is a standing, reproducible measurement of the
+optimizer keeping something that is not paying for itself, and
+`docs/diagnosis.md` says why.
+
+## Six ideas that carry the design
+
+**The schema-mode spectrum.** `Dynamic → Declared → Strict → Fixed` is a
+declared, per-collection dial, and the database can *move along it* from
+evidence. A collection that started schemaless and settled into a shape becomes
+directly addressable without its API changing.
+
+**Derived representations are rebuildable.** Indexes, caches, column stores and
+direct arrays are all reconstructible from the primary. Adding one cannot lose
+data, rollback is a drop, and divergence is always a bug — never reconcilable.
 
 **Guarantees filter; priorities score.** `durability: strict` makes
-async-durability techniques *invisible* to the optimizer — not merely expensive.
-Constraints are hard feasibility; only the surviving set gets scored against the
-speed/resources/freedom priorities.
+async-durability techniques *invisible*, not merely expensive.
+
+**The resource axis points both ways.** Most optimizations spend memory to buy
+latency; compression trades the other way, so a `resources`-priority policy has
+something to select. A test enforces that at least one such optimization exists.
+
+**One control path.** Manual and adaptive selection are two implementations of
+`OptimizationDriver` feeding one `OptimizationController`. Every decision is
+logged, including manual ones.
+
+**Evidence outranks estimate.** A prior claiming a 70% win that measurement
+refutes stops arguing for itself. Irreversible changes are never made
+automatically, because every safety mechanism assumes a decision can be undone.
+
+## Optimization never changes answers
+
+Enforced, not asserted. The differential runner replays random operation
+sequences against a reference model at every optimization level; separate tests
+run every query at every level, before and after every specialisation, and
+demand identical results.
 
 ## Build
 
-Requires a C linker (`build-essential` on Debian/Ubuntu).
+Requires a C linker and Rust 1.82+.
 
 ```sh
 cargo test --workspace
-cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Build artefacts go to `~/.cargo-target/adabt` (see `.cargo/config.toml`): the
-source lives on a 9p-mounted Windows drive where Cargo's I/O is 5-15x slower
-than native.
+Artefacts go to `~/.cargo-target/adabt` — the source lives on a 9p-mounted
+Windows drive where Cargo's I/O is 5–15× slower.
 
 ## Benchmarks
 
 ```sh
-cargo build --profile bench-fast -p adabt-bench   # release codegen, fast to compile
+cargo build --profile bench-fast -p adabt-bench
 B=~/.cargo-target/adabt/bench-fast/adabt-bench
 
-$B list
-$B run    --workload point_lookup --size 100000 --ops 200000
-$B matrix --size 50000 --ops 300000 --duration 4 --out results.json
+$B matrix       --engine engine --levels 0,1,2,3,10
+$B query-matrix --levels 0,1,2,4,10 --disable result_cache
+$B compiled     --size 50000 --ops 20000
 ```
 
-Every run is bounded by **both** an op count and a wall-clock deadline
-(`--duration`, default 10s), and reports the ops it actually completed. An
-op-count budget alone is the wrong bound for a matrix: an unbounded scan costs
-four orders of magnitude more than a point get, so a count that is brisk for one
-workload runs for hours on another.
+`--disable` forces an optimization off whatever the level says, so a benchmark
+can isolate one from another that would mask it. The harness warns when its data
+directory is memory-backed: `fsync` on tmpfs never reaches a disk, and an early
+version of these numbers was wrong because of it.
 
-At M0 every run is against the reference model at level 0 — a deliberately
-unoptimised `BTreeMap` floor that Level 0 must not fall below. The matrix
-rejects non-zero levels rather than printing identical rows under different
-labels, which would read as "optimization made no difference" instead of "not
-built yet".
+## Watching it work
+
+```sh
+$B soak --data-dir /var/tmp/soak --size 5000 --ops-per-phase 25000 --log
+```
+
+Runs the adaptive engine against a workload that changes underneath it, with a
+second database pinned at level 0 taking the same queries — any difference in
+results stops the run. It found four defects in its first sitting, all of them
+interactions between components that each passed their own tests, and it is the
+only test here that can see that class of bug. `docs/m15-notes.md` has them.
+
+## Proving a change before trusting it
+
+An optimization that adds a derived representation is not switched on; it is put
+on trial. The structure is built where the planner cannot see it, both paths
+answer the same queries against the same state until the results are known to
+agree, and only then does traffic move — 1%, 10%, 50%, 90% — with any divergence
+or guardrail breach reverting it. `optimize_verified` is the entry point;
+`docs/m14-notes.md` explains what shadow proves that canary cannot, and why.
+
+Changes that rewrite the primary are refused for the trial with a reason, because
+after one there is no old path left to compare against.
+
+## What is not built
+
+No joins, no multi-statement transactions, no SQL, no replication, no backup or
+restore, no authentication. The write-ahead log is never truncated, so it is read
+in full on every open and is now the entire remaining cost of opening a database.
+
+Shared-nothing partitioning exists; **thread-per-core does not** — no core
+pinning, no `io_uring`, no zero-copy path. `--shards 1` is the unpartitioned
+behaviour exactly, which is the honest way to measure what partitioning is worth.
+
+`SUM` is materialized only while integer arithmetic stays exact, aggregates are
+never combined across shards, and `MIN`/`MAX` are not maintained at all. Each is
+a place where a faster implementation was available and was rejected because it
+would have moved an answer in the last decimal place.
+
+`docs/diagnosis.md` is the full accounting, including what the optimizer still
+cannot reason about.

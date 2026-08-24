@@ -9,6 +9,10 @@ license.workspace = true
 adabt-core.workspace = true
 adabt-telemetry.workspace = true
 adabt-testkit.workspace = true
+adabt-storage.workspace = true
+adabt-engine.workspace = true
+adabt-ir.workspace = true
+adabt-opt.workspace = true
 
 [[bin]]
 name = "adabt-bench"

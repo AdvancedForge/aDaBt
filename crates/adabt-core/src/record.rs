@@ -51,6 +51,15 @@ impl Record {
         self.fields.is_empty()
     }
 
+    /// Rough in-memory footprint, in bytes. See `Value::approx_size` — the
+    /// same "close enough for a circuit breaker" contract applies here.
+    pub fn approx_size(&self) -> usize {
+        self.fields
+            .iter()
+            .map(|(k, v)| k.len() + v.approx_size())
+            .sum()
+    }
+
     /// Keep only the named fields. Used by projection pushdown, and by the
     /// column-store representation when serving a partial read.
     pub fn project(&self, names: &[&str]) -> Record {

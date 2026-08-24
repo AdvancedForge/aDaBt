@@ -15,12 +15,77 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     /// The user picks. The engine must not change strategy on its own.
-    Manual {
-        level: u8,
-        overrides: Vec<(String, bool)>,
-    },
+    Manual { level: u8, overrides: Vec<Override> },
     /// The user states priorities; the engine picks and revises.
     Adaptive,
+}
+
+/// One explicit thing an expert wants the optimizer to do, on top of
+/// whatever `level` already turns on.
+///
+/// `("column_store", true)` used to be all an override could say — an
+/// on/off switch, always applied at the one scope the driver knew about:
+/// `"global"`. That was never expressive enough for "index users.country
+/// hash" or "compile shape X", both of which name a specific *place* to
+/// act, not just a capability to flip. `scope` and `params` are what close
+/// that gap, and they reuse the exact vocabulary `adabt-opt`'s own
+/// `Registry`/`Optimization` machinery already has for the same two
+/// concepts — `OptScope`'s `describe()` form for scope strings, and
+/// per-optimization tuning numbers for params — rather than inventing a
+/// second one at the policy layer.
+///
+/// `params` is `Vec<(String, i64)>`, not `adabt_opt::config::Params`,
+/// because `adabt-core` has no dependency on `adabt-opt` and must not
+/// gain one just to name a policy directive — the same reasoning that put
+/// `IndexKind` here instead of in the crate that builds one. `ManualDriver`
+/// converts this into a real `Params` where it is actually consumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Override {
+    pub name: String,
+    /// `"global"` for a whole-database toggle; a scope string like
+    /// `"users.country"` (collection.field) to name one specific place —
+    /// see `adabt_opt::optimization::OptScope::describe` for the forms this
+    /// mirrors. An optimization whose `ScopeKind` is not `Global` and whose
+    /// override is left at `"global"` is expanded into every scope that
+    /// currently qualifies, exactly as a level preset already is; naming a
+    /// scope explicitly targets that one place instead.
+    pub scope: String,
+    pub enabled: bool,
+    /// Tuning numbers for this override — for example, an explicit index
+    /// kind (`IndexKind::as_ordinal`) so "index users.country hash" means
+    /// hash and not whatever the workload's telemetry would have guessed.
+    /// Empty for an override that only wants the default.
+    pub params: Vec<(String, i64)>,
+}
+
+impl Override {
+    /// A global on/off toggle — everything an override could express before
+    /// `scope` and `params` existed.
+    pub fn toggle(name: impl Into<String>, enabled: bool) -> Self {
+        Self {
+            name: name.into(),
+            scope: "global".into(),
+            enabled,
+            params: Vec::new(),
+        }
+    }
+
+    /// Name a specific scope — a collection, a `"collection.field"` pair, or
+    /// whatever else the named optimization's `ScopeKind` expects — instead
+    /// of defaulting to `"global"`.
+    pub fn scoped(name: impl Into<String>, scope: impl Into<String>, enabled: bool) -> Self {
+        Self {
+            name: name.into(),
+            scope: scope.into(),
+            enabled,
+            params: Vec::new(),
+        }
+    }
+
+    pub fn with_param(mut self, key: impl Into<String>, value: i64) -> Self {
+        self.params.push((key.into(), value));
+        self
+    }
 }
 
 impl Default for Mode {
@@ -138,7 +203,19 @@ impl GuaranteeRequirements {
 /// Hard resource ceilings. `None` means unbounded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Constraints {
+    /// Extra memory an *optimization* may commit while building a new
+    /// derived representation — read only by `adabt-opt`'s cost model, never
+    /// by query execution. A tight ceiling here says "don't let the driver
+    /// build expensive structures," not "don't let a query buffer much,"
+    /// which is a different question with its own field below: a policy
+    /// tuned to keep the optimizer thrifty is not thereby also asking every
+    /// sort and aggregate to run in a few kilobytes.
     pub max_ram_bytes: Option<u64>,
+    /// Ceiling on what one query may buffer at once — read only by
+    /// `adabt_exec::exec`'s `Sort`/`Aggregate` operators, via
+    /// `Database::query`/`ShardedDatabase::query`. See `max_ram_bytes` for
+    /// why this is not the same field.
+    pub max_query_ram_bytes: Option<u64>,
     pub max_storage_bytes: Option<u64>,
     pub max_cpu_cores: Option<u32>,
     pub max_build_secs: Option<u64>,

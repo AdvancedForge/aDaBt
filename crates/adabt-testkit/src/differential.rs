@@ -207,7 +207,7 @@ mod tests {
             }
             self.inner.insert(c, id, r)
         }
-        fn get(&self, c: &str, id: RecordId) -> Result<Option<Record>> {
+        fn get(&mut self, c: &str, id: RecordId) -> Result<Option<Record>> {
             self.inner.get(c, id)
         }
         fn update(&mut self, c: &str, id: RecordId, r: Record) -> Result<bool> {
@@ -216,10 +216,10 @@ mod tests {
         fn delete(&mut self, c: &str, id: RecordId) -> Result<bool> {
             self.inner.delete(c, id)
         }
-        fn scan(&self, c: &str) -> Result<Vec<(RecordId, Record)>> {
+        fn scan(&mut self, c: &str) -> Result<Vec<(RecordId, Record)>> {
             self.inner.scan(c)
         }
-        fn count(&self, c: &str) -> Result<usize> {
+        fn count(&mut self, c: &str) -> Result<usize> {
             self.inner.count(c)
         }
     }
