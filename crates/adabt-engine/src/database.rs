@@ -212,6 +212,10 @@ pub struct Database {
     /// `None` is the default: logging every query's wall-clock time is a cost
     /// nobody asked for, so this opts in rather than the reverse.
     slow_query: Option<(Duration, SlowQuerySink)>,
+    /// Per-collection clustering hints, set with [`Database::declare_cluster_field`]:
+    /// the field whose integer value steers *where* a record is placed. A hint,
+    /// not a constraint — see that method for exactly what is and is not promised.
+    cluster_fields: HashMap<String, String>,
 }
 
 /// Everything an `OptContext` borrows, owned.
@@ -414,6 +418,7 @@ impl Database {
             next_txn_id: 1,
             pending_cancel: None,
             slow_query: None,
+            cluster_fields: HashMap::new(),
         };
         db.unique_constraints = crate::unique::read(db.store.dir());
         // Restore the indexes the log says existed.
@@ -1571,6 +1576,63 @@ impl Database {
 
     pub fn compression_enabled(&self) -> bool {
         self.store.compression_enabled()
+    }
+
+    /// Declare `field` as the collection's clustering hint: subsequent inserts
+    /// are *placed* so records with nearby integer values land on the same
+    /// pages, which is what turns a range scan over that field from a
+    /// scatter of page reads into a run of consecutive ones.
+    ///
+    /// What is promised, precisely:
+    /// - answers never change — clustering is placement, not content, and
+    ///   every read path is identical to an unclustered collection's;
+    /// - the hint is advisory. Updates may move a record to any page with
+    ///   room; deletes leave holes; a restart forgets the declaration (the
+    ///   placement machinery stays correct without it). Re-declare after
+    ///   open to keep steering new inserts.
+    ///
+    /// Only integer fields can steer placement today: the key is the field's
+    /// value cast to `i64`, and anything else is silently inserted unclustered.
+    pub fn declare_cluster_field(&mut self, collection: &str, field: &str) -> Result<()> {
+        self.store.schema_of(collection)?;
+        self.cluster_fields
+            .insert(collection.to_string(), field.to_string());
+        Ok(())
+    }
+
+    /// Drop a collection's clustering hint. Existing placements stay where
+    /// they are; only future keyed inserts revert to first-fit.
+    pub fn clear_cluster_field(&mut self, collection: &str) {
+        self.cluster_fields.remove(collection);
+    }
+
+    /// Distinct pages `get` has touched since the last clear — the number a
+    /// locality claim is measured against. See [`HeapStore::touched_pages`].
+    pub fn touched_pages(&self) -> usize {
+        self.store.touched_pages()
+    }
+
+    /// Reset the touched-page diagnostic.
+    pub fn clear_page_touches(&mut self) {
+        self.store.clear_page_touches();
+    }
+
+    /// The declared clustering hint for `collection`, if any.
+    pub fn cluster_field(&self, collection: &str) -> Option<&str> {
+        self.cluster_fields.get(collection).map(String::as_str)
+    }
+
+    /// The integer key a record contributes to the clustering hint, or `None`
+    /// when the collection has no hint or the value is not an integer.
+    fn cluster_key(collection: &str, field: &str, rec: &Record) -> Option<i64> {
+        match rec.get(field) {
+            Some(adabt_core::value::Value::I64(v)) => Some(*v),
+            Some(adabt_core::value::Value::U64(v)) => i64::try_from(*v).ok(),
+            _ => {
+                let _ = collection;
+                None
+            }
+        }
     }
 
     pub fn index_memory_bytes(&self) -> usize {
@@ -3249,7 +3311,14 @@ impl LogicalStore for Database {
         let mut stored = rec.clone();
         adabt_core::store::normalize_for_storage(&mut stored);
         self.check_unique_constraints(collection, None, &stored)?;
-        self.store.insert(collection, id, rec)?;
+        let key = self
+            .cluster_fields
+            .get(collection)
+            .and_then(|f| Self::cluster_key(collection, f, &rec));
+        match key {
+            Some(k) => self.store.insert_keyed(collection, id, rec, k)?,
+            None => self.store.insert(collection, id, rec)?,
+        }
         self.reindex_insert(collection, id, &stored);
         self.bump_epoch(collection);
         self.observe(collection, OpKind::Insert, t, 1);

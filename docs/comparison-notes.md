@@ -10,6 +10,27 @@ also fixed in this document.
 
 ## The numbers
 
+### Compression today: what lz4 covers, and what the default question actually is (investigated, not benchmarked)
+
+Record compression is per-record lz4 (`lz4_flex`) in the heap payload only,
+**off by default**, opt-in through the optimizer's `record_compression` action
+(level ≥ 2, gated at ≥ 500 rows). The properties that matter:
+
+- **Never expands.** A record that would shrink < 3% is stored raw; the
+  encoding bit rides in each slot prefix, so compressed and raw records
+  coexist and toggling needs no migration.
+- **The default-off choice is deliberate**, not an omission: the optimizer
+  gates it on row count because the CPU cost is not worth paying below a few
+  hundred rows, and the cost estimates carry confidence 0.3 by design —
+  whether a dataset compresses is a property of the *data*.
+- **What it does not cover:** WAL frames (replayed rarely — right call),
+  columnar segments (dictionary encoding lives there instead), index files.
+
+So "change the defaults" is not the next move; the honest next move for this
+thread is *measurement*: stored bytes + insert/scan throughput with the flag
+on vs off on realistic records, which is what Stage 7's standing measurement
+was for. Prefix/delta compression (Stage 2 item 5) remains untouched.
+
 ### Bitmap versus hash, settled by benchmark (the planner question)
 
 `adabt-bench index-scale`, low-cardinality field (4 distinct values), release

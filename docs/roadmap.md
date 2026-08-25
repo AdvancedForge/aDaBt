@@ -86,8 +86,8 @@ both dynamic and declared schemas).
 | gap | why it matters |
 |---|---|
 | **Thread-per-core (M28)** | Everything is one `Mutex` deep. On any modern core count this is the dominant ceiling, and the largest single item on the track. |
-| **Zero-copy fetch, the literal remainder** | Owned records still materialize on the fetch loop. Two allocations per row is the floor *of the owned form*; the borrowed view over decoded pages is the design M27 named and nothing has replaced. |
-| **Clustered sort order** | The only thing that makes a range scan sequential rather than random. |
+| **Zero-copy fetch, the literal remainder** | Owned records still materialize on the fetch loop. Two allocations per row is the floor *of the owned form*; the borrowed view over decoded pages is the design M27 named. Its foundation landed: `RecordCodec::peek_field` decodes one field straight out of an encoded buffer — no record map, no name interning, skip cost of one field instead of one record (tested against full decode across Fixed/Strict/Dynamic). What remains is the executor integration: a `Source` fetch that projects through this seam and a batch type that can hold borrowed rows. |
+| **Clustered sort order** | The mechanism landed (see Stage 2 item 4); what remains is persisting the declaration across restarts and letting the optimizer propose it. |
 | **Cost-model honesty** | Every estimate assumes indexed point lookups are flat in collection size; measured, they grow (6.3 µs at 100k rows, 12.4 µs at 800k). The bitmap-over-hash preference is a reasoned ordering that measurement contradicted at 1M rows and left in place. Both must be decided by benchmark. |
 | **Prefix/delta compression** | Dictionary encoding landed; these two did not. |
 | **io_uring (M29)** | Needs an async storage path first. Real, but last. |
@@ -243,9 +243,20 @@ In order:
    through `CoveringLookup` with zero fetches; indexed range went 1.8–3× to
    **~1.5×** through `CoveringRange`. The residue in both is per-row
    projection-record construction — item 2's territory.
-4. **Clustered sort order** — a collection may declare physical order;
-   range scans over it become sequential. *Finish test:* page reads for a range
-   scan drop to the pages the range physically occupies.
+4. **Clustered sort order** — **landed (mechanism)**: a collection may
+   declare a clustering field (`Database::declare_cluster_field`); integer
+   keys steer *placement*, so records with nearby values land on the same
+   pages and an index range over that field touches pages in proportion to
+   the range, not the collection — the finish test passes on identical data
+   differing only in the hint (10%-of-domain band: 31–46 of 200 pages vs all
+   of them unclustered). The placement policy went through two refuted
+   designs before landing (nearest-at-any-distance lets wide pages hoard
+   everything; strict containment refuses to fill gaps) — the working rule is
+   *nearest within twice one page's share of the observed domain*, which is
+   self-limiting by construction; see `place_keyed`. Answers never change;
+   clustering is placement, not content. *Still open:* persisting the
+   declaration across restarts (it is session state today), optimizer
+   proposals, reclustering existing data.
 5. **Prefix/delta compression** alongside dictionary encoding. *Finish test:*
    stored bytes on sorted-key collections fall measurably further, decode cost
    within a stated bound of today's.

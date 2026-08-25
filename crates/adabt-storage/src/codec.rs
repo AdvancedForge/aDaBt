@@ -794,6 +794,95 @@ impl RecordCodec {
         Ok(self.decode_with_header(buf)?.1)
     }
 
+    /// Decode exactly one field of an encoded record, borrowing the buffer.
+    ///
+    /// This is the seed of the borrowed view M27 named: a fetch that needs
+    /// two of twenty fields should not pay for a `Record` — the map, the
+    /// name refcounts, the reserve — to throw the other eighteen away. It
+    /// walks only what the requested field needs: the header, its presence
+    /// bit, and (for variable fields) one offset-table entry. Everything else
+    /// in the buffer is untouched bytes.
+    ///
+    /// The returned `Value` is still owned — strings copy out of the buffer,
+    /// because lending slices tied to an encoded page's lifetime is the
+    /// executor's next step, not this one. What lands here is the *skip*
+    /// cost: decoding one field of a wide record costs one field, not one
+    /// record.
+    pub fn peek_field(&self, buf: &[u8], field: &str) -> Result<Option<Value>> {
+        if self.schema.mode() == SchemaMode::Dynamic {
+            // Names live in the record; walk TLVs and match raw bytes so a
+            // miss costs a scan of name prefixes, not a decode of values.
+            let mut c = Cursor::new(buf);
+            c.take(HEADER_LEN)?;
+            let n = c.varint()? as usize;
+            for _ in 0..n {
+                let klen = c.varint()? as usize;
+                let matches = {
+                    let raw = c.take(klen)?;
+                    raw == field.as_bytes()
+                };
+                let v = read_tlv_value(&mut c, 0)?;
+                if matches {
+                    return Ok(Some(v));
+                }
+            }
+            return Ok(None);
+        }
+
+        let fields = self.schema.fields();
+        let Some(i) = fields.iter().position(|f| f.name == field) else {
+            return Ok(None);
+        };
+        let n = fields.len();
+        let bm_len = bitmap_len(n);
+        if buf.len() < HEADER_LEN + bm_len {
+            return Err(Error::Corruption(
+                "record too short for its presence bitmap".to_string(),
+            ));
+        }
+        let bitmap = &buf[HEADER_LEN..HEADER_LEN + bm_len];
+        if !bit_get(bitmap, i) {
+            return Ok(None);
+        }
+        let fixed_at = HEADER_LEN + bm_len;
+
+        if let Some(w) = fields[i].ty.fixed_width() {
+            let at = fixed_at + self.fixed_offsets[i] as usize;
+            let end = at + w as usize;
+            if end > buf.len() {
+                return Err(Error::Corruption(format!(
+                    "fixed field {i} extends past the record"
+                )));
+            }
+            return read_fixed_field(&fields[i].ty, &buf[at..end]).map(Some);
+        }
+
+        let k = self
+            .variable
+            .iter()
+            .position(|&v| v == i)
+            .expect("variable field indexed");
+        let table_at = fixed_at + self.fixed_region_len as usize;
+        let entries = self.variable.len() + 1;
+        if table_at + 4 * entries > buf.len() {
+            return Err(Error::Corruption(
+                "record too short for its offset table".to_string(),
+            ));
+        }
+        let offset_at = |kk: usize| -> usize {
+            let at = table_at + 4 * kk;
+            u32::from_le_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]) as usize
+        };
+        let (lo, hi) = (offset_at(k), offset_at(k + 1));
+        if lo > hi || hi > buf.len() {
+            return Err(Error::Corruption(format!(
+                "offset table entry {k} is out of range"
+            )));
+        }
+        let mut c = Cursor::new(&buf[lo..hi]);
+        read_tlv_value(&mut c, 0).map(Some)
+    }
+
     pub fn decode_with_header(&self, buf: &[u8]) -> Result<(RecordHeader, Record)> {
         let header = RecordHeader::read(buf)?;
         let mut rec = Record::new();
@@ -924,6 +1013,58 @@ mod tests {
     use super::*;
     use adabt_core::schema::{FieldDef, SchemaMode};
     use adabt_testkit::rng::Rng;
+
+    #[test]
+    fn peek_field_matches_decode_for_every_field() {
+        for schema in [fixed_schema(), strict_schema()] {
+            let codec = RecordCodec::new(schema.clone());
+            let rec = Record::new()
+                .with("id", 42_u64)
+                .with("balance", -7_i64)
+                .with("active", true)
+                .with("name", "ada")
+                .with("bio", "analytical engine")
+                .with("score", 1.5_f64)
+                .with("tags", Value::List(vec![Value::Str("math".to_string())]));
+            let buf = codec.encode(&rec).unwrap();
+            for f in codec.schema.fields() {
+                assert_eq!(
+                    codec.peek_field(&buf, &f.name).unwrap(),
+                    rec.get(&f.name).cloned(),
+                    "{}: peek disagrees with decode",
+                    f.name
+                );
+            }
+            assert_eq!(codec.peek_field(&buf, "absent").unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn peek_of_a_missing_optional_field_is_none_not_an_error() {
+        let codec = RecordCodec::new(fixed_schema());
+        let rec = Record::new().with("id", 1_u64).with("balance", 2_i64);
+        let buf = codec.encode(&rec).unwrap();
+        // `active` and `name` are declared but not present in this record.
+        assert_eq!(codec.peek_field(&buf, "active").unwrap(), None);
+        assert_eq!(codec.peek_field(&buf, "name").unwrap(), None);
+        assert_eq!(codec.peek_field(&buf, "id").unwrap(), Some(Value::U64(1)));
+    }
+
+    #[test]
+    fn dynamic_records_peek_by_in_record_name() {
+        let codec = RecordCodec::new(Schema::dynamic());
+        let rec = Record::new().with("kind", "sensor").with("reading", 9_i64);
+        let buf = codec.encode(&rec).unwrap();
+        assert_eq!(
+            codec.peek_field(&buf, "reading").unwrap(),
+            Some(Value::I64(9))
+        );
+        assert_eq!(
+            codec.peek_field(&buf, "kind").unwrap(),
+            Some(Value::Str("sensor".to_string()))
+        );
+        assert_eq!(codec.peek_field(&buf, "nope").unwrap(), None);
+    }
 
     fn fixed_schema() -> Schema {
         Schema::new(

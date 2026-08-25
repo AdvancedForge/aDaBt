@@ -135,6 +135,24 @@ struct Collection {
     /// out again, which is what lets a foreign key survive a restart without
     /// silently starting to point at something else.
     next_record_id: u64,
+    /// Clustering state: which pages hold which key ranges. Present only once
+    /// a keyed insert arrives; a collection nobody clusters is untouched by
+    /// any of this.
+    cluster: Option<ClusterState>,
+}
+
+/// The clustering hint's bookkeeping: the integer key range each page was
+/// filled under.
+///
+/// This is what turns a keyed range scan from random page touches into a run
+/// of consecutive ones — records whose keys are near each other are *placed*
+/// on the same pages, so the ids an index range returns land on few pages.
+/// Ranges only ever widen after the fact (deletes leave holes, updates may
+/// move a record), which costs some pruning precision but never correctness:
+/// the directory, not these ranges, is where truth about location lives.
+#[derive(Default)]
+struct ClusterState {
+    ranges: HashMap<PageId, (i64, i64)>,
 }
 
 /// Prefix marking a collection as a migration's staging area.
@@ -273,6 +291,9 @@ pub struct HeapStore {
     identity: u128,
     /// How far `recover` replayed the log. `Latest` outside a restore.
     recover_target: RecoverTarget,
+    /// Pages touched by `get` since the last clear — the diagnostic a
+    /// locality claim is measured against. See [`Self::touched_pages`].
+    touched: std::collections::HashSet<u32>,
 }
 
 /// How far to replay the log when opening a store.
@@ -379,6 +400,7 @@ impl HeapStore {
             replaying: true,
             identity: superblock.identity,
             recover_target: target,
+            touched: std::collections::HashSet::new(),
         };
         store.recover()?;
         store.replaying = false;
@@ -649,6 +671,7 @@ impl HeapStore {
                 codec: RecordCodec::new(schema),
                 directory: BTreeMap::new(),
                 next_record_id: 0,
+                cluster: None,
             },
         );
         self.by_id.insert(id, name.to_string());
@@ -836,6 +859,41 @@ impl HeapStore {
         Ok(())
     }
 
+    /// Insert or overwrite with a clustering key: same durability and
+    /// directory work as [`Self::apply_put`], placement chosen for locality.
+    fn apply_put_keyed(
+        &mut self,
+        collection: &str,
+        id: RecordId,
+        bytes: &[u8],
+        key: i64,
+    ) -> Result<()> {
+        let Some(c) = self.collections.get(collection) else {
+            return Ok(());
+        };
+        let cid = c.id;
+        let payload = Self::build_payload(cid, id, bytes, self.compress);
+        if payload.len() > MAX_PAYLOAD {
+            return Err(Error::Corruption(format!(
+                "record of {} bytes exceeds the {MAX_RECORD_BYTES}-byte page limit",
+                bytes.len()
+            )));
+        }
+
+        let txn = self.versions.begin_write();
+        let loc = self.place_keyed(collection, &payload, key)?;
+        let c = self.collections.get_mut(collection).expect("checked above");
+        let chain = c.directory.entry(id).or_default();
+        let superseded = !chain.versions.is_empty();
+        chain.push(txn, Some(loc));
+        c.next_record_id = c.next_record_id.max(id.0 + 1);
+        if superseded {
+            self.retained += 1;
+        }
+        self.maybe_reclaim()?;
+        Ok(())
+    }
+
     fn place(&mut self, payload: &[u8]) -> Result<RecordLocation> {
         let need = Page::cost_of(payload.len());
         if let Some(pid) = self.fsm.find(need) {
@@ -855,6 +913,99 @@ impl HeapStore {
         let slot = page.insert(payload)?;
         let free = page.free_space();
         self.fsm.set(pid, free);
+        Ok(RecordLocation { page: pid, slot })
+    }
+
+    /// Place a payload under the clustering hint, preferring a page whose key
+    /// range already contains `key`.
+    ///
+    /// The policy in one line: containing pages first (nearest midpoint as tie
+    /// break), then the adjacent range with room, then a fresh page. It is
+    /// deliberately not a B-tree split — the goal is *locality*, and locality
+    /// does not need perfect ordering. What it needs is that a contiguous key
+    /// span maps to a small set of pages, which "put it where its neighbours
+    /// are" achieves.
+    ///
+    /// Pages fill left to right along the key domain; when every candidate is
+    /// full, a new page extends the run. Deletes leave holes and widen no
+    /// ranges, so precision decays only as far as fragmentation does.
+    fn place_keyed(
+        &mut self,
+        collection: &str,
+        payload: &[u8],
+        key: i64,
+    ) -> Result<RecordLocation> {
+        let c = self
+            .collections
+            .get_mut(collection)
+            .expect("checked by caller");
+        let cluster = c.cluster.get_or_insert_with(ClusterState::default);
+
+        // Candidates are pages whose range is within `slack` of the key,
+        // ordered by distance then tightness. The slack is the load-adaptive
+        // part: roughly twice one page's share of the observed key domain.
+        // It replaces two policies that each fail informatively:
+        //
+        // - nearest-at-any-distance lets the long-lived wide pages hoard
+        //   every insert (the tight ones fill first, the wide ones survive
+        //   to absorb whatever remains, and their ranges balloon until
+        //   placement is noise);
+        // - strict containment refuses to fill gaps, and random-order keys
+        //   land between existing ranges often enough to give one row per
+        //   page.
+        //
+        // With a window tied to the current page count, a page stops
+        // stretching once its neighbourhood has grown a fair share of the
+        // domain, and gaps between ranges still spawn fresh pages rather
+        // than stretching old ones past their share.
+        let mut lo_min = i64::MAX;
+        let mut hi_max = i64::MIN;
+        let mut candidates: Vec<(i64, i64, PageId)> = Vec::with_capacity(cluster.ranges.len());
+        for (&pid, &(lo, hi)) in &cluster.ranges {
+            lo_min = lo_min.min(lo);
+            hi_max = hi_max.max(hi);
+            let dist = if key < lo {
+                lo - key
+            } else if key > hi {
+                key - hi
+            } else {
+                0
+            };
+            candidates.push((dist, hi - lo, pid));
+        }
+        let pages = candidates.len() as i64;
+        let slack = if pages == 0 {
+            0
+        } else {
+            let extent = hi_max.saturating_sub(lo_min);
+            (extent / pages * 2).max(1024)
+        };
+        candidates.retain(|&(dist, _, _)| dist <= slack);
+        candidates.sort();
+        for (_, _, pid) in candidates {
+            if let Ok(page) = self.pool.get_mut(pid) {
+                if page.can_fit(payload.len()) {
+                    let slot = page.insert(payload)?;
+                    // The range stays an honest record of the page's contents:
+                    // it widens only to swallow a key it genuinely took.
+                    if let Some(r) = cluster.ranges.get_mut(&pid) {
+                        r.0 = r.0.min(key);
+                        r.1 = r.1.max(key);
+                    }
+                    self.fsm.set(pid, page.free_space());
+                    return Ok(RecordLocation { page: pid, slot });
+                }
+            }
+        }
+        // No tracked page both contains the key and has room: start a fresh
+        // one. It becomes the tightest range claiming this key, so its
+        // neighbourhood settles onto it as it fills.
+        let pid = self.pool.allocate()?;
+        let page = self.pool.get_mut(pid)?;
+        let slot = page.insert(payload)?;
+        let free = page.free_space();
+        self.fsm.set(pid, free);
+        cluster.ranges.insert(pid, (key, key));
         Ok(RecordLocation { page: pid, slot })
     }
 
@@ -1314,6 +1465,22 @@ impl HeapStore {
         self.compress
     }
 
+    /// How many distinct pages `get` has touched since the last clear.
+    ///
+    /// This is the number a locality claim is measured against: a clustered
+    /// range scan should touch pages in proportion to the *range's* size,
+    /// an unclustered one in proportion to the collection's. A diagnostic,
+    /// not a statistic — it accumulates under the caller's control rather
+    /// than pretending to be a rate.
+    pub fn touched_pages(&self) -> usize {
+        self.touched.len()
+    }
+
+    /// Reset the touched-page set.
+    pub fn clear_page_touches(&mut self) {
+        self.touched.clear();
+    }
+
     /// Bytes after which a log segment is sealed. See [`crate::wal::Wal::set_segment_bytes`].
     pub fn set_segment_bytes(&mut self, bytes: u64) {
         self.wal.set_segment_bytes(bytes);
@@ -1732,6 +1899,32 @@ impl LogicalStore for HeapStore {
         self.apply_put(collection, id, &bytes)
     }
 
+    fn insert_keyed(
+        &mut self,
+        collection: &str,
+        id: RecordId,
+        rec: Record,
+        key: i64,
+    ) -> Result<()> {
+        let mut rec = rec;
+        normalize_for_storage(&mut rec);
+        let c = self.coll(collection)?;
+        c.codec.schema().validate_record(&rec)?;
+        if c.directory.get(&id).is_some_and(|v| !v.is_absent()) {
+            return Err(Error::RecordExists(id));
+        }
+        let bytes = c.codec.encode(&rec)?;
+        // The log carries the same op either way: clustering is placement, not
+        // content, so replay reproduces the bytes exactly and re-derives (or
+        // forgets, which is equally correct) the locality.
+        self.log(WalOp::Insert {
+            collection: collection.to_string(),
+            id,
+            bytes: bytes.clone(),
+        })?;
+        self.apply_put_keyed(collection, id, &bytes, key)
+    }
+
     fn get(&mut self, collection: &str, id: RecordId) -> Result<Option<Record>> {
         let Some(loc) = self
             .coll(collection)?
@@ -1742,6 +1935,7 @@ impl LogicalStore for HeapStore {
             // Still validates the collection exists, above.
             return Ok(None);
         };
+        self.touched.insert(loc.page.0);
         Ok(Some(self.read_at(collection, loc)?))
     }
 

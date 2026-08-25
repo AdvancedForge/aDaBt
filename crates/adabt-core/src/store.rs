@@ -59,6 +59,25 @@ pub trait LogicalStore {
     /// Insert, failing if `id` is already present.
     fn insert(&mut self, collection: &str, id: RecordId, rec: Record) -> Result<()>;
 
+    /// Insert with a clustering hint: records whose `key` values are close
+    /// should land close together physically.
+    ///
+    /// The default ignores the hint and behaves exactly like [`Self::insert`],
+    /// so stores without a placement policy need no code. A store that can
+    /// honour it overrides this; either way the stored bytes and observable
+    /// answers are identical — clustering changes *where* a record lives,
+    /// never *what* a read returns.
+    fn insert_keyed(
+        &mut self,
+        collection: &str,
+        id: RecordId,
+        rec: Record,
+        key: i64,
+    ) -> Result<()> {
+        let _ = key;
+        self.insert(collection, id, rec)
+    }
+
     fn get(&mut self, collection: &str, id: RecordId) -> Result<Option<Record>>;
 
     /// Replace an existing record. Returns whether it existed.
