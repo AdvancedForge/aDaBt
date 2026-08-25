@@ -349,10 +349,13 @@ suite asserts on elapsed time.
 server — gate before dispatch, per-connection state, constant-time compare,
 refusals that neither close the connection nor echo the secret.
 
-Remaining: TLS (the token is only as private as its transport), roles and
-per-collection permissions, a C ABI with one real binding on top of it, and
-semantic versioning with an on-disk format version and a migration path, so
-the encoding stops changing without one.
+Remaining: TLS (the token is only as private as its transport), per-collection
+permission grants, a C ABI with one real binding on top of it, and semantic
+versioning with an on-disk format version and a migration path. **Landed
+since:** roles — an admin token plus an optional read-only credential
+(`--read-token`), enforced after authentication with a new `Forbidden` status
+that tells a known caller the truth (re-authenticating cannot help);
+socket-tested in `roles.rs`.
 
 *Finish tests:* a hostile-client suite runs against the exposed server;
 a fresh clone reaches a working example in a stated number of commands;

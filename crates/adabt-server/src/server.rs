@@ -81,7 +81,76 @@ pub struct Server {
     active: Arc<AtomicUsize>,
     max_connections: usize,
     idle_timeout: Option<Duration>,
-    auth_token: Option<String>,
+    auth: AuthConfig,
+}
+
+/// What a connection is allowed to do once it has authenticated.
+///
+/// Two roles, because two is what the threat model justifies today: an
+/// operator token that may do anything, and a read-only token for dashboards
+/// and probes. Roles are a property of the *token*, not the connection —
+/// a client cannot upgrade by asking, only by presenting a different
+/// credential. Per-collection grants are the next slice if a deployment
+/// ever needs them; nothing in the wire format assumes they will not fit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// Every request kind.
+    Admin,
+    /// Reads and introspection only: Get, Count, Query, Explain,
+    /// ExplainOptimizations, Metrics, Ping. Writes and optimization
+    /// triggers are refused with `Forbidden`.
+    Reader,
+}
+
+impl Role {
+    /// Whether this role may issue `kind`.
+    fn permits(self, kind: RequestKind) -> bool {
+        match self {
+            Role::Admin => true,
+            Role::Reader => !matches!(
+                kind,
+                RequestKind::Insert
+                    | RequestKind::Update
+                    | RequestKind::Delete
+                    | RequestKind::Optimize
+            ),
+        }
+    }
+}
+
+/// The server's credential table.
+#[derive(Debug, Clone, Default)]
+pub struct AuthConfig {
+    admin_token: Option<String>,
+    reader_token: Option<String>,
+}
+
+impl AuthConfig {
+    fn open_role(&self) -> Option<Role> {
+        // With no credentials configured the listener is open: every
+        // connection starts as admin, which is exactly the trusted-network
+        // posture the server shipped with.
+        if self.admin_token.is_none() && self.reader_token.is_none() {
+            return Some(Role::Admin);
+        }
+        None
+    }
+
+    fn authenticate(&self, presented: &str) -> Option<Role> {
+        let admin = self
+            .admin_token
+            .as_deref()
+            .is_some_and(|t| tokens_match(t, presented));
+        let reader = self
+            .reader_token
+            .as_deref()
+            .is_some_and(|t| tokens_match(t, presented));
+        match (admin, reader) {
+            (true, _) => Some(Role::Admin),
+            (_, true) => Some(Role::Reader),
+            _ => None,
+        }
+    }
 }
 
 impl Server {
@@ -93,11 +162,12 @@ impl Server {
             active: Arc::new(AtomicUsize::new(0)),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
-            auth_token: None,
+            auth: AuthConfig::default(),
         })
     }
 
-    /// Require a bearer token on every connection.
+    /// Require a bearer token on every connection, granting `admin` to the
+    /// connections that present it.
     ///
     /// Until a connection presents this token via an Auth request, every
     /// other request it sends is refused with `Unauthorized` — including
@@ -106,7 +176,16 @@ impl Server {
     /// (the default) disables the gate entirely, which is the trusted-
     /// network posture this server shipped with.
     pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
-        self.auth_token = Some(token.into());
+        self.auth.admin_token = Some(token.into());
+        self
+    }
+
+    /// Issue a second credential that authenticates to the [`Role::Reader`]
+    /// role: reads and introspection only. Requires an admin token to be
+    /// configured — a read-only credential alongside an open listener would
+    /// be a lock on a door that is already standing open.
+    pub fn with_read_token(mut self, token: impl Into<String>) -> Self {
+        self.auth.reader_token = Some(token.into());
         self
     }
 
@@ -171,7 +250,7 @@ impl Server {
             let guard = ActiveGuard(Arc::clone(&self.active));
             let db = Arc::clone(&self.db);
             let idle_timeout = self.idle_timeout;
-            let auth = self.auth_token.clone();
+            let auth = self.auth.clone();
             // A connection that fails takes nothing else down with it: the
             // thread ends, the socket closes, every other client carries on.
             std::thread::spawn(move || {
@@ -229,7 +308,7 @@ fn handle(
     mut stream: TcpStream,
     db: Shared,
     idle_timeout: Option<Duration>,
-    auth_token: Option<String>,
+    auth: AuthConfig,
 ) -> std::io::Result<()> {
     stream.set_nodelay(true).ok();
     // Re-armed by the OS on every `read`, so this bounds the gap between
@@ -238,11 +317,11 @@ fn handle(
     stream.set_read_timeout(idle_timeout).ok();
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 16 * 1024];
-    // Per-connection authentication state. A connection starts
-    // unauthenticated whenever a token is required; success is remembered
-    // here and nowhere else, so one client's proof says nothing about any
-    // other connection.
-    let mut authed = auth_token.is_none();
+    // Per-connection authorization state. A connection starts unauthenticated
+    // whenever any token is required; the role it earns is remembered here
+    // and nowhere else, so one client's proof says nothing about any other
+    // connection.
+    let mut role = auth.open_role();
     loop {
         let n = stream.read(&mut chunk)?;
         if n == 0 {
@@ -255,7 +334,7 @@ fn handle(
                 Ok(None) => break,
                 Ok(Some((frame, used))) => {
                     buf.drain(..used);
-                    let reply = respond(&frame, &db, auth_token.as_deref(), &mut authed);
+                    let reply = respond(&frame, &db, &auth, &mut role);
                     stream.write_all(&reply.encode())?;
                 }
                 // The stream is no longer frames. Nothing useful can be read
@@ -270,7 +349,7 @@ fn handle(
     }
 }
 
-fn respond(frame: &Frame, db: &Shared, auth_token: Option<&str>, authed: &mut bool) -> Frame {
+fn respond(frame: &Frame, db: &Shared, auth: &AuthConfig, role: &mut Option<Role>) -> Frame {
     let id = frame.request_id;
     let Some(kind) = RequestKind::from_code(frame.kind) else {
         return error_frame(
@@ -279,23 +358,33 @@ fn respond(frame: &Frame, db: &Shared, auth_token: Option<&str>, authed: &mut bo
             &format!("unknown request kind {}", frame.kind),
         );
     };
-    // The gate. Everything except Auth is refused before it reaches the
-    // engine, so an unauthenticated connection cannot even count rows.
-    if !*authed {
+    // The gate, in two layers. First authentication: nothing but Auth is
+    // answered until a credential is presented, so an unauthenticated
+    // connection cannot even count rows. Then authorization: what the
+    // presented credential's role permits. Both run before the engine is
+    // touched.
+    let Some(known) = role else {
         if kind != RequestKind::Auth {
             return error_frame(id, StatusCode::Unauthorized, "authentication required");
         }
         let token = Reader::new(&frame.body)
             .str("auth token")
             .unwrap_or_default();
-        if auth_token.is_some_and(|want| tokens_match(want, &token)) {
-            *authed = true;
+        if let Some(earned) = auth.authenticate(&token) {
+            *role = Some(earned);
             return Frame::new(StatusCode::Ok.code(), id, Vec::new());
         }
         return error_frame(
             id,
             StatusCode::AuthDenied,
             "authentication failed; the connection remains unauthenticated",
+        );
+    };
+    if !known.permits(kind) {
+        return error_frame(
+            id,
+            StatusCode::Forbidden,
+            "this connection's role does not permit that request",
         );
     }
     match dispatch(kind, &frame.body, db) {

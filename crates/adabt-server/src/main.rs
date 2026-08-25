@@ -39,9 +39,10 @@ when they want the same partition. This is shared-nothing partitioning, not
 thread-per-core — there is no core pinning, no io_uring and no zero-copy path.
 `--shards 1` is the unpartitioned behaviour exactly.
 
-POSTURE: token auth available (--auth-token / ADABT_TOKEN); still no encryption
-and no roles. A token stops strangers from reading; it does not stop them
-reading it in transit, so bind to a trusted network regardless.
+POSTURE: token auth available (--auth-token / ADABT_TOKEN) with roles
+(--read-token issues a read-only credential); still no encryption. A token
+stops strangers from reading; it does not stop them reading it in transit,
+so bind to a trusted network regardless.
 
 SIGINT/SIGTERM (Unix): stop accepting new connections, let connections already
 open finish, checkpoint, exit.
@@ -57,6 +58,7 @@ fn main() {
     let mut idle_timeout = Some(adabt_server::server::DEFAULT_IDLE_TIMEOUT);
     let mut slow_query_log_ms: Option<u64> = None;
     let mut auth_token: Option<String> = None;
+    let mut read_token: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -94,6 +96,13 @@ fn main() {
                 Some(t) if !t.is_empty() => auth_token = Some(t),
                 _ => {
                     eprintln!("--auth-token requires a non-empty value\n\n{USAGE}");
+                    std::process::exit(2);
+                }
+            },
+            "--read-token" => match args.next() {
+                Some(t) if !t.is_empty() => read_token = Some(t),
+                _ => {
+                    eprintln!("--read-token requires a non-empty value\n\n{USAGE}");
                     std::process::exit(2);
                 }
             },
@@ -152,8 +161,16 @@ fn main() {
             let s = s
                 .with_max_connections(max_connections)
                 .with_idle_timeout(idle_timeout);
-            match auth_token.as_deref() {
+            let s = match auth_token.as_deref() {
                 Some(t) => s.with_auth_token(t),
+                None => s,
+            };
+            if read_token.is_some() && auth_token.is_none() {
+                eprintln!("--read-token requires --auth-token: a read-only credential alongside an open listener locks a door that is already standing open");
+                std::process::exit(2);
+            }
+            match read_token.as_deref() {
+                Some(t) => s.with_read_token(t),
                 None => s,
             }
         }
@@ -171,7 +188,7 @@ fn main() {
                 format!("level {level}")
             },
             if auth_token.is_some() {
-                "token auth required"
+                "token auth required (read-only tokens: --read-token)"
             } else {
                 "trusted network only, NO AUTH"
             }

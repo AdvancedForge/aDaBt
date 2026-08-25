@@ -10,6 +10,21 @@ also fixed in this document.
 
 ## The numbers
 
+### Bitmap versus hash, settled by benchmark (the planner question)
+
+`adabt-bench index-scale`, low-cardinality field (4 distinct values), release
+build: at both 100k and 1M rows, bitmap holds **0.06×** hash's memory
+(500 KB vs 8 MB) and returns byte-identical result sets; hash's single-value
+lookup stays ~30% faster (~2.6 ms vs ~3.5 ms — both dominated by materializing
+the 250k matched ids). This is the *low*-cardinality regime where bitmap was
+supposed to shine on memory, and it does. What it does **not** settle is the
+high-cardinality regime the planner's hash-first comment actually argues
+about — a bitmap over 1M distinct values should explode toward hash's
+footprint while keeping none of its lookup speed, and that variant needs its
+own bench row before the preference flips. Hash-first for equality stands;
+bitmap remains the memory play when someone *tells* the engine the field is
+narrow.
+
 100,000 rows, one machine, best-of-passes, one run — every verdict below is
 read within this single table so no ratio crosses runs. Absolute values move
 between machines and between runs on this one; earlier published runs of the

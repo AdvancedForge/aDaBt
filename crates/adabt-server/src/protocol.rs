@@ -103,6 +103,12 @@ pub enum StatusCode {
     /// unauthenticated and may try again, because a typo should cost a
     /// retry and not a reconnect.
     AuthDenied,
+    /// Authenticated, but this connection's role does not permit the
+    /// request — a read-only token asking to insert, say. Distinct from
+    /// `Unauthorized`: the caller *is* known, so re-authenticating cannot
+    /// help, and retrying the same request on this connection will always
+    /// fail the same way.
+    Forbidden,
     Internal,
 }
 
@@ -119,6 +125,7 @@ impl StatusCode {
             StatusCode::Cancelled => 7,
             StatusCode::Unauthorized => 8,
             StatusCode::AuthDenied => 9,
+            StatusCode::Forbidden => 10,
         }
     }
     pub fn from_code(c: u8) -> Option<Self> {
@@ -133,6 +140,7 @@ impl StatusCode {
             7 => StatusCode::Cancelled,
             8 => StatusCode::Unauthorized,
             9 => StatusCode::AuthDenied,
+            10 => StatusCode::Forbidden,
             _ => return None,
         })
     }
@@ -151,6 +159,7 @@ impl StatusCode {
             StatusCode::NotImplemented => "not implemented",
             StatusCode::Cancelled => "cancelled",
             StatusCode::Unauthorized => "unauthorized",
+            StatusCode::Forbidden => "forbidden",
             StatusCode::AuthDenied => "authentication failed",
         }
     }
