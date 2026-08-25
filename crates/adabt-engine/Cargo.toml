@@ -16,3 +16,4 @@ adabt-opt.workspace = true
 
 [dev-dependencies]
 adabt-testkit.workspace = true
+tempfile = "3"

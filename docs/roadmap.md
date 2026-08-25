@@ -315,16 +315,21 @@ standard workloads, with the expert given everything Stage 2 built.
 
 ### Stage 7 — Hardening *(makes the numbers trustworthy)*
 
-Loom on the lock-free structures, a crash/chaos matrix around checkpoints,
-experiment promotion and 2PC, a consistency checker runnable against a live or
-recovered data directory, and the sweep of wall-clock assertions out of the
-test suite into deterministic counters (allocation counts, page reads) — one
-flake is already on record.
+**Landed:** the deterministic sweep and the consistency checker.
+`Database::verify()` walks heap against every derived structure — forward
+(record → index), reverse (index → heap, catching dangling ids), columnar id
+sets — with `cfg(test)` fault-injection seams proving it detects seeded
+divergence in both directions. The crash/chaos matrix (`crash_consistency.rs`)
+truncates the WAL's active segment at 13 byte offsets through an uncheckpointed
+write wave and demands, at every point: clean open or clean refusal, exact
+survivors, `verify()` empty, idempotent reopen.
+
+Remaining: loom on the lock-free structures, chaos around experiment promotion
+and 2PC.
 
 *Finish tests:* nightly CI runs the loom subset and chaos matrix; the checker
-detects every seeded divergence in both directions (engine wrong, checker
-silent is the failure mode that matters); no test in the default suite asserts
-on elapsed time.
+detects every seeded divergence in both directions; no test in the default
+suite asserts on elapsed time.
 
 ### Stage 8 — Surface and ecosystem *(finishes D)*
 

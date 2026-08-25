@@ -295,6 +295,18 @@ impl ColumnStore {
         v
     }
 
+    /// The ids of every live row, ascending.
+    ///
+    /// `pub(crate)` because the consistency checker is the only reader: it
+    /// compares this set against the heap's to catch a derived copy that has
+    /// drifted from its primary.
+    pub(crate) fn live_ids(&self) -> Vec<RecordId> {
+        (0..self.ids.len())
+            .filter(|row| !self.dead[*row])
+            .map(|row| self.ids[row])
+            .collect()
+    }
+
     pub fn memory_bytes(&self) -> usize {
         self.columns
             .values()
