@@ -53,6 +53,15 @@ pub struct PlanContext<'a> {
     /// fields it does not carry, so a planner that guessed from presence
     /// alone could order a top-K by absence and return an arbitrary k.
     pub columnar_fields: HashMap<&'a str, Vec<String>>,
+    /// Estimated distinct values per indexed field — the selectivity signal.
+    ///
+    /// Sourced from each index's own key count, which is why it exists only
+    /// for fields that are already indexed: the planner consults it to choose
+    /// *between* serving structures, never to invent one. A field with a
+    /// million distinct values narrows an equality probe to roughly one row;
+    /// a field with four narrows it to a quarter of the collection, and when
+    /// both are indexed the first is the index to ask.
+    pub cardinality: HashMap<&'a str, HashMap<&'a str, u64>>,
 }
 
 impl<'a> PlanContext<'a> {
@@ -64,6 +73,7 @@ impl<'a> PlanContext<'a> {
             partial: HashMap::new(),
             columnar: Vec::new(),
             columnar_fields: HashMap::new(),
+            cardinality: HashMap::new(),
         }
     }
 
@@ -91,6 +101,17 @@ impl<'a> PlanContext<'a> {
             partial: HashMap::new(),
             columnar: Vec::new(),
             columnar_fields: HashMap::new(),
+            cardinality: {
+                let mut c: HashMap<&str, HashMap<&str, u64>> = HashMap::new();
+                c.insert(
+                    collection,
+                    indexes
+                        .iter()
+                        .map(|i| (i.field(), i.key_count() as u64))
+                        .collect(),
+                );
+                c
+            },
         }
     }
 
@@ -468,6 +489,7 @@ mod tests {
             partial: HashMap::new(),
             columnar: Vec::new(),
             columnar_fields: HashMap::new(),
+            cardinality: HashMap::new(),
         }
     }
 
@@ -869,7 +891,36 @@ pub fn decide(logical: &LogicalOp, ctx: &PlanContext<'_>) -> PlanDecision {
                             rationale,
                         };
                     }
-                    for (field, _) in equalities {
+                    // Among single-field candidates, the most selective
+                    // field's index is probed: each candidate narrows the
+                    // collection to roughly rows/distinct, so the field with
+                    // the most distinct values fetches the fewest ids, and
+                    // the `Filter` above re-checks the rest of the predicate
+                    // either way. Fields without a cardinality estimate rank
+                    // as if unbounded — worse than any known count but still
+                    // usable — which preserves the previous first-wins order
+                    // when nothing is measured yet.
+                    let mut best: Option<(u64, &str)> = None;
+                    for (field, _) in &equalities {
+                        let has_index = ctx.partial_for(collection, field, pred).is_some()
+                            || ctx.index_for(collection, field).is_some();
+                        if !has_index {
+                            continue;
+                        }
+                        let distinct = ctx
+                            .cardinality
+                            .get(collection.as_str())
+                            .and_then(|mm| mm.get(field.as_str()))
+                            .copied()
+                            .unwrap_or(u64::MAX);
+                        // Strictly greater, so ties and unknowns keep the
+                        // predicate's own order and behaviour is unchanged
+                        // when every estimate is absent.
+                        if best.is_none_or(|(d, _)| distinct > d) {
+                            best = Some((distinct, field));
+                        }
+                    }
+                    if let Some((_, field)) = best {
                         // A partial index first when the predicate guarantees
                         // its condition: it holds a subset of the same rows,
                         // so it is strictly cheaper to probe, and the `Filter`
@@ -879,7 +930,7 @@ pub fn decide(logical: &LogicalOp, ctx: &PlanContext<'_>) -> PlanDecision {
                         // condition and all — because that is what the index
                         // answers to. A bare field name would find the
                         // unrestricted index, or nothing.
-                        if let Some((name, kind)) = ctx.partial_for(collection, &field, pred) {
+                        if let Some((name, kind)) = ctx.partial_for(collection, field, pred) {
                             let rationale = format!(
                                 "equality on {collection}.{field} served by a partial {} index",
                                 kind.as_str()
@@ -889,13 +940,16 @@ pub fn decide(logical: &LogicalOp, ctx: &PlanContext<'_>) -> PlanDecision {
                                 rationale,
                             };
                         }
-                        if let Some(kind) = ctx.index_for(collection, &field) {
+                        if let Some(kind) = ctx.index_for(collection, field) {
                             let rationale = format!(
                                 "equality on {collection}.{field} served by {} index",
                                 kind.as_str()
                             );
                             return PlanDecision {
-                                access: AccessDecision::IndexLookup { field, kind },
+                                access: AccessDecision::IndexLookup {
+                                    field: field.to_string(),
+                                    kind,
+                                },
                                 rationale,
                             };
                         }
@@ -1167,6 +1221,75 @@ mod decision_tests {
             partial: HashMap::new(),
             columnar: Vec::new(),
             columnar_fields: HashMap::new(),
+            cardinality: HashMap::new(),
+        }
+    }
+
+    fn ctx_with_cardinality(pairs: Vec<(&'static str, IndexKind, u64)>) -> PlanContext<'static> {
+        let mut m = HashMap::new();
+        let mut card = HashMap::new();
+        m.insert(
+            "users",
+            pairs.iter().map(|(f, k, _)| (*f, *k)).collect::<Vec<_>>(),
+        );
+        card.insert(
+            "users",
+            pairs
+                .iter()
+                .map(|(f, _, d)| (*f, *d))
+                .collect::<HashMap<&str, u64>>(),
+        );
+        PlanContext {
+            indexes: m,
+            composite: HashMap::new(),
+            covering: HashMap::new(),
+            partial: HashMap::new(),
+            columnar: Vec::new(),
+            columnar_fields: HashMap::new(),
+            cardinality: card,
+        }
+    }
+
+    #[test]
+    fn the_more_selective_indexed_field_is_probed_first() {
+        // country has 4 distinct values; user_id has 100_000. A predicate
+        // constraining both is served by the user_id index — probing country
+        // first would fetch 250× the ids only to throw them away.
+        let ctx = ctx_with_cardinality(vec![
+            ("country", IndexKind::Hash, 4),
+            ("user_id", IndexKind::Hash, 100_000),
+        ]);
+        let d = decide(
+            &LogicalOp::scan("users").filter(Expr::And(vec![
+                Expr::eq("country", "NO"),
+                Expr::eq("user_id", Value::U64(7)),
+            ])),
+            &ctx,
+        );
+        match d.access {
+            AccessDecision::IndexLookup { field, .. } => {
+                assert_eq!(field, "user_id", "rationale was: {}", d.rationale)
+            }
+            _other => panic!("expected an index lookup, got {}", d.rationale),
+        }
+    }
+
+    #[test]
+    fn unknown_selectivity_keeps_the_predicate_order() {
+        // With no estimates at all (the empty map every pre-existing caller
+        // passes), behaviour is exactly what shipped before: the predicate's
+        // first indexed field wins.
+        let ctx = ctx_with(vec![("a", IndexKind::Hash), ("b", IndexKind::Hash)]);
+        let d = decide(
+            &LogicalOp::scan("users").filter(Expr::And(vec![
+                Expr::eq("b", Value::U64(1)),
+                Expr::eq("a", "x"),
+            ])),
+            &ctx,
+        );
+        match d.access {
+            AccessDecision::IndexLookup { field, .. } => assert_eq!(field, "b"),
+            _other => panic!("expected an index lookup, got {}", d.rationale),
         }
     }
 

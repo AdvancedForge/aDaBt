@@ -1917,12 +1917,23 @@ impl Database {
         let masked = self.masked();
         let revealed = self.revealed();
         let mut m = HashMap::new();
+        // Selectivity estimates, read where they are cheapest: an index's
+        // own key count. Only indexed fields get one, which is the right
+        // boundary — the planner consults cardinality to choose between
+        // serving structures, never to invent one.
+        let mut card: HashMap<&str, HashMap<&str, u64>> = HashMap::new();
         for (c, list) in &self.indexes {
             m.insert(
                 c.as_str(),
                 list.iter()
                     .map(|i| (i.field(), i.kind()))
                     .filter(|(f, k)| !masked.is_some_and(|h| h.hides_index(revealed, c, f, *k)))
+                    .collect(),
+            );
+            card.insert(
+                c.as_str(),
+                list.iter()
+                    .map(|i| (i.field(), i.key_count() as u64))
                     .collect(),
             );
         }
@@ -2001,6 +2012,7 @@ impl Database {
             partial,
             columnar,
             columnar_fields,
+            cardinality: card,
         }
     }
 

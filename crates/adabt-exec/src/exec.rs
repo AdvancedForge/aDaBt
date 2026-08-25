@@ -1243,6 +1243,7 @@ mod tests {
                 partial: std::collections::HashMap::new(),
                 columnar: Vec::new(),
                 columnar_fields: HashMap::new(),
+                cardinality: HashMap::new(),
             }
         }
     }
@@ -1423,6 +1424,7 @@ mod tests {
                 partial: std::collections::HashMap::new(),
                 columnar: Vec::new(),
                 columnar_fields: HashMap::new(),
+                cardinality: HashMap::new(),
             },
         );
         let mut stats = ExecStats::default();

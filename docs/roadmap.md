@@ -208,10 +208,14 @@ In order:
    serves through the index, aggregate wins untouched. Landed alongside it:
    **columnar top-K** (`docs/comparison-notes.md`), which took the worst
    loss on the board to a 1.9× win over SQLite and added a move to C's set.
-   Still open: selectivity in the access decision (a predicate matching
-   everything still wins columnar for its index), the flat-point-lookup
-   assumption every estimate carries, and the bitmap-over-hash preference
-   measurement contradicted at 1M rows.
+   Still open: the flat-point-lookup assumption every estimate carries,
+   and the bitmap-over-hash preference measurement contradicted at 1M rows.
+   **Landed since:** selectivity in the access decision — `PlanContext`
+   now carries per-field cardinality read from each index's own key count
+   (O(1), and defined only for fields that are indexed, which is the right
+   boundary), and among equality candidates the planner probes the most
+   selective field's index; absent estimates preserve the shipped
+   first-wins order, asserted by test.
    *Finish tests:* predicted-vs-actual within noise at 100k and 1M rows in
    the level matrix; bitmap-versus-hash settled by benchmark, not argument.
 2. **Borrowed-view fetch path** — **started, measured slice landed.** The
