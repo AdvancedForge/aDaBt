@@ -243,7 +243,7 @@ In order:
    through `CoveringLookup` with zero fetches; indexed range went 1.8–3× to
    **~1.5×** through `CoveringRange`. The residue in both is per-row
    projection-record construction — item 2's territory.
-4. **Clustered sort order** — **landed (mechanism)**: a collection may
+4. **Clustered sort order** — **landed**: a collection may
    declare a clustering field (`Database::declare_cluster_field`); integer
    keys steer *placement*, so records with nearby values land on the same
    pages and an index range over that field touches pages in proportion to
@@ -254,9 +254,10 @@ In order:
    everything; strict containment refuses to fill gaps) — the working rule is
    *nearest within twice one page's share of the observed domain*, which is
    self-limiting by construction; see `place_keyed`. Answers never change;
-   clustering is placement, not content. *Still open:* persisting the
-   declaration across restarts (it is session state today), optimizer
-   proposals, reclustering existing data.
+   clustering is placement, not content. The declaration persists across
+   restarts (catalog + `WalOp::SetClusterField`, tested end to end, clear
+   persists too); placement ranges re-derive from new keyed inserts. *Still
+   open:* optimizer proposals, reclustering existing data.
 5. **Prefix/delta compression** alongside dictionary encoding. *Finish test:*
    stored bytes on sorted-key collections fall measurably further, decode cost
    within a stated bound of today's.
@@ -360,17 +361,22 @@ suite asserts on elapsed time.
 server — gate before dispatch, per-connection state, constant-time compare,
 refusals that neither close the connection nor echo the secret.
 
-Remaining: TLS (the token is only as private as its transport), per-collection
-permission grants, semantic versioning with an on-disk format version and a
-migration path. **Landed since:** roles — an admin token plus an optional
-read-only credential (`--read-token`), enforced after authentication with a
-new `Forbidden` status that tells a known caller the truth (re-authenticating
-cannot help); socket-tested in `roles.rs`. And the **C ABI**
-(`crates/adabt-ffi`, cdylib + `include/adabt.h`): open/close,
-create-collection, i64 field put/get, count — nothing that is not
-ABI-stable crosses the boundary; the contract tests call through C-typed
-declarations and `nm` on the built `.so` shows all six exports. A real
-binding beyond Rust's own test harness remains open.
+Remaining: TLS (the token is only as private as its transport) and
+per-collection permission grants. **Landed since:** roles — an admin token
+plus an optional read-only credential (`--read-token`), enforced after
+authentication with a new `Forbidden` status that tells a known caller the
+truth (re-authenticating cannot help); socket-tested in `roles.rs`. The **C
+ABI** (`crates/adabt-ffi`, cdylib + `include/adabt.h`): open/close,
+create-collection, i64 field put/get, count — nothing that is not ABI-stable
+crosses the boundary; the contract tests call through C-typed declarations,
+and a real binding exists: a C program compiled by `cc` against the header
+and linked to the built `.so` runs end to end (`c_binding.rs`). And the
+**version gate**: the superblock's single format number refuses a newer
+database outright, migrations are enumerated in code (`migrate`, proven by
+the legacy-identity adoption), and the one independently versioned file —
+the catalog — is exactly the one whose loss is recoverable: an unreadable
+catalog rebuilds from the log with every record intact (tested end to end).
+That is semantic versioning for the disk: refuse forward, enumerate backward.
 
 *Finish tests:* a hostile-client suite runs against the exposed server;
 a fresh clone reaches a working example in a stated number of commands;

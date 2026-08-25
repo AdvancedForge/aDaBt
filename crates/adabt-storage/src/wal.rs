@@ -37,6 +37,10 @@ const OP_CREATE_INDEX: u8 = 8;
 const OP_DROP_INDEX: u8 = 9;
 const OP_ADOPT_MIGRATION: u8 = 10;
 const OP_ALTER_SCHEMA_IN_PLACE: u8 = 11;
+/// The clustering declaration: which field steers record placement. Logged
+/// like an index definition — a declaration about the physical shape, not
+/// content, replayed to restore the catalog's memory of it.
+const OP_SET_CLUSTER_FIELD: u8 = 12;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalOp {
@@ -60,6 +64,13 @@ pub enum WalOp {
     },
     DropCollection {
         name: String,
+    },
+    /// Declare (or clear, with `None`) the field whose integer values steer
+    /// record placement. The declaration is catalog state; placement itself
+    /// re-derives from subsequent keyed inserts.
+    SetClusterField {
+        collection: String,
+        field: Option<String>,
     },
     Commit {
         txn: TxnId,
@@ -215,7 +226,21 @@ impl WalEntry {
             WalOp::AlterSchemaInPlace { collection, schema } => {
                 out.push(OP_ALTER_SCHEMA_IN_PLACE);
                 put_str(collection, &mut out);
+                // Varint length, matching `blob()`'s reader — a raw u32 here
+                // made replay consume three zero bytes of the length word as
+                // the first three bytes of the schema.
                 put_bytes(schema, &mut out);
+            }
+            WalOp::SetClusterField { collection, field } => {
+                out.push(OP_SET_CLUSTER_FIELD);
+                put_str(collection, &mut out);
+                match field {
+                    Some(f) => {
+                        out.push(1);
+                        put_str(f, &mut out);
+                    }
+                    None => out.push(0),
+                }
             }
         }
         out
@@ -269,6 +294,18 @@ impl WalEntry {
             OP_ALTER_SCHEMA_IN_PLACE => WalOp::AlterSchemaInPlace {
                 collection: r.string()?,
                 schema: r.blob()?,
+            },
+            OP_SET_CLUSTER_FIELD => WalOp::SetClusterField {
+                collection: r.string()?,
+                field: match r.u8()? {
+                    0 => None,
+                    1 => Some(r.string()?),
+                    other => {
+                        return Err(Error::Corruption(format!(
+                            "invalid cluster-field presence byte {other}"
+                        )));
+                    }
+                },
             },
             other => {
                 return Err(Error::Corruption(format!("unknown wal opcode {other}")));

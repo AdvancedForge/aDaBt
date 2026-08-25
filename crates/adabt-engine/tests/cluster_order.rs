@@ -168,10 +168,11 @@ fn updates_through_a_clustered_collection_stay_correct() {
     }
 }
 
-/// A restart forgets the declaration by design; it must not forget a record.
-/// The full answer set survives, and re-declaring steers new inserts again.
+/// A restart keeps the declaration (catalog state) but not the placement
+/// ranges - and it must not forget a record. New keyed inserts steer again
+/// without re-declaring, and a cleared hint stays cleared.
 #[test]
-fn a_restart_keeps_every_record_and_allows_redeclaration() {
+fn a_restart_keeps_the_declaration_and_every_record() {
     let tmp = Tmp::new("restart");
     {
         let mut db = seed(tmp.path());
@@ -185,24 +186,17 @@ fn a_restart_keeps_every_record_and_allows_redeclaration() {
         .unwrap();
     }
     let mut db = Database::open(tmp.path(), Policy::manual(0)).unwrap();
-    assert!(
-        db.cluster_field("ordered").is_none(),
-        "hint is session state"
-    );
-    assert!(
-        db.get("ordered", RecordId(N)).unwrap().is_some(),
-        "the last insert must survive its own restart"
-    );
+    assert_eq!(db.cluster_field("ordered"), Some("k"));
+    assert!(db.get("ordered", RecordId(N)).unwrap().is_some());
     for i in 0..N {
         assert!(db.get("ordered", RecordId(i)).unwrap().is_some(), "row {i}");
     }
-    db.declare_cluster_field("ordered", "k").unwrap();
     db.insert(
         "ordered",
         RecordId(N + 1),
         Record::new()
             .with("k", 424_243i64)
-            .with("payload", "steered-again"),
+            .with("payload", "steered-after-restart"),
     )
     .unwrap();
     let rec = db.get("ordered", RecordId(N + 1)).unwrap().unwrap();
@@ -211,6 +205,15 @@ fn a_restart_keeps_every_record_and_allows_redeclaration() {
             Some(adabt_core::value::Value::Str(s)) => Some(s.as_str()),
             _ => None,
         },
-        Some("steered-again")
+        Some("steered-after-restart")
+    );
+    db.clear_cluster_field("ordered").unwrap();
+    assert_eq!(db.cluster_field("ordered"), None);
+    drop(db);
+    let db = Database::open(tmp.path(), Policy::manual(0)).unwrap();
+    assert_eq!(
+        db.cluster_field("ordered"),
+        None,
+        "a cleared hint stays cleared"
     );
 }

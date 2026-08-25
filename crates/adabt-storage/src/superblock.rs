@@ -43,6 +43,14 @@ const MAGIC: &[u8; 8] = b"aDaBtSB\0";
 /// rather than one per file — a database is only readable if all of it is, and
 /// per-file versions invite the combinatorial question of which mixtures are
 /// legal.
+///
+/// One deliberate exception proves the rule: the *catalog* file
+/// (`metadata.rs`) carries its own version, because the catalog is the one
+/// authoritative file whose total loss is recoverable by design — replaying
+/// the log from the beginning rebuilds it. An unreadable catalog must be
+/// refused as absent (`read → None`), never misparsed, and that contract is
+/// pinned by `catalog_persistence.rs::an_unreadable_catalog_version_rebuilds_from_the_log`.
+/// Everything else answers to this single number.
 pub const FORMAT_VERSION: u32 = 1;
 
 /// The file left behind by builds before the superblock existed.

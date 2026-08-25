@@ -442,6 +442,12 @@ impl Database {
                 db.create_index_from(&collection, &field, k, entries)?;
             }
         }
+        // Restore the clustering declarations the catalog holds. The
+        // declarations are state; the placement ranges are not, and rebuild
+        // from subsequent keyed inserts.
+        for (collection, field) in db.store.declared_cluster_fields() {
+            db.cluster_fields.insert(collection, field);
+        }
         // Apply whatever the policy asks for, so opening at level 3 gives a
         // level-3 database rather than a level-0 one that drifts up later.
         db.optimize()?;
@@ -1587,23 +1593,28 @@ impl Database {
     /// - answers never change — clustering is placement, not content, and
     ///   every read path is identical to an unclustered collection's;
     /// - the hint is advisory. Updates may move a record to any page with
-    ///   room; deletes leave holes; a restart forgets the declaration (the
-    ///   placement machinery stays correct without it). Re-declare after
-    ///   open to keep steering new inserts.
+    ///   room; deletes leave holes. The *declaration* persists across
+    ///   restarts (it is catalog state), but the placement ranges re-derive:
+    ///   locality rebuilds as new keyed inserts arrive, it is not rebuilt
+    ///   retroactively for old data.
     ///
     /// Only integer fields can steer placement today: the key is the field's
     /// value cast to `i64`, and anything else is silently inserted unclustered.
     pub fn declare_cluster_field(&mut self, collection: &str, field: &str) -> Result<()> {
         self.store.schema_of(collection)?;
+        self.store.set_cluster_field(collection, Some(field))?;
         self.cluster_fields
             .insert(collection.to_string(), field.to_string());
         Ok(())
     }
 
-    /// Drop a collection's clustering hint. Existing placements stay where
-    /// they are; only future keyed inserts revert to first-fit.
-    pub fn clear_cluster_field(&mut self, collection: &str) {
+    /// Drop a collection's clustering hint and forget its declaration.
+    /// Existing placements stay where they are; only future keyed inserts
+    /// revert to first-fit.
+    pub fn clear_cluster_field(&mut self, collection: &str) -> Result<()> {
+        self.store.set_cluster_field(collection, None)?;
         self.cluster_fields.remove(collection);
+        Ok(())
     }
 
     /// Distinct pages `get` has touched since the last clear — the number a

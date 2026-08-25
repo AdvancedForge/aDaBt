@@ -215,3 +215,37 @@ fn writes_after_the_checkpoint_are_replayed_on_top_of_the_catalog() {
     assert_eq!(h.count("epsilon").unwrap(), 50);
     assert_intact(&mut h, "with a post-checkpoint collection");
 }
+
+/// The version contract, end to end: a catalog this build cannot parse is
+/// treated as absent — never misparsed — and the database rebuilds from the
+/// log with every record intact. This is why the catalog's format version may
+/// bump independently of the superblock's: losing the cache costs a replay,
+/// not the data.
+#[test]
+fn an_unreadable_catalog_version_rebuilds_from_the_log() {
+    let t = Tmp::new("version");
+    {
+        let mut h = seeded(t.path());
+        h.insert("alpha", RecordId(200), rec("alpha", 200)).unwrap();
+    }
+    // Corrupt only the version byte in the authoritative catalog file.
+    let p = adabt_storage::metadata::path(t.path());
+    assert!(p.exists(), "checkpoint should have written a catalog");
+    let mut bytes = std::fs::read(&p).unwrap();
+    bytes[8] = bytes[8].wrapping_add(1);
+    std::fs::write(&p, &bytes).unwrap();
+
+    let mut h = HeapStore::open(t.path(), Durability::Strict, 32).unwrap();
+    // The catalog was unreadable, so everything comes back by replay —
+    // including the post-checkpoint insert.
+    assert_eq!(h.count("alpha").unwrap(), 201);
+    assert_eq!(h.count("beta").unwrap(), 200);
+    assert_eq!(h.count("gamma").unwrap(), 200);
+    for i in 0..200u64 {
+        assert_eq!(
+            h.get("alpha", RecordId(i)).unwrap(),
+            Some(rec("alpha", i)),
+            "alpha/{i} is not the record that was written"
+        );
+    }
+}

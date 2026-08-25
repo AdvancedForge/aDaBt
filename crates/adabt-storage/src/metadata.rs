@@ -43,7 +43,7 @@ const MAGIC: &[u8; 8] = b"aDaBtCat";
 // it does not recognise, and recovery falls back to the log, which is exactly
 // the degraded-but-correct path this file exists to make unnecessary rather
 // than the path that makes it unsafe to change the format.
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectionMeta {
@@ -55,6 +55,8 @@ pub struct CollectionMeta {
     /// never hands out an id that was already used, even one whose record has
     /// since been deleted.
     pub next_record_id: u64,
+    /// The declared clustering field, if any. See [`WalOp::SetClusterField`].
+    pub cluster_field: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +106,13 @@ pub fn write(dir: &Path, identity: u128, cat: &Catalog) -> Result<()> {
         body.extend_from_slice(&c.next_record_id.to_le_bytes());
         body.extend_from_slice(&(c.schema.len() as u32).to_le_bytes());
         body.extend_from_slice(&c.schema);
+        match &c.cluster_field {
+            Some(f) => {
+                body.push(1);
+                put_str(f, &mut body);
+            }
+            None => body.push(0),
+        }
     }
     body.extend_from_slice(&(cat.indexes.len() as u32).to_le_bytes());
     for i in &cat.indexes {
@@ -159,11 +168,24 @@ pub fn read(dir: &Path, identity: u128) -> Option<Catalog> {
         let id = r.u32()?;
         let next_record_id = r.u64()?;
         let len = r.u32()? as usize;
+        let schema = r.take(len)?.to_vec();
+        let cluster_field = match r.u8()? {
+            0 => None,
+            1 => Some(r.string()?),
+            other => {
+                // A presence byte outside {0,1} means the file does not mean
+                // what we would write; treating it as absent catalog (rebuild
+                // from log) is safer than guessing.
+                let _ = other;
+                return None;
+            }
+        };
         cat.collections.push(CollectionMeta {
             name,
             id,
             next_record_id,
-            schema: r.take(len)?.to_vec(),
+            schema,
+            cluster_field,
         });
     }
     let n = r.u32()? as usize;
@@ -231,6 +253,9 @@ impl<'a> Reader<'a> {
     fn u64(&mut self) -> Option<u64> {
         Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
     }
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
     fn string(&mut self) -> Option<String> {
         let n = self.u32()? as usize;
         String::from_utf8(self.take(n)?.to_vec()).ok()
@@ -271,12 +296,14 @@ mod tests {
                     id: 0,
                     next_record_id: 42,
                     schema: vec![1, 2, 3, 4],
+                    cluster_field: Some("k".into()),
                 },
                 CollectionMeta {
                     name: "orders".into(),
                     id: 7,
                     next_record_id: 0,
                     schema: Vec::new(),
+                    cluster_field: None,
                 },
             ],
             indexes: vec![IndexMeta {
@@ -300,6 +327,22 @@ mod tests {
     #[test]
     fn an_absent_catalog_is_not_an_error() {
         let t = Tmp::new("absent");
+        assert_eq!(read(&t.0, ID), None);
+    }
+
+    #[test]
+    fn a_catalog_from_another_format_version_is_refused_cleanly() {
+        // The version contract: this build bumps the catalog version when the
+        // layout changes, and an unreadable catalog is *always* safe to lose —
+        // the caller rebuilds from the log. This test pins the refusal so a
+        // future change cannot quietly start misparsing an old file instead.
+        let t = Tmp::new("oldversion");
+        write(&t.0, ID, &catalog()).unwrap();
+        let p = path(&t.0);
+        let mut bytes = std::fs::read(&p).unwrap();
+        // The version sits right after the magic; make it a future one.
+        bytes[MAGIC.len()] += 1;
+        std::fs::write(&p, &bytes).unwrap();
         assert_eq!(read(&t.0, ID), None);
     }
 

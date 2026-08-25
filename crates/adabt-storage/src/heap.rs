@@ -139,6 +139,11 @@ struct Collection {
     /// a keyed insert arrives; a collection nobody clusters is untouched by
     /// any of this.
     cluster: Option<ClusterState>,
+    /// The declared clustering field's name, as logged via
+    /// [`WalOp::SetClusterField`]. Survives restarts through replay and the
+    /// catalog; the *ranges* above do not (they re-derive from subsequent
+    /// keyed inserts).
+    cluster_name: Option<String>,
 }
 
 /// The clustering hint's bookkeeping: the integer key range each page was
@@ -498,6 +503,13 @@ impl HeapStore {
                         self.index_defs.push(def);
                     }
                 }
+                WalOp::SetClusterField { collection, field } => {
+                    if let Some(c) = self.collections.get_mut(collection.as_str()) {
+                        c.cluster_name = field.clone();
+                    }
+                    // A declaration for a collection later dropped replays as
+                    // nothing — same rule as every other per-collection op.
+                }
                 WalOp::DropIndex {
                     collection,
                     field,
@@ -631,6 +643,7 @@ impl HeapStore {
                     id: c.id.0,
                     next_record_id: c.next_record_id,
                     schema: encode_schema(c.codec.schema()),
+                    cluster_field: c.cluster_name.clone(),
                 })
                 .collect(),
             indexes: self
@@ -672,6 +685,7 @@ impl HeapStore {
                 directory: BTreeMap::new(),
                 next_record_id: 0,
                 cluster: None,
+                cluster_name: None,
             },
         );
         self.by_id.insert(id, name.to_string());
@@ -1463,6 +1477,30 @@ impl HeapStore {
 
     pub fn compression_enabled(&self) -> bool {
         self.compress
+    }
+
+    /// Declare (or clear) the collection's clustering field. Logged, so the
+    /// declaration survives restarts; the page ranges themselves re-derive.
+    /// Fails only if the collection does not exist.
+    pub fn set_cluster_field(&mut self, collection: &str, field: Option<&str>) -> Result<()> {
+        self.coll(collection)?;
+        self.log(WalOp::SetClusterField {
+            collection: collection.to_string(),
+            field: field.map(String::from),
+        })?;
+        let c = self.collections.get_mut(collection).expect("checked above");
+        c.cluster_name = field.map(String::from);
+        Ok(())
+    }
+
+    /// The declared clustering fields across all user collections — what an
+    /// engine reads once at open to restore its routing map.
+    pub fn declared_cluster_fields(&self) -> Vec<(String, String)> {
+        self.collections
+            .iter()
+            .filter(|(name, _)| !is_migration_name(name))
+            .filter_map(|(name, c)| c.cluster_name.as_ref().map(|f| (name.clone(), f.clone())))
+            .collect()
     }
 
     /// How many distinct pages `get` has touched since the last clear.
