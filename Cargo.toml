@@ -13,6 +13,7 @@ members = [
     "crates/adabt-bench",
     "crates/adabt-server",
     "crates/adabt-cli",
+    "crates/adabt-ffi",
 ]
 exclude = [
     "comparison",

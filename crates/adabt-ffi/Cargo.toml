@@ -1,0 +1,15 @@
+[package]
+name = "adabt-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+# `cdylib` is what a C linker consumes; `rlib` keeps the crate testable from
+# Rust, which is how the ABI contract is exercised in this workspace.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+adabt-core.workspace = true
+adabt-engine.workspace = true

@@ -350,12 +350,16 @@ server — gate before dispatch, per-connection state, constant-time compare,
 refusals that neither close the connection nor echo the secret.
 
 Remaining: TLS (the token is only as private as its transport), per-collection
-permission grants, a C ABI with one real binding on top of it, and semantic
-versioning with an on-disk format version and a migration path. **Landed
-since:** roles — an admin token plus an optional read-only credential
-(`--read-token`), enforced after authentication with a new `Forbidden` status
-that tells a known caller the truth (re-authenticating cannot help);
-socket-tested in `roles.rs`.
+permission grants, semantic versioning with an on-disk format version and a
+migration path. **Landed since:** roles — an admin token plus an optional
+read-only credential (`--read-token`), enforced after authentication with a
+new `Forbidden` status that tells a known caller the truth (re-authenticating
+cannot help); socket-tested in `roles.rs`. And the **C ABI**
+(`crates/adabt-ffi`, cdylib + `include/adabt.h`): open/close,
+create-collection, i64 field put/get, count — nothing that is not
+ABI-stable crosses the boundary; the contract tests call through C-typed
+declarations and `nm` on the built `.so` shows all six exports. A real
+binding beyond Rust's own test harness remains open.
 
 *Finish tests:* a hostile-client suite runs against the exposed server;
 a fresh clone reaches a working example in a stated number of commands;

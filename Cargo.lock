@@ -60,6 +60,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "adabt-ffi"
+version = "0.0.1"
+dependencies = [
+ "adabt-core",
+ "adabt-engine",
+]
+
+[[package]]
 name = "adabt-index"
 version = "0.0.1"
 dependencies = [
