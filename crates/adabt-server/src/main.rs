@@ -151,6 +151,12 @@ fn main() {
         ),
         Err(_) => eprintln!("aDaBt listening"),
     }
+    // The residency ceiling is a property, not a defect; an operator who
+    // learns it from a crash dump learned it too late. The measured figure
+    // and its revisit triggers are in docs/scale-decision.md.
+    eprintln!(
+        "datasets are held resident: ~470 bytes of RAM per record — plan for roughly 2M records per GB"
+    );
 
     // Retrieved before `serve` takes ownership of `server` — the same reason
     // `stopper()` and `database()` both take `&self`.

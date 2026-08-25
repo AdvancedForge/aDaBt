@@ -18,7 +18,75 @@
 use adabt_core::ids::RecordId;
 use adabt_core::record::Record;
 use adabt_core::value::Value;
+use std::collections::BinaryHeap;
 use std::collections::HashMap;
+
+/// One row's candidacy in a top-K selection: its id and whatever the key
+/// column holds for it.
+///
+/// The ordering mirrors the executor's single-key sort exactly — value
+/// comparison first with direction applied to the value alone, an absent
+/// cell ordered as a missing field is after a fetch (last, ascending), and
+/// the record id ascending as a tiebreak that direction never touches. That
+/// last part matters: reversing the whole composite would also reverse the
+/// tiebreak, and ties under `Sort` come out in ascending id order regardless
+/// of direction.
+struct Candidate {
+    id: RecordId,
+    value: Option<Value>,
+}
+
+impl PartialEq for Candidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.value == other.value
+    }
+}
+impl Eq for Candidate {}
+
+impl Candidate {
+    fn order_vs(&self, other: &Self, descending: bool) -> std::cmp::Ordering {
+        let ord = match (&self.value, &other.value) {
+            (Some(x), Some(y)) => x.cmp(y),
+            (None, None) => std::cmp::Ordering::Equal,
+            // A missing field sorts after a present one; `compare_rows` in
+            // adabt-exec is the definition this mirrors.
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (Some(_), None) => std::cmp::Ordering::Less,
+        };
+        let ord = if descending { ord.reverse() } else { ord };
+        ord.then(self.id.cmp(&other.id))
+    }
+}
+
+/// A candidacy paired with the query's direction, ordered by the query's own
+/// total order.
+///
+/// The selection heap needs `peek()` to be the worst row it holds. Ordered
+/// by the full query order — direction included, id tiebreak last — a
+/// max-heap's peek is the maximum under that order, which is exactly the
+/// row to evict whether the query wants the smallest or the largest: in both
+/// cases the kept set is the k minima of the order, and its worst member is
+/// the largest of those minima. One rule serves both directions; reversing
+/// the order instead would put the best row on top for descending sorts and
+/// let early losers hide beneath it.
+struct HeapCand(Candidate, bool);
+
+impl PartialEq for HeapCand {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+impl Eq for HeapCand {}
+impl PartialOrd for HeapCand {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for HeapCand {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.order_vs(&other.0, self.1)
+    }
+}
 
 /// One field's values, in row order.
 #[derive(Debug, Clone)]
@@ -286,6 +354,50 @@ impl ColumnStore {
                 .filter_map(|row| col.get(row))
                 .collect(),
         )
+    }
+
+    /// The k record ids whose `field` values are smallest under the executor's
+    /// single-key total order — value first, absent last, direction applied to
+    /// the value comparison alone, id ascending as the tiebreak — returned in
+    /// that order.
+    ///
+    /// `None` when the store does not hold `field`. Selection happens over
+    /// raw column cells: no `Record` is built per row, which is the entire
+    /// point — `project` pays a record allocation per row to hand back one
+    /// field, and at 100k rows that allocation is the cost of the query.
+    ///
+    /// Absence follows the heap's meaning, not the cell's: an absent cell
+    /// sorts as a missing field does after a fetch, so winners chosen here
+    /// are the winners a full sort would choose.
+    pub fn topk_ids(&self, field: &str, descending: bool, k: usize) -> Option<Vec<RecordId>> {
+        let col = self.columns.get(field)?;
+        if k == 0 {
+            return Some(Vec::new());
+        }
+        let mut heap: BinaryHeap<HeapCand> = BinaryHeap::with_capacity(k + 1);
+        for row in 0..self.ids.len() {
+            if self.dead[row] {
+                continue;
+            }
+            let cand = Candidate {
+                id: self.ids[row],
+                value: col.get(row),
+            };
+            if heap.len() < k {
+                heap.push(HeapCand(cand, descending));
+                continue;
+            }
+            // `peek` is the worst row held (see HeapCand); a better candidate
+            // takes its place.
+            let worst = heap.peek().expect("heap at capacity is non-empty");
+            if cand.order_vs(&worst.0, descending) == std::cmp::Ordering::Less {
+                heap.pop();
+                heap.push(HeapCand(cand, descending));
+            }
+        }
+        let mut out: Vec<Candidate> = heap.into_iter().map(|r| r.0).collect();
+        out.sort_by(|a, b| a.order_vs(b, descending));
+        Some(out.into_iter().map(|c| c.id).collect())
     }
 
     pub fn get(&self, id: RecordId, fields: &[&str]) -> Option<Record> {

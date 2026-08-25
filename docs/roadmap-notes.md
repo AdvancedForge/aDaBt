@@ -1,8 +1,10 @@
 # Executing the roadmap
 
-Working notes for the seven items in `docs/roadmap.md`, in the order they were
-done. Each records what was measured, what was refuted, and what the test is
-that would catch the bug coming back.
+Working notes for the plan in `docs/roadmap.md`, in the order items were done.
+Items 1–4 of the original seven-item plan are recorded here and are complete;
+the remaining work is staged as "The road to 100%" in `roadmap.md`, which this
+file will track as stages close. Each entry records what was measured, what was
+refuted, and what the test is that would catch the bug coming back.
 
 ---
 

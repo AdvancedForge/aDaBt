@@ -105,6 +105,28 @@ pub enum Event<'a> {
         collection: &'a str,
         fields: &'a [String],
     },
+    /// A query filtered a field and projected a set of fields.
+    ///
+    /// The evidence for a *covering* index. An index on `country` answers
+    /// which records match; it cannot answer "and give me their names" without
+    /// a fetch per match. If the queries filtering `country` keep asking for
+    /// the same small projection, an index that carries that projection beside
+    /// the key removes every one of those fetches — but only if the projection
+    /// is stable, which per-field filter counts cannot show, for the same
+    /// reason they could not show co-occurrence to `auto_composite_index`.
+    ///
+    /// `equality` records HOW the field was filtered, because the two want
+    /// different structures: an equality lookup wants a hash-backed covering
+    /// index, a range wants a b-tree-backed one, and a proposal that ignored
+    /// the distinction would build indexes its own queries cannot use. The
+    /// projected list arrives sorted, de-duplicated, and never contains the
+    /// filtered field itself, because the index carries its own key.
+    FieldsProjectedTogether {
+        collection: &'a str,
+        filtered: &'a str,
+        fields: &'a [String],
+        equality: bool,
+    },
     /// An index was maintained on the write path — one entry inserted or
     /// removed because a record changed.
     ///

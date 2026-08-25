@@ -95,6 +95,11 @@ pub fn level_preset(level: u8) -> Vec<LevelEntry> {
         // and serves a narrower set of queries, so it is worth reaching for
         // only once the single-field indexes exist and are not enough.
         out.push(entry("auto_composite_index", &[]));
+        // Same tier, same reasoning: a covering index is chosen from what
+        // this workload projects alongside its filters, which is traffic and
+        // not schema. Registered separately from `auto_index` because it
+        // costs more per write and answers a narrower question.
+        out.push(entry("auto_covering_index", &[]));
     }
     if level >= 8 {
         // Freezing is what makes direct addressing legal for a collection that

@@ -78,6 +78,14 @@ pub struct Snapshot {
     /// is already covered by `equality_filters`, and storing it twice would
     /// let the two disagree.
     pub pinned_sets: HashMap<(String, Vec<String>), u64>,
+    /// How often each filtered field was paired with a projection.
+    ///
+    /// Keyed by collection, the single equality-filtered field, and the
+    /// sorted projected list — the question a covering index answers: "do
+    /// the queries filtering this field keep asking for these fields". The
+    /// projected list never contains the filtered field; the index carries
+    /// its own key whether the caller remembers to ask or not.
+    pub projected_covers: HashMap<(String, String, Vec<String>, bool), u64>,
     /// `(collection, field) -> times the planner chose that index`.
     pub index_usage: HashMap<(String, String), u64>,
     /// `(collection, field)` -> index entries written on the write path.
@@ -153,6 +161,27 @@ impl Snapshot {
         v
     }
 
+    /// Filtered-field/projection pairs ranked by how often they co-occurred.
+    ///
+    /// Same ordering discipline as `most_pinned_sets`: count first, then the
+    /// key, so identical traffic produces identical rankings and an
+    /// experiment can be replayed.
+    pub fn most_projected_covers(&self) -> Vec<(String, String, Vec<String>, bool, u64)> {
+        let mut v: Vec<(String, String, Vec<String>, bool, u64)> = self
+            .projected_covers
+            .iter()
+            .map(|((c, f, p, e), n)| (c.clone(), f.clone(), p.clone(), *e, *n))
+            .collect();
+        v.sort_by(|a, b| {
+            b.4.cmp(&a.4)
+                .then(a.0.cmp(&b.0))
+                .then(a.1.cmp(&b.1))
+                .then(a.2.cmp(&b.2))
+                .then(a.3.cmp(&b.3))
+        });
+        v
+    }
+
     /// Fields ranked by how often queries filtered on them.
     pub fn most_filtered_fields(&self) -> Vec<(String, String, u64)> {
         let mut v: Vec<(String, String, u64)> = self
@@ -215,6 +244,7 @@ struct Shard {
     field_filters: HashMap<(String, String), u64>,
     equality_filters: HashMap<(String, String), u64>,
     pinned_sets: HashMap<(String, Vec<String>), u64>,
+    projected_covers: HashMap<(String, String, Vec<String>, bool), u64>,
     index_usage: HashMap<(String, String), u64>,
     index_maintenance: HashMap<(String, String), u64>,
     touches: u64,
@@ -292,6 +322,9 @@ impl CollectingProbe {
             }
             for (k, v) in &g.pinned_sets {
                 *out.pinned_sets.entry(k.clone()).or_default() += v;
+            }
+            for (k, v) in &g.projected_covers {
+                *out.projected_covers.entry(k.clone()).or_default() += v;
             }
             out.touches += g.touches;
             if let Some(t) = &mut out.temperature {
@@ -407,6 +440,22 @@ impl Probe for CollectingProbe {
                 if fields.len() > 1 {
                     let key = (collection.to_string(), fields.to_vec());
                     *g.pinned_sets.entry(key).or_default() += 1;
+                }
+            }
+            Event::FieldsProjectedTogether {
+                collection,
+                filtered,
+                fields,
+                equality,
+            } => {
+                if !fields.is_empty() && !filtered.is_empty() {
+                    let key = (
+                        collection.to_string(),
+                        filtered.to_string(),
+                        fields.to_vec(),
+                        equality,
+                    );
+                    *g.projected_covers.entry(key).or_default() += 1;
                 }
             }
             Event::FieldFiltered {

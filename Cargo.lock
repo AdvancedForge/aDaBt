@@ -18,6 +18,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "adabt-cli"
+version = "0.0.1"
+dependencies = [
+ "adabt-core",
+ "adabt-engine",
+ "adabt-ir",
+]
+
+[[package]]
 name = "adabt-core"
 version = "0.0.1"
 dependencies = [

@@ -244,34 +244,100 @@ fn an_index_added_after_the_last_checkpoint_is_still_there_after_a_restart() {
     assert_eq!(answers(&mut db), expected);
 }
 
+// -- the instrument ------------------------------------------------------
+//
+// A local copy of the counting allocator from `allocations.rs` — each test
+// file is its own binary, so a global allocator cannot be shared, and this
+// test needs it: page reads turned out to be identical between the two
+// paths (records live decoded in RAM after recovery, so rebuilding pays no
+// pool reads at all), while the decode-and-clone work of a rebuild shows up
+// plainly in allocation counts.
+static ALLOCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static COUNTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+struct CountingAlloc;
+
+unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        if COUNTING.load(std::sync::atomic::Ordering::Relaxed) {
+            ALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        unsafe { std::alloc::System.alloc(l) }
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(p, l) }
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, n: usize) -> *mut u8 {
+        if COUNTING.load(std::sync::atomic::Ordering::Relaxed) {
+            ALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        unsafe { std::alloc::System.realloc(p, l, n) }
+    }
+}
+
+#[global_allocator]
+static A: CountingAlloc = CountingAlloc;
+
+fn allocations_during<T>(f: impl FnOnce() -> T) -> u64 {
+    use std::sync::atomic::Ordering;
+    ALLOCS.store(0, Ordering::Relaxed);
+    COUNTING.store(true, Ordering::Relaxed);
+    let out = f();
+    COUNTING.store(false, Ordering::Relaxed);
+    drop(out);
+    ALLOCS.load(Ordering::Relaxed)
+}
+
 #[test]
-fn restoring_is_faster_than_rebuilding() {
-    // Not a benchmark, a floor. Restoring reads keys back directly; rebuilding
-    // decodes every record in the heap. If the two ever cost the same, the cache
-    // is doing nothing and should be deleted rather than maintained.
-    let t = Tmp::new("speed");
-    let db = prepared(t.path());
-    drop(db);
+fn restoring_costs_far_fewer_allocations_than_rebuilding() {
+    // Not a benchmark, a floor — and deliberately NOT a timing assertion.
+    // An earlier version of this test compared elapsed wall-clock time, and
+    // flaked on a loaded machine: 69.5ms against 67.4ms is noise, not a
+    // result. Page reads were tried next and measure nothing here: records
+    // live decoded in RAM after recovery, so both opens touch the same
+    // pages and the counters come back equal. What rebuilding actually
+    // spends is per-record decode-and-clone work, which shows up as
+    // allocations — deterministic on every machine.
+    //
+    // Restoring reads keys back from the cache file; rebuilding decodes
+    // every record in the heap twice over (once per index). If restoring
+    // ever costs as much as rebuilding, the cache is doing nothing and
+    // should be deleted rather than maintained.
+    const BIG: u64 = 60_000;
+    let t = Tmp::new("allocs-big");
+    {
+        let mut db = Database::open(t.path(), Policy::manual(0)).unwrap();
+        db.create_collection("users", schema()).unwrap();
+        for i in 0..BIG {
+            db.insert("users", RecordId(i), rec(i)).unwrap();
+        }
+        db.create_index("users", "country", IndexKind::Hash)
+            .unwrap();
+        db.create_index("users", "age", IndexKind::BTree).unwrap();
+        db.checkpoint().unwrap();
+    }
     let cached = std::fs::read(cache_path(t.path())).unwrap();
 
-    let time_open = |dir: &Path| {
-        let start = std::time::Instant::now();
-        let db = Database::open(dir, Policy::manual(0)).unwrap();
-        let e = start.elapsed();
-        drop(db);
-        e
+    let open_counting = |dir: &Path| {
+        allocations_during(|| {
+            let mut db = Database::open(dir, Policy::manual(0)).unwrap();
+            assert_eq!(db.count("users").unwrap(), BIG.try_into().unwrap());
+        })
     };
 
-    // Alternate, so a cold page cache or a busy machine cannot favour one.
-    let (mut restored, mut rebuilt) = (u128::MAX, u128::MAX);
-    for _ in 0..5 {
-        std::fs::write(cache_path(t.path()), &cached).unwrap();
-        restored = restored.min(time_open(t.path()).as_nanos());
-        std::fs::remove_file(cache_path(t.path())).unwrap();
-        rebuilt = rebuilt.min(time_open(t.path()).as_nanos());
-    }
+    std::fs::write(cache_path(t.path()), &cached).unwrap();
+    let restored = open_counting(t.path());
+    std::fs::remove_file(cache_path(t.path())).unwrap();
+    let rebuilt = open_counting(t.path());
+
+    // The first calibration run measured 492k against 731k on this fixture.
+    // The bulk of an open is shared — WAL recovery, heap load — so the cache
+    // cannot and should not claim a multiple; what it claims is its own
+    // margin, and the floor is set at one avoided allocation per record
+    // (the measured delta was roughly four, across two indexes).
     assert!(
-        restored < rebuilt,
-        "restoring took {restored}ns and rebuilding {rebuilt}ns"
+        restored < rebuilt && rebuilt - restored >= BIG,
+        "restoring cost {restored} allocations against rebuilding's {rebuilt}; \
+         the saved margin fell below one allocation per record ({BIG})"
     );
 }

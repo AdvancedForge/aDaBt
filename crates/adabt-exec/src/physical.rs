@@ -42,6 +42,19 @@ pub enum PhysicalOp {
         kind: IndexKind,
         key: Value,
     },
+    /// The k smallest rows under a single-key order, read columnarly.
+    ///
+    /// A `Limit` over a `Sort` does not need a sorted collection — it needs k
+    /// winners. This reads only the sort key out of the column store, keeps
+    /// the k smallest under exactly `Sort`'s total order (key, then id), and
+    /// fetches full records for those k alone. Legal only when the plan above
+    /// reads whole records of the survivors, which fetching provides.
+    ColumnarTopK {
+        collection: String,
+        key: String,
+        descending: bool,
+        k: usize,
+    },
     IndexRange {
         collection: String,
         field: String,
@@ -59,6 +72,18 @@ pub enum PhysicalOp {
         field: String,
         key: Value,
         needed: Vec<String>,
+    },
+    /// Rows in a range, served from a covering index with no fetch.
+    ///
+    /// The b-tree-backed sibling of `CoveringLookup`: same projections beside
+    /// the keys, answered through the inner index's range scan. The planner
+    /// only emits it for a covering index whose backing can walk a range.
+    CoveringRange {
+        collection: String,
+        field: String,
+        needed: Vec<String>,
+        lo: Bound<Value>,
+        hi: Bound<Value>,
     },
     /// Ids from a composite index, then a fetch per id. `key` is the
     /// `Value::List` of the pinned field values, in the index's own field
@@ -111,10 +136,12 @@ impl PhysicalOp {
             | PhysicalOp::GetByIds { .. }
             | PhysicalOp::HeapScan { .. }
             | PhysicalOp::ColumnScan { .. }
+            | PhysicalOp::ColumnarTopK { .. }
             | PhysicalOp::IndexLookup { .. }
             | PhysicalOp::IndexRange { .. }
             | PhysicalOp::CompositeLookup { .. }
-            | PhysicalOp::CoveringLookup { .. } => None,
+            | PhysicalOp::CoveringLookup { .. }
+            | PhysicalOp::CoveringRange { .. } => None,
             PhysicalOp::Filter { input, .. }
             | PhysicalOp::Project { input, .. }
             | PhysicalOp::Sort { input, .. }
@@ -140,10 +167,12 @@ impl PhysicalOp {
             | PhysicalOp::GetByIds { collection, .. }
             | PhysicalOp::HeapScan { collection }
             | PhysicalOp::ColumnScan { collection, .. }
+            | PhysicalOp::ColumnarTopK { collection, .. }
             | PhysicalOp::IndexLookup { collection, .. }
             | PhysicalOp::IndexRange { collection, .. }
             | PhysicalOp::CompositeLookup { collection, .. }
-            | PhysicalOp::CoveringLookup { collection, .. } => collection,
+            | PhysicalOp::CoveringLookup { collection, .. }
+            | PhysicalOp::CoveringRange { collection, .. } => collection,
             other => other.child().expect("non-leaf has a child").collection(),
         }
     }
@@ -154,10 +183,12 @@ impl PhysicalOp {
             PhysicalOp::GetByIds { .. } => "GetByIds",
             PhysicalOp::HeapScan { .. } => "HeapScan",
             PhysicalOp::ColumnScan { .. } => "ColumnScan",
+            PhysicalOp::ColumnarTopK { .. } => "ColumnarTopK",
             PhysicalOp::IndexLookup { .. } => "IndexLookup",
             PhysicalOp::IndexRange { .. } => "IndexRange",
             PhysicalOp::CompositeLookup { .. } => "CompositeLookup",
             PhysicalOp::CoveringLookup { .. } => "CoveringLookup",
+            PhysicalOp::CoveringRange { .. } => "CoveringRange",
             PhysicalOp::Filter { .. } => "Filter",
             PhysicalOp::Project { .. } => "Project",
             PhysicalOp::Sort { .. } => "Sort",
@@ -175,7 +206,12 @@ impl PhysicalOp {
     /// collection somewhere if either input does.
     pub fn is_full_scan(&self) -> bool {
         match self {
-            PhysicalOp::HeapScan { .. } | PhysicalOp::ColumnScan { .. } => true,
+            PhysicalOp::HeapScan { .. }
+            | PhysicalOp::ColumnScan { .. }
+            // Reads the whole key column: every row is touched, only the
+            // winners are fetched. That distinction belongs in EXPLAIN's
+            // operator name, not in a method named is_full_scan.
+            | PhysicalOp::ColumnarTopK { .. } => true,
             PhysicalOp::Join { left, right, .. } => left.is_full_scan() || right.is_full_scan(),
             other => other.child().is_some_and(|c| c.is_full_scan()),
         }
@@ -209,6 +245,15 @@ impl PhysicalOp {
                 PhysicalOp::ColumnScan { collection, fields } => {
                     format!("ColumnScan({collection}: {})", fields.join(", "))
                 }
+                PhysicalOp::ColumnarTopK {
+                    collection,
+                    key,
+                    descending,
+                    k,
+                } => format!(
+                    "ColumnarTopK({collection}: top {k} by {key}{dir})",
+                    dir = if *descending { " desc" } else { "" }
+                ),
                 PhysicalOp::IndexLookup {
                     collection,
                     field,
@@ -222,6 +267,15 @@ impl PhysicalOp {
                     ..
                 } => format!(
                     "CoveringLookup({collection}.{field} covering {})",
+                    needed.join(", ")
+                ),
+                PhysicalOp::CoveringRange {
+                    collection,
+                    field,
+                    needed,
+                    ..
+                } => format!(
+                    "CoveringRange({collection}.{field} covering {}, via btree)",
                     needed.join(", ")
                 ),
                 PhysicalOp::IndexRange {

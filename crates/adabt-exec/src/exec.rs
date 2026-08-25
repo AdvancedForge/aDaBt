@@ -13,6 +13,7 @@ use adabt_core::value::Value;
 use adabt_ir::plan::{Agg, AggKind, JoinKind, SortKey};
 use adabt_ir::Expr;
 use std::collections::BTreeMap;
+use std::collections::BinaryHeap;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -111,6 +112,26 @@ pub trait Source {
         Ok(None)
     }
 
+    /// The k ids whose single-key values come first under the executor's
+    /// total order, selected inside the columnar representation without
+    /// materializing records, returned in answer order.
+    ///
+    /// This, like `column_aggregate`, is where a columnar layout actually
+    /// pays: `column_scan` hands back one record per row even for one field,
+    /// and at scan scale that per-row construction is the cost of the query.
+    /// `None` when no columnar representation exists or it does not hold
+    /// `field`; the caller then falls back to `column_scan`, which is slower
+    /// and correct in the same way.
+    fn column_topk(
+        &mut self,
+        _collection: &str,
+        _field: &str,
+        _descending: bool,
+        _k: usize,
+    ) -> Result<Option<Vec<RecordId>>> {
+        Ok(None)
+    }
+
     /// Ids matching an indexed equality, or `None` when no index can serve it.
     fn index_lookup(
         &mut self,
@@ -162,6 +183,19 @@ pub trait Source {
         lo: Bound<&Value>,
         hi: Bound<&Value>,
     ) -> Result<Option<Vec<RecordId>>>;
+    /// Rows in an indexed range, served entirely from a covering index's
+    /// projections — no fetch per id. `None` when no covering index on
+    /// `field` with a range-capable backing carries every field in `needed`.
+    fn covering_range(
+        &mut self,
+        _collection: &str,
+        _field: &str,
+        _lo: Bound<&Value>,
+        _hi: Bound<&Value>,
+        _needed: &[String],
+    ) -> Result<Option<Vec<(RecordId, Record)>>> {
+        Ok(None)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -308,6 +342,79 @@ fn run<S: Source>(
             }
         }
 
+        PhysicalOp::ColumnarTopK {
+            collection,
+            key,
+            descending,
+            k,
+        } => {
+            let keys = [SortKey {
+                field: key.clone(),
+                descending: *descending,
+            }];
+            // Fast path: selection happens inside the columnar
+            // representation, over raw cells, and only the winners cross the
+            // boundary. The ids arrive in answer order.
+            if let Some(ids) = src.column_topk(collection, key, *descending, *k)? {
+                stats.rows_scanned += ids.len() as u64;
+                let mut out = Vec::with_capacity(ids.len());
+                for (i, id) in ids.iter().enumerate() {
+                    if i % CANCEL_CHECK_INTERVAL == 0 {
+                        budget.check_cancelled()?;
+                    }
+                    if let Some(rec) = src.fetch(collection, *id)? {
+                        stats.rows_scanned += 1;
+                        out.push((*id, rec));
+                    }
+                }
+                return Ok(batches_of(out));
+            }
+            match src.column_scan(collection, std::slice::from_ref(key))? {
+                Some(rows) => {
+                    stats.rows_scanned += rows.len() as u64;
+                    // The winners are then fetched WHOLE. What the columnar
+                    // read supplies is enough to choose them, not to answer
+                    // with: a record carrying only the sort key would hand
+                    // the projection above a row missing every other field,
+                    // and missing fields do not error — they read as absent.
+                    //
+                    // Fetched in loop rather than through `fetch_batches`,
+                    // which sorts ids for locality — right for a set of
+                    // lookups, wrong here, where the id order IS the answer's
+                    // order and k is small.
+                    let winners = top_k(rows, &keys, *k);
+                    let mut out = Vec::with_capacity(winners.len());
+                    for (i, (id, _)) in winners.iter().enumerate() {
+                        if i % CANCEL_CHECK_INTERVAL == 0 {
+                            budget.check_cancelled()?;
+                        }
+                        if let Some(rec) = src.fetch(collection, *id)? {
+                            stats.rows_scanned += 1;
+                            out.push((*id, rec));
+                        }
+                    }
+                    Ok(batches_of(out))
+                }
+                None => {
+                    // Same contract as ColumnScan's fallback above: the store
+                    // the planner believed in is gone, so answer the slow way
+                    // and say so.
+                    stats.index_misses += 1;
+                    let mut rows = collect_rows(
+                        &PhysicalOp::HeapScan {
+                            collection: collection.clone(),
+                        },
+                        src,
+                        stats,
+                        budget,
+                    )?;
+                    rows.sort_by(|a, b| compare_rows(&a.1, &b.1, &keys).then(a.0.cmp(&b.0)));
+                    rows.truncate(*k);
+                    Ok(batches_of(rows))
+                }
+            }
+        }
+
         PhysicalOp::IndexLookup {
             collection,
             field,
@@ -355,6 +462,44 @@ fn run<S: Source>(
                 None => {
                     stats.index_misses += 1;
                     match src.index_lookup(collection, field, key)? {
+                        Some(ids) => fetch_batches(collection, ids, src, stats, budget),
+                        None => {
+                            let ids = src.all_ids(collection)?;
+                            fetch_batches(collection, ids, src, stats, budget)
+                        }
+                    }
+                }
+            }
+        }
+
+        PhysicalOp::CoveringRange {
+            collection,
+            field,
+            needed,
+            lo,
+            hi,
+        } => {
+            stats.index_probes += 1;
+            let lo_ref = match lo {
+                Bound::Included(v) => Bound::Included(v),
+                Bound::Excluded(v) => Bound::Excluded(v),
+                Bound::Unbounded => Bound::Unbounded,
+            };
+            let hi_ref = match hi {
+                Bound::Included(v) => Bound::Included(v),
+                Bound::Excluded(v) => Bound::Excluded(v),
+                Bound::Unbounded => Bound::Unbounded,
+            };
+            match src.covering_range(collection, field, lo_ref, hi_ref, needed)? {
+                Some(rows) => {
+                    stats.rows_scanned += rows.len() as u64;
+                    // Same ordering contract as CoveringLookup: the covering
+                    // index keeps ids ascending inside its range scan.
+                    Ok(batches_of(rows))
+                }
+                None => {
+                    stats.index_misses += 1;
+                    match src.index_range(collection, field, lo_ref, hi_ref)? {
                         Some(ids) => fetch_batches(collection, ids, src, stats, budget),
                         None => {
                             let ids = src.all_ids(collection)?;
@@ -848,6 +993,65 @@ fn compare_rows(a: &Record, b: &Record, keys: &[SortKey]) -> std::cmp::Ordering 
     Ordering::Equal
 }
 
+/// One row held in the top-K heap, ordered by Sort's total order.
+///
+/// A `BinaryHeap` is a max-heap by its element ordering, so ordering entries
+/// by "later under the query's order is Greater" makes `peek()` the worst row
+/// kept — exactly the one to evict when a better row arrives.
+struct HeapEntry<'a>((RecordId, Record), &'a [SortKey]);
+
+impl Eq for HeapEntry<'_> {}
+
+impl PartialEq for HeapEntry<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Ord for HeapEntry<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        compare_rows(&self.0 .1, &other.0 .1, self.1).then(self.0 .0.cmp(&other.0 .0))
+    }
+}
+
+impl PartialOrd for HeapEntry<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// The k smallest rows under Sort's exact total order — `compare_rows` over
+/// `keys`, then record id, the same comparison a full `Sort` applies before
+/// `Limit` truncates it — returned in that order.
+///
+/// The output is identical to sorting everything and taking k, ties included,
+/// because the comparator and tiebreak are the same objects; only the work
+/// between them changed. That identity is what lets the planner swap one for
+/// the other without asking the differential rig a new question.
+fn top_k(rows: Vec<(RecordId, Record)>, keys: &[SortKey], k: usize) -> Vec<(RecordId, Record)> {
+    if k == 0 {
+        return Vec::new();
+    }
+    let mut heap: BinaryHeap<HeapEntry<'_>> = BinaryHeap::with_capacity(k + 1);
+    for row in rows {
+        if heap.len() < k {
+            heap.push(HeapEntry(row, keys));
+            continue;
+        }
+        // The same comparison `Ord for HeapEntry` makes, unwrapped so this
+        // reads exactly like the sort arm's comparator.
+        let worst = heap.peek().expect("heap at capacity is non-empty");
+        let ord = compare_rows(&row.1, &worst.0 .1, keys).then(row.0.cmp(&worst.0 .0));
+        if ord == std::cmp::Ordering::Less {
+            heap.pop();
+            heap.push(HeapEntry(row, keys));
+        }
+    }
+    let mut out: Vec<(RecordId, Record)> = heap.into_iter().map(|e| e.0).collect();
+    out.sort_by(|a, b| compare_rows(&a.1, &b.1, keys).then(a.0.cmp(&b.0)));
+    out
+}
+
 struct AggAcc {
     count: u64,
     sum: f64,
@@ -977,6 +1181,7 @@ mod tests {
     use adabt_ir::plan::{Agg, AggKind, LogicalOp, SortKey};
     use adabt_ir::{CmpOp, Expr};
     use std::collections::BTreeMap;
+    use std::collections::HashMap;
 
     /// An in-memory source, so execution is tested apart from storage.
     struct MemSource {
@@ -1037,6 +1242,7 @@ mod tests {
                 covering: std::collections::HashMap::new(),
                 partial: std::collections::HashMap::new(),
                 columnar: Vec::new(),
+                columnar_fields: HashMap::new(),
             }
         }
     }
@@ -1216,6 +1422,7 @@ mod tests {
                 covering: std::collections::HashMap::new(),
                 partial: std::collections::HashMap::new(),
                 columnar: Vec::new(),
+                columnar_fields: HashMap::new(),
             },
         );
         let mut stats = ExecStats::default();

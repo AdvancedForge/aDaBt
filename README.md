@@ -5,12 +5,17 @@ implementation ranges from completely conventional to radically specialized** �
 and where the choice of specialization can be made by a human or by the database
 itself, through the same mechanism.
 
-Status: **M0–M15 complete** (M13's per-core work landed in M15 as shared-nothing
-partitioning; thread-per-core proper is still not built). 708 tests, 34,857 lines.
+Status: **M0–M37 complete**, plus the roadmap stages: the comparison is
+published (4 of 8 wins vs SQLite, losses included), covering-index selection
+proposes both shapes from traffic, the scale contract is decided, settled
+decisions are re-examined every cycle, and `adabt-cli` gives the SQL surface
+a shell. 1,100 tests, 56,500+ lines. Thread-per-core and cross-shard
+transactions are the largest things still unbuilt.
 
-Start with **`docs/diagnosis.md`** — what this actually does, where it is useful,
-and how far it is from being a normal, a good, a manually optimal and an
-automatically optimal database. Milestone notes and measurements are in `docs/`.
+Start with **`docs/roadmap.md`** — where the four tracks stand now and the
+ordered plan to their finish lines. `docs/diagnosis.md` is the original
+post-M15 accounting that the roadmap scores against; milestone notes and
+measurements are in `docs/`.
 
 ## Layout
 
@@ -27,6 +32,7 @@ automatically optimal database. Milestone notes and measurements are in `docs/`.
 | `adabt-testkit` | Reference model, deterministic generator, differential runner. |
 | `adabt-bench` | Workloads and measurement harnesses. |
 | `adabt-server` | TCP listener, binary protocol, blocking client. No lock around the engine — the shards hold their own. |
+| `adabt-cli` | The SQL shell: open a directory, SELECT through the M37 parser, `.explain` plans. Thin on purpose — one evaluation path. |
 
 ## What the measurements say
 
@@ -54,9 +60,12 @@ And what it does unaided, from `adabt-bench soak` — five workloads in sequence
 | range filters | 12,373 µs | 490 µs | **−96%** |
 | grouped aggregates | 1,824 µs | 1,850 µs | −1% |
 
-The last row is not padding. It is a standing, reproducible measurement of the
-optimizer keeping something that is not paying for itself, and
-`docs/diagnosis.md` says why.
+The last row is a historical measurement, and it earned its keep: it stood,
+reproducible, until it forced the driver to re-examine settled decisions —
+every cycle now re-scores what is enabled under the calibrated cost model
+(`docs/roadmap.md`, Track C). Against the outside witness the aggregate
+phase now tells the opposite story: tuned group-by beats SQLite by four
+orders of magnitude (`docs/comparison-notes.md`).
 
 ## Six ideas that carry the design
 
@@ -119,6 +128,18 @@ can isolate one from another that would mask it. The harness warns when its data
 directory is memory-backed: `fsync` on tmpfs never reaches a disk, and an early
 version of these numbers was wrong because of it.
 
+`comparison/` (a separate crate, excluded from the workspace) runs aDaBt against
+SQLite on workloads chosen to include the ones aDaBt should lose. The numbers
+are published in `docs/comparison-notes.md`: at its best configuration aDaBt
+wins **4 of 8** — point lookups, post-tuning count/group-by at four orders of
+magnitude through its column store and materialized views, and top-20 sort at
+2–3× over SQLite by selecting k winners from raw columnar cells instead of
+sorting the collection. The indexed shapes answer through self-proposed
+covering indexes (`auto_covering_index`: hash-backed for equality evidence,
+b-tree-backed for ranges) and sit at 1.5–2.4×; what remains is projection
+fetch cost, not structure choice. It loses bulk load and single-row inserts —
+the price of per-record MVCC and WAL, which it will not trade away.
+
 ## Watching it work
 
 ```sh
@@ -145,18 +166,25 @@ after one there is no old path left to compare against.
 
 ## What is not built
 
-No joins, no multi-statement transactions, no SQL, no replication, no backup or
-restore, no authentication. The write-ahead log is never truncated, so it is read
-in full on every open and is now the entire remaining cost of opening a database.
+No replication. No cross-shard transactions — the log format records
+participants and coordinator, but no coordinator exists. Serializable isolation
+is not yet a selectable level. No authentication, TLS or roles: the server is
+trusted-network-only. Shared-nothing partitioning exists; **thread-per-core
+does not** — no core pinning, no `io_uring`, no async storage path. Every index
+and the page directory are fully resident, measured at roughly 470–570 bytes of
+resident memory per row, which puts the practical ceiling near a few million
+rows on ordinary hardware. `--shards 1` is the unpartitioned behaviour exactly,
+which is the honest way to measure what partitioning is worth.
 
-Shared-nothing partitioning exists; **thread-per-core does not** — no core
-pinning, no `io_uring`, no zero-copy path. `--shards 1` is the unpartitioned
-behaviour exactly, which is the honest way to measure what partitioning is worth.
+Joins (hash and indexed nested loop, with spill), multi-statement transactions
+with single-shard snapshot isolation, a SQL `SELECT` front-end, segmented WAL
+with log truncation at checkpoint, and backup/restore/PITR have all landed
+since this file was last revised. The milestone notes in `docs/` are the
+record.
 
 `SUM` is materialized only while integer arithmetic stays exact, aggregates are
 never combined across shards, and `MIN`/`MAX` are not maintained at all. Each is
 a place where a faster implementation was available and was rejected because it
 would have moved an answer in the last decimal place.
 
-`docs/diagnosis.md` is the full accounting, including what the optimizer still
-cannot reason about.
+`docs/roadmap.md` is the full accounting, including what remains for each track.

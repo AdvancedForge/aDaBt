@@ -107,15 +107,34 @@ fn main() {
 
     println!("# aDaBt vs SQLite — {rows} rows\n");
 
+    // Progress goes to stderr as each workload STARTS: results print only at
+    // the end, and this project has already lost one benchmark run to a
+    // timeout with nothing to show for it (`docs/m36-notes.md`). A harness
+    // that dies without evidence is worse than no harness.
+    let stages: [(&str, fn(u64) -> Row); 8] = [
+        ("bulk load", bulk_load),
+        ("point lookup", point_lookup),
+        ("indexed equality", indexed_equality),
+        ("full scan count", full_scan_count),
+        ("grouped aggregate", grouped_aggregate),
+        ("range scan", range_scan),
+        ("sorted limit", sorted_limit),
+        ("single-row writes", single_row_writes),
+    ];
     let mut out: Vec<Row> = Vec::new();
-    out.push(bulk_load(rows));
-    out.push(point_lookup(rows));
-    out.push(indexed_equality(rows));
-    out.push(full_scan_count(rows));
-    out.push(grouped_aggregate(rows));
-    out.push(range_scan(rows));
-    out.push(sorted_limit(rows));
-    out.push(single_row_writes(rows));
+    // `--only NAME` runs a single workload (matched on its stage name), for
+    // iterating on one row of the table without paying for the other seven.
+    let only = std::env::args()
+        .skip_while(|a| a != "--only")
+        .nth(1);
+    let total = stages.len();
+    for (i, (name, f)) in stages.iter().enumerate() {
+        if only.as_deref().is_some_and(|o| !name.contains(o)) {
+            continue;
+        }
+        eprintln!("[comparison] starting {name} ({}/{})", i + 1, total);
+        out.push(f(rows));
+    }
 
     let verdict = |ours: u64, theirs: u64| -> String {
         if ours == 0 {
@@ -238,13 +257,15 @@ fn fill_sqlite(c: &mut rusqlite::Connection, rows: u64) {
 
 /// Run the same plan against an aDaBt that has been allowed to optimize.
 ///
-/// Level 4 is the lowest that permits a column store and a materialized view,
-/// which are the two structures that could plausibly change a scan-heavy
-/// result. `optimize()` is called after loading and after a warm-up pass, so
-/// the optimizer sees the workload before it decides — which is how it is
-/// meant to be used and not how a benchmark usually runs it.
+/// Level 4 is the lowest that permits a column store and a materialized
+/// view, which are the two structures that could plausibly change a scan-heavy
+/// result. Level 5 is where the workload-aware index proposals live
+/// (`auto_composite_index`, `auto_covering_index`); the covering index is
+/// what lets an indexed lookup skip its fetches entirely, which matters
+/// against an opponent whose rows are packed pages. Both sides get the
+/// indexes they would actually have.
 fn tuned_query(tag: &str, rows: u64, plan: &LogicalPlan, reps: u32, indexes: &[(&str, IndexKind)]) -> u64 {
-    let (mut db, p) = fresh_adabt(tag, 4);
+    let (mut db, p) = fresh_adabt(tag, 5);
     fill_adabt(&mut db, rows);
     for (field, kind) in indexes {
         db.create_index("users", field, *kind).expect("index");
@@ -254,6 +275,31 @@ fn tuned_query(tag: &str, rows: u64, plan: &LogicalPlan, reps: u32, indexes: &[(
         db.query(plan).expect("warm");
     }
     db.optimize().expect("optimize");
+    // Drive whatever experiment optimize() started to its verdict before any
+    // timing happens.
+    //
+    // Shadow executes every query on BOTH paths and canary routes a fraction
+    // of them, so timing mid-trial measures the trial rather than the engine
+    // — and without `advance_experiments()` the state machine never leaves
+    // shadow at all, because phase transitions happen when the caller folds
+    // evidence in, not inside `query`. The first version of this harness did
+    // exactly that and reported `tuned` three to seven times slower than
+    // level 0 on every read workload while believing it was measuring column
+    // stores and materialized views. Time-bounded rather than sample-bounded:
+    // a plan that costs hundreds of microseconds can need thousands of canary
+    // queries at the bottom of the ramp, and a benchmark with an unbounded
+    // warm-up is a soak with a printing habit.
+    let settle_deadline = Instant::now() + Duration::from_secs(90);
+    while db.experiments().next().is_some() {
+        for _ in 0..50 {
+            db.query(plan).expect("settle");
+        }
+        db.advance_experiments().expect("advance");
+        if Instant::now() > settle_deadline {
+            db.abort_experiment("comparison harness settle deadline").expect("abort");
+            break;
+        }
+    }
     // Switch the result cache off, and say why.
     //
     // SQLite has no equivalent of memoizing a whole result set by query key.
@@ -269,6 +315,11 @@ fn tuned_query(tag: &str, rows: u64, plan: &LogicalPlan, reps: u32, indexes: &[(
     // which is a thing other databases also have. This one is not.
     db.set_result_cache_entries(0);
     db.query(plan).expect("warm after");
+    // Record what the planner actually serves the plan through after tuning.
+    // The first run of this harness reported `tuned` several times slower than
+    // level 0 on indexed workloads and the reason was right here: optimize()
+    // had replaced an IndexLookup with a ColumnScan over the whole collection.
+    eprintln!("---- tuned plan ({tag}) ----\n{}", db.explain(plan));
     let ns = best_of(5, reps as u64, || {
         for _ in 0..reps {
             std::hint::black_box(db.query(plan).expect("query").len());
@@ -397,7 +448,12 @@ fn full_scan_count(rows: u64) -> Row {
         vec![Agg::count("n")],
     ));
     db.query(&plan).expect("warm");
-    let adabt_ns = best_of(5, 20 * rows, || {
+    // Per QUERY, all three engines: this workload's question is "what does it
+    // cost to count the table", and per-row numbers hide what a derived
+    // structure does to that cost. (The first version reported L0 and SQLite
+    // per row but the tuned number per query — and briefly concluded tuning
+    // made aggregates 10× slower by dividing one by the other.)
+    let adabt_ns = best_of(5, 20, || {
         for _ in 0..20 {
             std::hint::black_box(db.query(&plan).expect("count"));
         }
@@ -411,7 +467,7 @@ fn full_scan_count(rows: u64) -> Row {
     // `count(age)` rather than `count(*)`: SQLite answers `count(*)` from an
     // index without reading rows, which measures a different thing entirely.
     let mut stmt = c.prepare("SELECT count(age) FROM users").unwrap();
-    let sqlite_ns = best_of(5, 20 * rows, || {
+    let sqlite_ns = best_of(5, 20, || {
         for _ in 0..20 {
             let n: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
             std::hint::black_box(n);
@@ -424,9 +480,9 @@ fn full_scan_count(rows: u64) -> Row {
     Row {
         workload: "full scan count",
         adabt_ns,
-        tuned_ns: tuned_query("scant", rows, &plan, 20, &[]) * 20 / rows.max(1),
+        tuned_ns: tuned_query("scant", rows, &plan, 20, &[]),
         sqlite_ns,
-        note: "per row, not per query",
+        note: "per query",
     }
 }
 
@@ -438,7 +494,8 @@ fn grouped_aggregate(rows: u64) -> Row {
         vec![Agg::count("n")],
     ));
     db.query(&plan).expect("warm");
-    let adabt_ns = best_of(5, 20 * rows, || {
+    // Per QUERY, all three engines — same reasoning as `full_scan_count`.
+    let adabt_ns = best_of(5, 20, || {
         for _ in 0..20 {
             std::hint::black_box(db.query(&plan).expect("group").len());
         }
@@ -452,7 +509,7 @@ fn grouped_aggregate(rows: u64) -> Row {
     let mut stmt = c
         .prepare("SELECT country, count(*) FROM users GROUP BY country")
         .unwrap();
-    let sqlite_ns = best_of(5, 20 * rows, || {
+    let sqlite_ns = best_of(5, 20, || {
         for _ in 0..20 {
             let n = stmt
                 .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
@@ -470,7 +527,7 @@ fn grouped_aggregate(rows: u64) -> Row {
         adabt_ns,
         tuned_ns: tuned_query("groupt", rows, &plan, 20, &[]),
         sqlite_ns,
-        note: "eight groups, per row",
+        note: "per query; eight groups",
     }
 }
 

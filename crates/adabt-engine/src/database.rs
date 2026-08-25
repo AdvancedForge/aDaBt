@@ -271,6 +271,28 @@ impl QueryMode {
     }
 }
 
+/// Whether `predicate` constrains `field` with at least one ordered
+/// comparison — a range want, as distinct from an equality pin.
+///
+/// Local mirror of the planner's range walk, kept deliberately shallow: this
+/// only decides whether a projection observation is worth recording against
+/// a b-tree-backed structure, not what the bounds are.
+fn range_constrained(predicate: &adabt_ir::Expr, field: &str) -> bool {
+    match predicate {
+        adabt_ir::Expr::Compare { op, lhs, .. } => {
+            matches!(
+                op,
+                adabt_ir::CmpOp::Ge
+                    | adabt_ir::CmpOp::Gt
+                    | adabt_ir::CmpOp::Le
+                    | adabt_ir::CmpOp::Lt
+            ) && matches!(lhs.as_ref(), adabt_ir::Expr::Field(f) if f == field)
+        }
+        adabt_ir::Expr::And(parts) => parts.iter().any(|p| range_constrained(p, field)),
+        _ => false,
+    }
+}
+
 impl Database {
     pub fn open(dir: &Path, policy: Policy) -> Result<Self> {
         Self::open_shared(
@@ -536,7 +558,6 @@ impl Database {
         self.compiled.clear();
         Ok(freed)
     }
-
 
     /// Resize the result cache, in entries. Zero disables it.
     ///
@@ -1735,6 +1756,20 @@ impl Database {
             .map(|k| k.as_str())
             .filter(|c| !masked.is_some_and(|h| h.hides_column_store(revealed, c)))
             .collect();
+        // And which fields each of those stores can reconstruct — the
+        // membership test a top-K decision needs before it may order by a
+        // field, because a columnar projection silently omits the rest.
+        let columnar_fields: HashMap<&str, Vec<String>> = self
+            .columns
+            .iter()
+            .filter(|(c, _)| !masked.is_some_and(|h| h.hides_column_store(revealed, c)))
+            .map(|(c, store)| {
+                (
+                    c.as_str(),
+                    store.fields().into_iter().map(String::from).collect(),
+                )
+            })
+            .collect();
         // Composite indexes, recognised by their NUL-joined name. Reported
         // separately because the planner asks a different question of them.
         //
@@ -1746,7 +1781,7 @@ impl Database {
         // predicate it cannot serve and get nothing back. Exactly the failure
         // the composite restore path already had once, in a new place.
         let mut composite: HashMap<&str, Vec<Vec<String>>> = HashMap::new();
-        let mut covering: HashMap<&str, Vec<(&str, Vec<String>)>> = HashMap::new();
+        let mut covering: HashMap<&str, Vec<adabt_exec::planner::CoveringEntry>> = HashMap::new();
         let mut partial: HashMap<&str, Vec<(&str, adabt_ir::Expr, IndexKind)>> = HashMap::new();
         for (c, list) in &self.indexes {
             for i in list {
@@ -1766,10 +1801,11 @@ impl Database {
                     }
                 } else if !i.covers().is_empty() {
                     if !masked.is_some_and(|h| h.hides_index(revealed, c, name, i.kind())) {
-                        covering
-                            .entry(c.as_str())
-                            .or_default()
-                            .push((name, i.covers().to_vec()));
+                        covering.entry(c.as_str()).or_default().push((
+                            name,
+                            i.covers().to_vec(),
+                            i.kind(),
+                        ));
                     }
                 } else if name.contains(adabt_index::COMPOSITE_SEP) {
                     composite
@@ -1785,6 +1821,7 @@ impl Database {
             covering,
             partial,
             columnar,
+            columnar_fields,
         }
     }
 
@@ -1808,37 +1845,92 @@ impl Database {
     fn note_filtered_fields(&self, logical: &LogicalPlan) {
         let collection = logical.collection();
         let mut op = Some(&logical.root);
+        // Gathered across the whole walk rather than at the filter node:
+        // the projection may sit above sorts and limits, and what a covering
+        // index needs to know is which output fields travelled with this
+        // predicate, wherever they were asked for.
+        let mut equalities_all: Vec<Vec<String>> = Vec::new();
+        let mut ranges: Vec<String> = Vec::new();
+        let mut projected: Vec<String> = Vec::new();
         while let Some(o) = op {
-            if let adabt_ir::plan::LogicalOp::Filter { predicate, .. } = o {
-                let mut equalities: Vec<String> = predicate
-                    .equality_constraints()
-                    .into_iter()
-                    .map(|(f, _)| f)
-                    .collect();
-                // Sorted and de-duplicated so that `country AND age` and
-                // `age AND country` are recognised as the same shape. A
-                // composite index over a set does not care which order the
-                // predicate wrote them in, and counting the two separately
-                // would halve the evidence for building one.
-                equalities.sort();
-                equalities.dedup();
-                if equalities.len() > 1 {
-                    self.probe.record(Event::FieldsPinnedTogether {
-                        collection,
-                        fields: &equalities,
-                    });
+            match o {
+                adabt_ir::plan::LogicalOp::Filter { predicate, .. } => {
+                    let mut equalities: Vec<String> = predicate
+                        .equality_constraints()
+                        .into_iter()
+                        .map(|(f, _)| f)
+                        .collect();
+                    // Sorted and de-duplicated so that `country AND age` and
+                    // `age AND country` are recognised as the same shape. A
+                    // composite index over a set does not care which order the
+                    // predicate wrote them in, and counting the two separately
+                    // would halve the evidence for building one.
+                    equalities.sort();
+                    equalities.dedup();
+                    let mut all = Vec::new();
+                    predicate.referenced_fields(&mut all);
+                    for f in all {
+                        // Constrained but not to a literal: range-filtered,
+                        // which is the covering question asked of a b-tree
+                        // rather than a hash.
+                        let equality = equalities.contains(&f);
+                        if !equality && !ranges.contains(&f) && range_constrained(predicate, &f) {
+                            ranges.push(f.clone());
+                        }
+                        self.probe.record(Event::FieldFiltered {
+                            collection,
+                            field: &f,
+                            equality,
+                        });
+                    }
+                    if equalities.len() > 1 {
+                        self.probe.record(Event::FieldsPinnedTogether {
+                            collection,
+                            fields: &equalities,
+                        });
+                    }
+                    equalities_all.push(equalities);
                 }
-                let mut all = Vec::new();
-                predicate.referenced_fields(&mut all);
-                for f in all {
-                    self.probe.record(Event::FieldFiltered {
-                        collection,
-                        field: &f,
-                        equality: equalities.contains(&f),
-                    });
+                adabt_ir::plan::LogicalOp::Project { fields, .. } => {
+                    projected.extend(fields.iter().cloned());
                 }
+                _ => {}
             }
             op = o.child();
+        }
+        if projected.is_empty() || (equalities_all.is_empty() && ranges.is_empty()) {
+            return;
+        }
+        projected.sort();
+        projected.dedup();
+        // One observation per filtered field, projection minus that field —
+        // the index carries its own key, so asking it to "cover" the filtered
+        // field would double-count a column it stores anyway. Equality and
+        // range observations stay apart: they want differently-backed
+        // indexes.
+        let mut seen: Vec<(String, bool)> = Vec::new();
+        for eqs in &equalities_all {
+            for f in eqs {
+                if !seen.iter().any(|(s, _)| s == f) {
+                    seen.push((f.clone(), true));
+                }
+            }
+        }
+        ranges.sort();
+        for f in &ranges {
+            if !seen.iter().any(|(s, _)| s == f) {
+                seen.push((f.clone(), false));
+            }
+        }
+        seen.sort();
+        for (f, equality) in seen {
+            let covers: Vec<String> = projected.iter().filter(|p| *p != &f).cloned().collect();
+            self.probe.record(Event::FieldsProjectedTogether {
+                collection,
+                filtered: &f,
+                fields: &covers,
+                equality,
+            });
         }
     }
 
@@ -2781,6 +2873,19 @@ impl Source for Database {
         Ok(Some(c.project(&refs)))
     }
 
+    fn column_topk(
+        &mut self,
+        collection: &str,
+        field: &str,
+        descending: bool,
+        k: usize,
+    ) -> Result<Option<Vec<RecordId>>> {
+        let Some(c) = self.columns.get(collection) else {
+            return Ok(None);
+        };
+        Ok(c.topk_ids(field, descending, k))
+    }
+
     fn index_lookup(
         &mut self,
         collection: &str,
@@ -2828,6 +2933,51 @@ impl Source for Database {
             // together precisely so this cannot happen; skipping rather than
             // fabricating an empty record keeps that a missing row rather than
             // a wrong one if it ever does.
+            if let Some(rec) = idx.covered(id) {
+                rows.push((id, rec.clone()));
+            }
+        }
+        Ok(Some(rows))
+    }
+
+    /// The range sibling of `covering_lookup`: ids from the inner index's
+    /// range scan, rows from the projections beside them, and no fetch.
+    ///
+    /// Two refusals, both load-bearing. The backing must be range-capable —
+    /// a hash-backed covering index holds no ordering to walk, and asking it
+    /// for a range would be a silent empty answer rather than an error. And
+    /// the projection must contain every field the plan above reads, for the
+    /// same reason `covering_lookup` demands it: a partial row is not an
+    /// answer to be topped up, it is not an answer.
+    fn covering_range(
+        &mut self,
+        collection: &str,
+        field: &str,
+        lo: Bound<&Value>,
+        hi: Bound<&Value>,
+        needed: &[String],
+    ) -> Result<Option<Vec<(RecordId, Record)>>> {
+        let Some(list) = self.indexes.get(collection) else {
+            return Ok(None);
+        };
+        let found = list.iter().find(|i| {
+            i.kind().supports_range() && {
+                let covers = i.covers();
+                !covers.is_empty()
+                    && adabt_index::covering_parts(i.field()).0 == field
+                    && needed.iter().all(|n| covers.contains(n))
+            }
+        });
+        let Some(idx) = found else {
+            return Ok(None);
+        };
+        let Some(ids) = idx.range(lo, hi) else {
+            return Ok(None);
+        };
+        let mut rows = Vec::new();
+        for id in ids {
+            // Same drift guard as `covering_lookup`: skip rather than
+            // fabricate.
             if let Some(rec) = idx.covered(id) {
                 rows.push((id, rec.clone()));
             }

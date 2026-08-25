@@ -19,6 +19,12 @@ use std::ops::Bound;
 use crate::physical::{PhysicalOp, PhysicalPlan};
 
 /// What the planner is allowed to assume exists.
+///
+/// One covering index as the planner sees it: its encoded name, the
+/// projection it carries, and its backing structure — the kind decides
+/// whether the index can serve a range or only an equality.
+pub type CoveringEntry<'a> = (&'a str, Vec<String>, IndexKind);
+
 pub struct PlanContext<'a> {
     /// Indexes available per collection, keyed by field.
     pub indexes: HashMap<&'a str, Vec<(&'a str, IndexKind)>>,
@@ -34,12 +40,19 @@ pub struct PlanContext<'a> {
     /// is — the question asked of it is different ("does this projection
     /// contain everything the query reads") and folding it in would make
     /// every existing lookup learn to skip entries it must not select.
-    pub covering: HashMap<&'a str, Vec<(&'a str, Vec<String>)>>,
+    pub covering: HashMap<&'a str, Vec<CoveringEntry<'a>>>,
     /// Partial indexes per collection: the index's full name, the condition
     /// it holds only the qualifying records for, and its kind.
     pub partial: HashMap<&'a str, Vec<(&'a str, Expr, IndexKind)>>,
     /// Collections with a columnar derived representation.
     pub columnar: Vec<&'a str>,
+    /// Which fields each collection's columnar representation can
+    /// reconstruct. Kept beside `columnar` rather than folded into it because
+    /// one question is yes/no and the other is a membership test — and the
+    /// membership test is load-bearing: a columnar projection silently omits
+    /// fields it does not carry, so a planner that guessed from presence
+    /// alone could order a top-K by absence and return an arbitrary k.
+    pub columnar_fields: HashMap<&'a str, Vec<String>>,
 }
 
 impl<'a> PlanContext<'a> {
@@ -50,6 +63,7 @@ impl<'a> PlanContext<'a> {
             covering: HashMap::new(),
             partial: HashMap::new(),
             columnar: Vec::new(),
+            columnar_fields: HashMap::new(),
         }
     }
 
@@ -61,11 +75,11 @@ impl<'a> PlanContext<'a> {
         );
         Self {
             covering: {
-                let mut c: HashMap<&str, Vec<(&str, Vec<String>)>> = HashMap::new();
-                let found: Vec<(&str, Vec<String>)> = indexes
+                let mut c: HashMap<&str, Vec<CoveringEntry>> = HashMap::new();
+                let found: Vec<CoveringEntry> = indexes
                     .iter()
                     .filter(|i| !i.covers().is_empty())
-                    .map(|i| (i.field(), i.covers().to_vec()))
+                    .map(|i| (i.field(), i.covers().to_vec(), i.kind()))
                     .collect();
                 if !found.is_empty() {
                     c.insert(collection, found);
@@ -76,19 +90,25 @@ impl<'a> PlanContext<'a> {
             composite: HashMap::new(),
             partial: HashMap::new(),
             columnar: Vec::new(),
+            columnar_fields: HashMap::new(),
         }
     }
 
     fn index_for(&self, collection: &str, field: &str) -> Option<IndexKind> {
         let list = self.indexes.get(collection)?;
-        // Prefer a hash index for equality: it is the cheapest lookup, and
-        // the caller only asks about a field it already intends to match
-        // exactly. A bitmap index answers equality too — the same `lookup`,
-        // the same rows back — and is preferred over a b-tree for it, since
-        // a b-tree is a range structure being asked for equality only as a
-        // fallback; between the two purpose-built equality structures, hash
-        // still wins because materializing a bitmap's matches costs a scan
-        // of its whole word range, not just of the matches themselves.
+        // Prefer a hash index for equality: the caller only asks about a
+        // field it already intends to match exactly, and hash is the one
+        // structure whose cost does not care how many distinct values the
+        // field has. A bitmap answers the same query and `adabt-bench
+        // index-scale` shows its lookups tying with hash at every scale
+        // measured (100k–1M rows, differences within run-to-run noise, sign
+        // flipping between runs) while holding ~6% of the memory — so on
+        // latency alone the tie would go to bitmap. It stays second because
+        // a bitmap's footprint scales with distinct values times rows, and
+        // this engine's ceiling IS its memory; hash-first is the choice that
+        // cannot explode on a high-cardinality field nobody has told us is
+        // low-cardinality. A cardinality signal would reopen the question,
+        // and belongs beside the selectivity work when it comes.
         let mut best = None;
         for (f, kind) in list {
             if *f == field {
@@ -115,13 +135,41 @@ impl<'a> PlanContext<'a> {
     ) -> Option<(String, adabt_core::value::Value, Vec<String>)> {
         let needed = needed?;
         let list = self.covering.get(collection)?;
-        for (name, covers) in list {
+        for (name, covers, _kind) in list {
             let (base, _) = adabt_index::covering_parts(name);
             let Some((_, key)) = equalities.iter().find(|(f, _)| *f == base) else {
                 continue;
             };
             if needed.iter().all(|n| covers.contains(n)) {
                 return Some((base, key.clone(), needed.to_vec()));
+            }
+        }
+        None
+    }
+
+    /// A covering index on one of the range-constrained fields whose
+    /// projection contains everything the query reads and whose backing can
+    /// walk a range.
+    ///
+    /// The b-tree sibling of `covering_for`. A hash-backed covering index
+    /// holds no ordering, so a range over one is not a slow plan but a silent
+    /// empty answer — the backing kind is checked here rather than trusted to
+    /// whoever created the index.
+    fn covering_range_for(
+        &self,
+        collection: &str,
+        range_fields: &[String],
+        needed: Option<&[String]>,
+    ) -> Option<String> {
+        let needed = needed?;
+        let list = self.covering.get(collection)?;
+        for (name, covers, kind) in list {
+            if !matches!(kind, IndexKind::BTree) {
+                continue;
+            }
+            let (base, _) = adabt_index::covering_parts(name);
+            if range_fields.contains(&base) && needed.iter().all(|n| covers.contains(n)) {
+                return Some(base);
             }
         }
         None
@@ -419,6 +467,7 @@ mod tests {
             covering: HashMap::new(),
             partial: HashMap::new(),
             columnar: Vec::new(),
+            columnar_fields: HashMap::new(),
         }
     }
 
@@ -582,8 +631,33 @@ pub enum AccessDecision {
         field: String,
         needed: Vec<String>,
     },
+    /// A range over a b-tree-backed covering index, answered without a fetch.
+    ///
+    /// The decision carries only shape-stable facts — which field, what the
+    /// projection must contain. The bounds bind at build time from this
+    /// query's predicate, exactly as an index lookup binds its key.
+    CoveringRange {
+        field: String,
+        needed: Vec<String>,
+    },
     IndexRange {
         field: String,
+    },
+    /// A top-K over a single sort key, served from the column store: read the
+    /// key column, keep the k smallest under Sort's exact order, fetch only
+    /// the winners. Chosen for a `Limit` directly over a single-key `Sort`
+    /// over a bare `Scan`, where sorting every materialized record would
+    /// throw all but k of them away.
+    ///
+    /// The decision deliberately does NOT carry k. Decisions are cached by
+    /// shape, and a query's shape hashes the presence of a limit but never
+    /// its value — so a k stored here would be the first asker's k, served
+    /// to every later limit on the same shape as if it were theirs. The
+    /// limit's value is bound at build time from the node itself, the same
+    /// way an index lookup binds its key from the predicate above the scan.
+    ColumnarTopK {
+        key: String,
+        descending: bool,
     },
 }
 
@@ -638,6 +712,42 @@ fn filter_directly_over_scan(op: &LogicalOp) -> Option<&Expr> {
     }
 }
 
+/// The shape a `ColumnarTopK` answers: a limit directly over a single-key
+/// sort directly over a bare scan.
+///
+/// Single-key only, and no filter anywhere between: the columnar read
+/// reconstructs only the fields it is asked for, so filtering before the
+/// winners are chosen would evaluate the predicate against records that do
+/// not carry it. Both restrictions are the weakest obviously-sound rule,
+/// the same policy the partial-index matcher follows.
+fn topk_over_scan(op: &LogicalOp) -> Option<(&str, &str, bool, usize)> {
+    // Projections above the limit are descended through: a top-K returns
+    // whole records for its winners, so whatever projects over them composes
+    // unchanged. Anything between the sort and the scan still blocks.
+    let mut op = op;
+    while let LogicalOp::Project { input, .. } = op {
+        op = input;
+    }
+    let LogicalOp::Limit { input, n } = op else {
+        return None;
+    };
+    let LogicalOp::Sort { input, keys } = input.as_ref() else {
+        return None;
+    };
+    let [only] = keys.as_slice() else {
+        return None;
+    };
+    let LogicalOp::Scan { collection } = input.as_ref() else {
+        return None;
+    };
+    Some((
+        collection.as_str(),
+        only.field.as_str(),
+        only.descending,
+        *n,
+    ))
+}
+
 /// Choose an access path. Depends on the plan's shape and the available
 /// indexes, never on its literals.
 pub fn decide(logical: &LogicalOp, ctx: &PlanContext<'_>) -> PlanDecision {
@@ -665,28 +775,67 @@ pub fn decide(logical: &LogicalOp, ctx: &PlanContext<'_>) -> PlanDecision {
                 rationale,
             };
         }
-    }
-
-    // A columnar read beats a heap scan when the plan touches only some fields,
-    // but it cannot serve an index lookup, so it is considered only where the
-    // access would otherwise be a full scan. `required_fields` returning None
-    // means the plan hands whole records upward and columnar is not legal.
-    if ctx.has_columnar(logical.collection()) {
-        if let Some(fields) = needed.clone() {
-            let equality_indexed = false;
-            if !equality_indexed {
+        // The range sibling: same no-fetch idea, b-tree backing, bounds
+        // bound at build time from the predicate above the scan.
+        if let Some(pred) = filter_directly_over_scan(logical) {
+            let mut ranged = Vec::new();
+            range_fields(pred, &mut ranged);
+            if let Some(field) =
+                ctx.covering_range_for(logical.collection(), &ranged, needed.as_deref())
+            {
                 let rationale = format!(
-                    "{} of the collection's fields are read; served columnar",
-                    fields.len()
+                    "range on {}.{field} answered from a covering index",
+                    logical.collection()
                 );
                 return PlanDecision {
-                    access: AccessDecision::ColumnScan { fields },
+                    access: AccessDecision::CoveringRange {
+                        field,
+                        needed: needed.unwrap_or_default(),
+                    },
                     rationale,
                 };
             }
         }
     }
-    // Walk to the leaf, remembering the filter directly above a scan.
+
+    // A limit over a single-key sort over a bare scan is a top-K question,
+    // not a sort question. Considered before the walk because, like covering
+    // above, it replaces more than the leaf access — it removes the sort
+    // itself. Gated on the column store actually holding the key field: the
+    // columnar projection silently omits fields it does not carry, and a
+    // top-K ordered by absence would return an arbitrary k rather than a
+    // wrong-by-a-little k.
+    if let Some((collection, key, descending, _)) = topk_over_scan(logical) {
+        if ctx
+            .columnar_fields
+            .get(collection)
+            .is_some_and(|fields| fields.iter().any(|f| f == key))
+        {
+            return PlanDecision {
+                access: AccessDecision::ColumnarTopK {
+                    key: key.to_string(),
+                    descending,
+                },
+                rationale: format!(
+                    "top-N by {key} read columnarly from {collection}; only the winners are fetched"
+                ),
+            };
+        }
+    }
+
+    // Walk to the leaf and settle the primary access path BEFORE columnar is
+    // considered.
+    //
+    // It did not always. The columnar branch used to sit here, above the
+    // walk, behind a guard reading `equality_indexed = false` — a constant,
+    // so the guard never fired, and every filtered query over a collection
+    // with a column store was served columnar even when an index served the
+    // same predicate better. Measured against SQLite, indexed equality went
+    // 43 ms at level 0 to 210 ms after `optimize()` (range: 30 ms to 171 ms):
+    // a hash lookup fetching 12,500 records replaced by a full columnar scan
+    // of all 100,000. The module's own comment already claimed the opposite
+    // precedence — "considered only where the access would otherwise be a
+    // full scan" — so the code now does what it said.
     let mut node = logical;
     let mut filter_over_scan: Option<&Expr> = None;
     loop {
@@ -764,6 +913,27 @@ pub fn decide(logical: &LogicalOp, ctx: &PlanContext<'_>) -> PlanDecision {
                                 rationale,
                             };
                         }
+                    }
+                }
+                // No index serves this plan, so the choice is columnar versus
+                // heap — and here a partial read of the needed fields beats
+                // materializing whole records. `required_fields` returning
+                // None means whole records reach the caller and columnar is
+                // not legal at all. An index that exists but does not fit the
+                // predicate is not consulted; whether columnar should also
+                // lose to an index whose selectivity is terrible is a cost
+                // question with no stats behind it yet, and precedence here
+                // stays on the documented side.
+                if ctx.has_columnar(collection) {
+                    if let Some(fields) = needed.clone() {
+                        let rationale = format!(
+                            "{} of the collection's fields are read; served columnar",
+                            fields.len()
+                        );
+                        return PlanDecision {
+                            access: AccessDecision::ColumnScan { fields },
+                            rationale,
+                        };
                     }
                 }
                 return PlanDecision {
@@ -903,6 +1073,20 @@ fn build_node(op: &LogicalOp, decision: &PlanDecision) -> PhysicalOp {
                             };
                         }
                     }
+                    AccessDecision::CoveringRange { field, needed } => {
+                        if let Some((lo, hi)) = range_constraint(predicate, field) {
+                            return PhysicalOp::Filter {
+                                input: Box::new(PhysicalOp::CoveringRange {
+                                    collection: collection.clone(),
+                                    field: field.clone(),
+                                    needed: needed.clone(),
+                                    lo,
+                                    hi,
+                                }),
+                                predicate: predicate.clone(),
+                            };
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -919,10 +1103,32 @@ fn build_node(op: &LogicalOp, decision: &PlanDecision) -> PhysicalOp {
             input: Box::new(build_node(input, decision)),
             keys: keys.clone(),
         },
-        LogicalOp::Limit { input, n } => PhysicalOp::Limit {
-            input: Box::new(build_node(input, decision)),
-            n: *n,
-        },
+        LogicalOp::Limit { input, n } => {
+            // A top-K decision names the whole subtree beneath this limit —
+            // the columnar read, the winner selection and the fetch of the
+            // survivors are one operator. Nothing below is built.
+            //
+            // k comes from THIS node, never from the decision: decisions are
+            // cached by shape and a shape does not know what n is.
+            if let AccessDecision::ColumnarTopK { key, descending } = &decision.access {
+                let LogicalOp::Sort { input, .. } = input.as_ref() else {
+                    unreachable!("a ColumnarTopK decision is only made over Limit(Sort(..))")
+                };
+                let LogicalOp::Scan { collection } = input.as_ref() else {
+                    unreachable!("a ColumnarTopK decision is only made over a bare Scan")
+                };
+                return PhysicalOp::ColumnarTopK {
+                    collection: collection.clone(),
+                    key: key.clone(),
+                    descending: *descending,
+                    k: *n,
+                };
+            }
+            PhysicalOp::Limit {
+                input: Box::new(build_node(input, decision)),
+                n: *n,
+            }
+        }
         LogicalOp::Aggregate {
             input,
             group_by,
@@ -960,6 +1166,7 @@ mod decision_tests {
             covering: HashMap::new(),
             partial: HashMap::new(),
             columnar: Vec::new(),
+            columnar_fields: HashMap::new(),
         }
     }
 
