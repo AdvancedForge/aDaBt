@@ -74,6 +74,19 @@ impl Client {
         self.call(RequestKind::Ping, Vec::new()).map(|_| ())
     }
 
+    /// Present a bearer token to a server that requires one.
+    ///
+    /// Must be the first thing a client does against an auth-enabled server;
+    /// every other request is refused with `Unauthorized` until this
+    /// succeeds. A wrong token is an `Error::Remote` whose message says so,
+    /// and the connection may simply try again — a typo costs a retry, not
+    /// a reconnect.
+    pub fn auth(&mut self, token: &str) -> Result<()> {
+        let mut w = Writer::new();
+        w.str(token);
+        self.call(RequestKind::Auth, w.finish()).map(|_| ())
+    }
+
     pub fn get(&mut self, collection: &str, id: RecordId) -> Result<Option<Record>> {
         let body = self.call(
             RequestKind::Get,

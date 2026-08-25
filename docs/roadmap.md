@@ -12,7 +12,7 @@ after M15. The middle column is where this file left them at its last revision;
 | **A — usable** | 60% | 90% | **95%** | you could ship on it |
 | **B — manually optimal** | 70% | 55% | **60%** | the engine's ceiling is the hardware's ceiling |
 | **C — automatically optimal** | 40% | 65% | **75%** | the expert adds nothing |
-| **D — good** | 30% | 35% | **50%** | there is a workload where it is demonstrably the right answer |
+| **D — good** | 30% | 35% | **55%** | there is a workload where it is demonstrably the right answer |
 
 What moved, and why:
 
@@ -26,9 +26,11 @@ What moved, and why:
   every cycle. The diagnosis's "keeps something that does not pay" standing
   measurement is retired: tuned aggregates now win by four orders of
   magnitude under outside witness.
-- **D 45 → 50.** The SQL shell exists (`adabt-cli`) — the surface a person
-  can actually touch, which M37 promised and did not deliver. Hardening,
-  security and packaging are what keep this track from moving further.
+- **D 45 → 55.** Three surface items landed: the SQL shell (`adabt-cli`),
+  an examples directory, and bearer-token auth on the server — the first
+  security pillar, tested over real sockets with per-connection state and
+  constant-time comparison. TLS and the role model keep "exposed on a
+  network" qualified; hardening keeps it unbenchmarked.
 - **D's wins deepened** (sort now 2–3× over SQLite; both indexed shapes
   answering through self-proposed covering indexes) but no new evidence
   *class* arrived — still one witness — so the comparison component holds.
@@ -126,10 +128,13 @@ visibly, under outside witness.
    optimizer because it has fewer moves. **Closing B raises C without touching
    C.**
 
-## D — Good · 45%
+## D — Good · 55%
 
-**Closed since the last revision: the comparison, for one witness — and the
-first loss converted into a win.**
+**Closed since the last revision:** the comparison for one witness (4 of 8
+wins, losses published, `docs/comparison-notes.md`), the SQL shell
+(`adabt-cli`), an examples directory, and bearer-token auth on the server —
+the first security pillar, with the gate before dispatch so an
+unauthenticated connection cannot even count rows.
 `comparison/` ran against bundled SQLite and the tables are published with
 losses beside wins (`docs/comparison-notes.md`): aDaBt now wins **4 of 8**
 workloads — point lookups on the resident directory, post-tuning aggregate
@@ -158,10 +163,16 @@ scans; the precedence half of that is fixed and re-published.
    floating point on their way to the screen). Refusals stay refusals —
    writes error by name, because a shell that approximates is worse than
    one that declines.
-4. **Security (M38): nothing.** No auth, no TLS, no roles, no per-collection
-   permissions. Honest posture, but the server cannot be exposed.
-5. **Ecosystem (M39).** No examples directory, no C ABI, no bindings, no semver
-   or format-compatibility promise — and the record encoding has changed twice
+4. **Security (M38): auth landed, the rest open.** The server accepts
+   `--auth-token` / `ADABT_TOKEN`; without a token, every request on a
+   connection is refused `Unauthorized` until Auth succeeds — including
+   Ping, so no unauthenticated oracle — with per-connection state,
+   constant-time comparison, and denial that neither closes the connection
+   nor echoes the secret. Still missing: TLS (the token is only as private
+   as its transport), roles and per-collection permissions.
+5. **Ecosystem (M39).** ~~No examples directory~~ — landed (`quickstart`,
+   `watch_it_optimize`). Still missing: a C ABI, bindings, semver and a
+   format-compatibility promise — and the record encoding has changed twice
    in its life with no migration path.
 
 ---
@@ -203,11 +214,17 @@ In order:
    measurement contradicted at 1M rows.
    *Finish tests:* predicted-vs-actual within noise at 100k and 1M rows in
    the level matrix; bitmap-versus-hash settled by benchmark, not argument.
-2. **Borrowed-view fetch path** — the literal second half of M27, and the
-   physical half of the remaining equality/range gaps and untuned scan
-   costs. Read paths see views over decoded pages; the owned form stays for
-   writes. *Finish test:* a scan of N rows allocates O(1) per row, asserted
-   by the counting allocator that already exists.
+2. **Borrowed-view fetch path** — **started, measured slice landed.** The
+   columnar projection was paying two allocations per *cell* for field
+   names (`to_string` plus the `Arc` conversion) on top of the record's own
+   vector; `ColumnStore::arcs` interns each name once per store and hands
+   out refcount bumps. A columnar scan now sits at its floor — **1
+   allocation per row**, asserted beside the heap budgets in
+   `allocations.rs`. What remains of this item is the literal borrowed view:
+   read paths seeing references into decoded pages instead of owned
+   records, which needs the executor's row API to grow lifetimes.
+   *Finish test:* a scan of N rows allocates O(1) per row — now asserted
+   for both the heap path (2/row) and the columnar path (1/row).
 3. **Automatic covering-index proposals** — **landed, both shapes**
    (`auto_covering_index`, level 5+). New telemetry pairs each filtered
    field with the projection it travels with (`FieldsProjectedTogether`,
@@ -311,11 +328,15 @@ on elapsed time.
 
 ### Stage 8 — Surface and ecosystem *(finishes D)*
 
-The SQL shell — **landed** as `adabt-cli`. Authentication, TLS, roles and per-collection
-permissions until the server can be exposed on a network; an examples
-directory; a C ABI and one real binding on top of it; semantic versioning with
-an on-disk format version and a migration path, so the encoding stops changing
-without one.
+**Landed:** the SQL shell (`adabt-cli`), the examples directory
+(`quickstart`, `watch_it_optimize`), and bearer-token authentication on the
+server — gate before dispatch, per-connection state, constant-time compare,
+refusals that neither close the connection nor echo the secret.
+
+Remaining: TLS (the token is only as private as its transport), roles and
+per-collection permissions, a C ABI with one real binding on top of it, and
+semantic versioning with an on-disk format version and a migration path, so
+the encoding stops changing without one.
 
 *Finish tests:* a hostile-client suite runs against the exposed server;
 a fresh clone reaches a working example in a stated number of commands;

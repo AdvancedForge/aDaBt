@@ -212,6 +212,15 @@ pub struct ColumnStore {
     /// Where each id sits, for point access.
     row_of: HashMap<RecordId, usize>,
     columns: HashMap<String, Column>,
+    /// One interned handle per field name, kept beside the column it names.
+    ///
+    /// Every record `project` builds carries the same field-name strings as
+    /// every other. Handing out fresh `Arc`s cloned from here is a refcount
+    /// bump; the alternative — `set("...")` with a literal — allocates a
+    /// `String` per field per row and then another allocation to turn it
+    /// into an `Arc`. On a scan that is the difference between one
+    /// allocation per row and one per cell.
+    arcs: HashMap<String, std::sync::Arc<str>>,
     /// Rows whose id has been deleted. Skipped on read; reclaimed by a rebuild.
     dead: Vec<bool>,
     dead_count: usize,
@@ -224,6 +233,7 @@ impl ColumnStore {
             ids: Vec::new(),
             row_of: HashMap::new(),
             columns: HashMap::new(),
+            arcs: HashMap::new(),
             dead: Vec::new(),
             dead_count: 0,
         };
@@ -257,6 +267,11 @@ impl ColumnStore {
                 col.push_null();
             }
             col.push(Some(value));
+            // And the name gets exactly one heap allocation for the life of
+            // the store, however many rows reference it afterwards.
+            self.arcs
+                .entry(name.to_string())
+                .or_insert_with(|| std::sync::Arc::from(name));
         }
         // Fields absent from this record still need a slot.
         for col in self.columns.values_mut() {
@@ -335,7 +350,15 @@ impl ColumnStore {
                 for f in fields {
                     if let Some(col) = self.columns.get(*f) {
                         if let Some(v) = col.get(row) {
-                            rec.set((*f).to_string(), v);
+                            // Interned name, refcount bump — see `arcs`.
+                            match self.arcs.get(*f) {
+                                Some(arc) => {
+                                    rec.set_shared(std::sync::Arc::clone(arc), v);
+                                }
+                                None => {
+                                    rec.set((*f).to_string(), v);
+                                }
+                            }
                         }
                     }
                 }

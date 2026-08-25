@@ -32,6 +32,9 @@ pub enum RequestKind {
     ExplainOptimizations,
     /// Ask for a Prometheus-formatted snapshot of what has been observed.
     Metrics,
+    /// Present a bearer token. The only request a server with auth enabled
+    /// will answer before it succeeds.
+    Auth,
 }
 
 impl RequestKind {
@@ -48,6 +51,7 @@ impl RequestKind {
             RequestKind::Optimize => 8,
             RequestKind::ExplainOptimizations => 9,
             RequestKind::Metrics => 10,
+            RequestKind::Auth => 11,
         }
     }
     pub fn from_code(c: u8) -> Option<Self> {
@@ -63,6 +67,7 @@ impl RequestKind {
             8 => RequestKind::Optimize,
             9 => RequestKind::ExplainOptimizations,
             10 => RequestKind::Metrics,
+            11 => RequestKind::Auth,
             _ => return None,
         })
     }
@@ -91,6 +96,13 @@ pub enum StatusCode {
     /// other status here: the request was fine and might succeed if sent
     /// again with more room or without being cancelled.
     Cancelled,
+    /// Not authenticated. The connection may retry with an Auth request;
+    /// nothing else on this connection will be answered until one succeeds.
+    Unauthorized,
+    /// Authentication failed. The token did not match; the connection stays
+    /// unauthenticated and may try again, because a typo should cost a
+    /// retry and not a reconnect.
+    AuthDenied,
     Internal,
 }
 
@@ -105,6 +117,8 @@ impl StatusCode {
             StatusCode::Internal => 5,
             StatusCode::NotImplemented => 6,
             StatusCode::Cancelled => 7,
+            StatusCode::Unauthorized => 8,
+            StatusCode::AuthDenied => 9,
         }
     }
     pub fn from_code(c: u8) -> Option<Self> {
@@ -117,6 +131,8 @@ impl StatusCode {
             5 => StatusCode::Internal,
             6 => StatusCode::NotImplemented,
             7 => StatusCode::Cancelled,
+            8 => StatusCode::Unauthorized,
+            9 => StatusCode::AuthDenied,
             _ => return None,
         })
     }
@@ -134,6 +150,8 @@ impl StatusCode {
             StatusCode::Internal => "internal error",
             StatusCode::NotImplemented => "not implemented",
             StatusCode::Cancelled => "cancelled",
+            StatusCode::Unauthorized => "unauthorized",
+            StatusCode::AuthDenied => "authentication failed",
         }
     }
 

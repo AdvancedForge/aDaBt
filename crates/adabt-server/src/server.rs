@@ -81,6 +81,7 @@ pub struct Server {
     active: Arc<AtomicUsize>,
     max_connections: usize,
     idle_timeout: Option<Duration>,
+    auth_token: Option<String>,
 }
 
 impl Server {
@@ -92,7 +93,21 @@ impl Server {
             active: Arc::new(AtomicUsize::new(0)),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
+            auth_token: None,
         })
+    }
+
+    /// Require a bearer token on every connection.
+    ///
+    /// Until a connection presents this token via an Auth request, every
+    /// other request it sends is refused with `Unauthorized` — including
+    /// Ping, because an unauthenticated oracle that says "the server is
+    /// alive" is a small thing to leak and a smaller thing to need. `None`
+    /// (the default) disables the gate entirely, which is the trusted-
+    /// network posture this server shipped with.
+    pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
+        self.auth_token = Some(token.into());
+        self
     }
 
     /// Refuse a connection beyond this many concurrently open. Default
@@ -156,11 +171,12 @@ impl Server {
             let guard = ActiveGuard(Arc::clone(&self.active));
             let db = Arc::clone(&self.db);
             let idle_timeout = self.idle_timeout;
+            let auth = self.auth_token.clone();
             // A connection that fails takes nothing else down with it: the
             // thread ends, the socket closes, every other client carries on.
             std::thread::spawn(move || {
                 let _guard = guard;
-                let _ = handle(stream, db, idle_timeout);
+                let _ = handle(stream, db, idle_timeout, auth);
             });
         }
         let deadline = std::time::Instant::now() + DRAIN_TIMEOUT;
@@ -213,6 +229,7 @@ fn handle(
     mut stream: TcpStream,
     db: Shared,
     idle_timeout: Option<Duration>,
+    auth_token: Option<String>,
 ) -> std::io::Result<()> {
     stream.set_nodelay(true).ok();
     // Re-armed by the OS on every `read`, so this bounds the gap between
@@ -221,6 +238,11 @@ fn handle(
     stream.set_read_timeout(idle_timeout).ok();
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 16 * 1024];
+    // Per-connection authentication state. A connection starts
+    // unauthenticated whenever a token is required; success is remembered
+    // here and nowhere else, so one client's proof says nothing about any
+    // other connection.
+    let mut authed = auth_token.is_none();
     loop {
         let n = stream.read(&mut chunk)?;
         if n == 0 {
@@ -233,7 +255,7 @@ fn handle(
                 Ok(None) => break,
                 Ok(Some((frame, used))) => {
                     buf.drain(..used);
-                    let reply = respond(&frame, &db);
+                    let reply = respond(&frame, &db, auth_token.as_deref(), &mut authed);
                     stream.write_all(&reply.encode())?;
                 }
                 // The stream is no longer frames. Nothing useful can be read
@@ -248,7 +270,7 @@ fn handle(
     }
 }
 
-fn respond(frame: &Frame, db: &Shared) -> Frame {
+fn respond(frame: &Frame, db: &Shared, auth_token: Option<&str>, authed: &mut bool) -> Frame {
     let id = frame.request_id;
     let Some(kind) = RequestKind::from_code(frame.kind) else {
         return error_frame(
@@ -257,10 +279,50 @@ fn respond(frame: &Frame, db: &Shared) -> Frame {
             &format!("unknown request kind {}", frame.kind),
         );
     };
+    // The gate. Everything except Auth is refused before it reaches the
+    // engine, so an unauthenticated connection cannot even count rows.
+    if !*authed {
+        if kind != RequestKind::Auth {
+            return error_frame(id, StatusCode::Unauthorized, "authentication required");
+        }
+        let token = Reader::new(&frame.body)
+            .str("auth token")
+            .unwrap_or_default();
+        if auth_token.is_some_and(|want| tokens_match(want, &token)) {
+            *authed = true;
+            return Frame::new(StatusCode::Ok.code(), id, Vec::new());
+        }
+        return error_frame(
+            id,
+            StatusCode::AuthDenied,
+            "authentication failed; the connection remains unauthenticated",
+        );
+    }
     match dispatch(kind, &frame.body, db) {
         Ok(body) => Frame::new(StatusCode::Ok.code(), id, body),
         Err(e) => error_frame(id, StatusCode::of(&e), &e.to_string()),
     }
+}
+
+/// Token comparison that does not leak its progress through timing.
+///
+/// A plain `==` returns at the first differing byte, which lets a client on
+/// the same network measure how far into the token it got and reconstruct
+/// the secret a piece at a time. Folding every byte into one accumulator
+/// costs nothing measurable and removes the channel; this is the whole
+/// trick, and it is small enough to be worth doing even here.
+fn tokens_match(want: &str, got: &str) -> bool {
+    let (w, g) = (want.as_bytes(), got.as_bytes());
+    if w.len() != g.len() {
+        // Length still differs up front — unavoidable without padding — but
+        // length alone narrows a secret much less than its bytes do.
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in w.iter().zip(g.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
 }
 
 fn error_frame(id: u64, status: StatusCode, message: &str) -> Frame {
@@ -272,6 +334,12 @@ fn error_frame(id: u64, status: StatusCode, message: &str) -> Frame {
 fn dispatch(kind: RequestKind, body: &[u8], db: &ShardedDatabase) -> Result<Vec<u8>> {
     let mut r = Reader::new(body);
     match kind {
+        // Unreachable through `respond` — the auth gate handles Auth itself
+        // and never forwards it here. A match arm rather than a `_` so a
+        // future request kind added to the enum fails to compile here until
+        // someone decides how it is served, instead of silently vanishing
+        // into a catch-all.
+        RequestKind::Auth => unreachable!("respond handles Auth before dispatch"),
         RequestKind::Ping => {
             r.end()?;
             Ok(Vec::new())

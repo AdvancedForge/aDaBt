@@ -39,7 +39,9 @@ when they want the same partition. This is shared-nothing partitioning, not
 thread-per-core — there is no core pinning, no io_uring and no zero-copy path.
 `--shards 1` is the unpartitioned behaviour exactly.
 
-POSTURE: no authentication, no encryption. Bind this to a trusted network only.
+POSTURE: token auth available (--auth-token / ADABT_TOKEN); still no encryption
+and no roles. A token stops strangers from reading; it does not stop them
+reading it in transit, so bind to a trusted network regardless.
 
 SIGINT/SIGTERM (Unix): stop accepting new connections, let connections already
 open finish, checkpoint, exit.
@@ -54,6 +56,7 @@ fn main() {
     let mut max_connections = adabt_server::server::DEFAULT_MAX_CONNECTIONS;
     let mut idle_timeout = Some(adabt_server::server::DEFAULT_IDLE_TIMEOUT);
     let mut slow_query_log_ms: Option<u64> = None;
+    let mut auth_token: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -87,6 +90,13 @@ fn main() {
             "--slow-query-log-ms" => {
                 slow_query_log_ms = args.next().and_then(|v| v.parse().ok());
             }
+            "--auth-token" => match args.next() {
+                Some(t) if !t.is_empty() => auth_token = Some(t),
+                _ => {
+                    eprintln!("--auth-token requires a non-empty value\n\n{USAGE}");
+                    std::process::exit(2);
+                }
+            },
             "-h" | "--help" => {
                 print!("{USAGE}");
                 return;
@@ -131,10 +141,22 @@ fn main() {
                 .enable_slow_query_log(Duration::from_millis(ms));
         }
     }
+    // A token can come from a flag or the environment. The environment is
+    // the better default for anything launched by a scheduler: process
+    // listings show arguments, but not env vars.
+    let auth_token = auth_token
+        .or_else(|| std::env::var("ADABT_TOKEN").ok())
+        .filter(|t| !t.is_empty());
     let server = match Server::bind(&listen, db) {
-        Ok(s) => s
-            .with_max_connections(max_connections)
-            .with_idle_timeout(idle_timeout),
+        Ok(s) => {
+            let s = s
+                .with_max_connections(max_connections)
+                .with_idle_timeout(idle_timeout);
+            match auth_token.as_deref() {
+                Some(t) => s.with_auth_token(t),
+                None => s,
+            }
+        }
         Err(e) => {
             eprintln!("could not bind {listen}: {e}");
             std::process::exit(1);
@@ -142,11 +164,16 @@ fn main() {
     };
     match server.local_addr() {
         Ok(addr) => eprintln!(
-            "aDaBt listening on {addr} ({}, {shards} shard(s)) — trusted network only, no auth",
+            "aDaBt listening on {addr} ({}, {shards} shard(s)) — {}, no encryption",
             if adaptive {
                 "adaptive".to_string()
             } else {
                 format!("level {level}")
+            },
+            if auth_token.is_some() {
+                "token auth required"
+            } else {
+                "trusted network only, NO AUTH"
             }
         ),
         Err(_) => eprintln!("aDaBt listening"),

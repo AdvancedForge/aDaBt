@@ -168,8 +168,10 @@ after one there is no old path left to compare against.
 
 No replication. No cross-shard transactions — the log format records
 participants and coordinator, but no coordinator exists. Serializable isolation
-is not yet a selectable level. No authentication, TLS or roles: the server is
-trusted-network-only. Shared-nothing partitioning exists; **thread-per-core
+is not yet a selectable level. The server takes bearer-token auth
+(`--auth-token` / `ADABT_TOKEN`); there is still **no TLS, no roles** — a token
+stops strangers reading over a trusted network, not in transit. Shared-nothing
+partitioning exists; **thread-per-core
 does not** — no core pinning, no `io_uring`, no async storage path. Every index
 and the page directory are fully resident, measured at roughly 470–570 bytes of
 resident memory per row, which puts the practical ceiling near a few million

@@ -139,6 +139,55 @@ fn scan() -> LogicalPlan {
 /// an honest change that costs one more allocation per row.
 const SCAN_BUDGET: u64 = 4;
 
+/// The columnar path's floor is one allocation per row — the record's own
+/// vector. Field names are interned in the store (`ColumnStore::arcs`), so
+/// handing them to each row is a refcount bump; integer cells are copied, not
+/// allocated; only string cells allocate, and this fixture has one per row.
+///
+/// Before interning, `project` built every name with `to_string()` plus the
+/// `Arc` conversion — two extra allocations per CELL per row, so six per row
+/// on this fixture instead of two. That is what this budget exists to keep
+/// from coming back.
+const COLUMNAR_BUDGET: u64 = 3;
+
+#[test]
+fn a_columnar_scan_allocates_a_bounded_amount_per_row() {
+    let _exclusive = exclusive();
+    let dir = Tmp::new("columnar");
+    seeded(dir.path());
+    // Two fields projected out of three, both non-string where possible: id
+    // and bucket are integers, status stays behind. The plan must actually be
+    // served columnarly or the test proves nothing — asserted, not assumed,
+    // exactly like the column-store tests do it.
+    let plan = LogicalPlan::new(
+        LogicalOp::Scan {
+            collection: "c".into(),
+        }
+        .project(vec!["id".into(), "bucket".into()]),
+    );
+
+    // A level whose preset includes the column store, then prove it engaged.
+    let mut tuned = Database::open(dir.path(), Policy::manual(4)).unwrap();
+    let explain = tuned.plan(&plan).explain();
+    assert!(
+        explain.contains("ColumnScan"),
+        "the plan was not served columnarly:\n{explain}"
+    );
+    tuned.query(&plan).unwrap(); // warm
+
+    let allocs = allocations_during(|| tuned.query(&plan).unwrap());
+    let per_row = allocs / N;
+
+    println!(
+        "columnar scan: {per_row} allocations/row ({allocs} for {N}), budget {COLUMNAR_BUDGET}"
+    );
+    assert!(
+        per_row <= COLUMNAR_BUDGET,
+        "a columnar scan cost {per_row} allocations per row (budget {COLUMNAR_BUDGET}); \
+         {allocs} for {N} rows"
+    );
+}
+
 #[test]
 fn a_scan_allocates_a_bounded_amount_per_row() {
     let _exclusive = exclusive();
