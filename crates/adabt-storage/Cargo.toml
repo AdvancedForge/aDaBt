@@ -5,10 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+loom = ["dep:loom"]
+
 [dependencies]
 adabt-core.workspace = true
 adabt-telemetry.workspace = true
 lz4_flex = { version = "0.14.0", default-features = false, features = ["safe-encode", "safe-decode", "checked-decode", "std"] }
+loom = { version = "0.7", optional = true }
 
 [dev-dependencies]
 adabt-testkit.workspace = true

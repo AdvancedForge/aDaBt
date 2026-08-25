@@ -25,8 +25,11 @@ use adabt_core::policy::Durability;
 use adabt_core::record::Record;
 use adabt_core::schema::Schema;
 use adabt_core::store::{normalize_for_storage, LogicalStore};
+#[cfg(feature = "loom")]
+use loom::sync::Arc;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+#[cfg(not(feature = "loom"))]
 use std::sync::Arc;
 
 use crate::catalog::{decode_schema, encode_schema};

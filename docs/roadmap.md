@@ -315,17 +315,24 @@ standard workloads, with the expert given everything Stage 2 built.
 
 ### Stage 7 — Hardening *(makes the numbers trustworthy)*
 
-**Landed:** the deterministic sweep and the consistency checker.
+**Landed:** the deterministic sweep, the consistency checker, the loom
+subset, and restart chaos around experiment promotion.
 `Database::verify()` walks heap against every derived structure — forward
 (record → index), reverse (index → heap, catching dangling ids), columnar id
 sets — with `cfg(test)` fault-injection seams proving it detects seeded
 divergence in both directions. The crash/chaos matrix (`crash_consistency.rs`)
 truncates the WAL's active segment at 13 byte offsets through an uncheckpointed
 write wave and demands, at every point: clean open or clean refusal, exact
-survivors, `verify()` empty, idempotent reopen.
+survivors, `verify()` empty, idempotent reopen. The lock-free transaction-id
+allocator is model-checked under `--features loom` (two writers, all
+interleavings: distinct ids from one, `current` equals the highest issued
+after join); `promotion_chaos.rs` kills and reopens at Building and Shadow,
+demanding identical answers, empty `verify()`, and a non-wedged engine each
+time — a lost trial loses only the trial.
 
-Remaining: loom on the lock-free structures, chaos around experiment promotion
-and 2PC.
+Remaining: chaos around 2PC commit windows (the two-phase path itself is
+transactional tests' territory; what is untested is a crash between its
+phases).
 
 *Finish tests:* nightly CI runs the loom subset and chaos matrix; the checker
 detects every seeded divergence in both directions; no test in the default

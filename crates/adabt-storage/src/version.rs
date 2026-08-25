@@ -21,7 +21,16 @@
 //! adding it now is not a format change.
 
 use adabt_core::ids::TxnId;
+/// Under the loom feature every atomic and thread primitive here is loom's,
+/// so the model checker explores all interleavings of the tests at the bottom
+/// of this file. The default build uses the real thing.
+#[cfg(feature = "loom")]
+use loom::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "loom")]
+use loom::sync::Arc;
+#[cfg(not(feature = "loom"))]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(feature = "loom"))]
 use std::sync::Arc;
 
 /// Hands out transaction ids and tracks which snapshots are still open.
@@ -124,6 +133,10 @@ impl std::fmt::Debug for Snapshot {
 }
 
 #[cfg(test)]
+// The ordinary tests use the real std primitives, which loom's cfg-swap
+// replaces; they run on the default build and yield to the model-checked
+// subset when `--features loom` is set.
+#[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
 
@@ -231,5 +244,49 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(t.open_count(), 0, "a thread leaked its snapshot");
+    }
+}
+
+/// The loom subset: exhaustive interleavings of the lock-free allocator,
+/// run only under `--features loom` (nightly CI). Two writers racing on
+/// `begin_write` must receive distinct ids, ids must start at one, and
+/// `current` must never name an id that has not been issued.
+#[cfg(all(test, feature = "loom"))]
+mod loom_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_writers_receive_distinct_ids_from_one() {
+        loom::model(|| {
+            let t = std::sync::Arc::new(VersionTracker::new());
+            let t2 = std::sync::Arc::clone(&t);
+            let h = loom::thread::spawn(move || t2.begin_write().0);
+            let a = t.begin_write().0;
+            let b = h.join().unwrap();
+            assert_ne!(a, b, "two writers were handed the same id");
+            assert_eq!(a.min(b), 1, "ids begin at one");
+        });
+    }
+
+    #[test]
+    fn current_names_the_last_issued_id_once_writers_finish() {
+        loom::model(|| {
+            let t = std::sync::Arc::new(VersionTracker::new());
+            let t2 = std::sync::Arc::clone(&t);
+            let h = loom::thread::spawn(move || t2.begin_write().0);
+            let issued = t.begin_write().0;
+            // Before the join, `current` may legitimately run ahead of THIS
+            // thread's id — the other writer's fetch_add can land first.
+            // That is why the check lives after the join: with both writes
+            // complete, `current` must name exactly the highest id handed
+            // out. (Loom explored every interleaving to get here.)
+            let other = h.join().unwrap();
+            let seen = t.current().0;
+            assert_eq!(
+                seen,
+                issued.max(other),
+                "after all writers finish, current must be the highest issued id"
+            );
+        });
     }
 }
