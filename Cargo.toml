@@ -35,7 +35,6 @@ adabt-exec = { path = "crates/adabt-exec" }
 adabt-opt = { path = "crates/adabt-opt" }
 adabt-engine = { path = "crates/adabt-engine" }
 adabt-testkit = { path = "crates/adabt-testkit" }
-adabt-cli = { path = "crates/adabt-cli" }
 thiserror = "1"
 
 [profile.release]

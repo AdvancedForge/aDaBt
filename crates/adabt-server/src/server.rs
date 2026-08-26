@@ -82,6 +82,10 @@ pub struct Server {
     max_connections: usize,
     idle_timeout: Option<Duration>,
     auth: AuthConfig,
+    /// When set, every accepted connection completes a TLS 1.3 handshake
+    /// before any protocol byte is read. `None` is plaintext, the posture
+    /// this server shipped with.
+    tls: Option<Arc<rustls::ServerConfig>>,
 }
 
 /// What a connection is allowed to do once it has authenticated.
@@ -153,6 +157,15 @@ impl AuthConfig {
     }
 }
 
+/// A PEM load failure with the offending file named — the caller's error is
+/// about a file on disk, and an unnamed "decode failed" would send someone
+/// hunting through the wrong directory.
+fn bad_pem(
+    path: &std::path::Path,
+) -> impl Fn(rustls::pki_types::pem::Error) -> std::io::Error + '_ {
+    move |e| std::io::Error::other(format!("reading {}: {e}", path.display()))
+}
+
 impl Server {
     pub fn bind(addr: impl ToSocketAddrs, db: ShardedDatabase) -> std::io::Result<Self> {
         Ok(Self {
@@ -163,7 +176,44 @@ impl Server {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
             auth: AuthConfig::default(),
+            tls: None,
         })
+    }
+
+    /// Encrypt every connection with TLS, presenting the certificate chain
+    /// and key from these PEM files.
+    ///
+    /// The handshake happens before any protocol byte is read — a client
+    /// that speaks plaintext to a TLS listener sees a handshake failure, not
+    /// a half-parsed frame. No client certificate is required; tokens
+    /// (`with_auth_token`) remain the authentication story. Fails at bind
+    /// time on unreadable files or a mismatched pair, which is the right
+    /// moment to learn that: a server that came up without the encryption it
+    /// was asked for would be worse than one that did not come up.
+    pub fn with_tls(
+        mut self,
+        cert_pem: &std::path::Path,
+        key_pem: &std::path::Path,
+    ) -> std::io::Result<Self> {
+        use rustls::pki_types::pem::PemObject;
+        let certs: Vec<_> = rustls::pki_types::CertificateDer::pem_file_iter(cert_pem)
+            .map_err(bad_pem(cert_pem))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(bad_pem(cert_pem))?;
+        if certs.is_empty() {
+            return Err(std::io::Error::other(format!(
+                "{} contained no certificates",
+                cert_pem.display()
+            )));
+        }
+        let key =
+            rustls::pki_types::PrivateKeyDer::from_pem_file(key_pem).map_err(bad_pem(key_pem))?;
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        self.tls = Some(Arc::new(config));
+        Ok(self)
     }
 
     /// Require a bearer token on every connection, granting `admin` to the
@@ -217,6 +267,23 @@ impl Server {
         Arc::clone(&self.db)
     }
 
+    /// The binary's flag pair, applied as one: both flags or neither. A
+    /// certificate without a key (or the reverse) is a startup error, not a
+    /// half-encrypted listener.
+    pub fn with_tls_flags(
+        self,
+        cert: Option<&std::path::Path>,
+        key: Option<&std::path::Path>,
+    ) -> std::io::Result<Self> {
+        match (cert, key) {
+            (Some(cert), Some(key)) => self.with_tls(cert, key),
+            (None, None) => Ok(self),
+            _ => Err(std::io::Error::other(
+                "--tls-cert and --tls-key must be given together",
+            )),
+        }
+    }
+
     /// A handle that stops the accept loop.
     pub fn stopper(&self) -> Stopper {
         Stopper {
@@ -251,11 +318,33 @@ impl Server {
             let db = Arc::clone(&self.db);
             let idle_timeout = self.idle_timeout;
             let auth = self.auth.clone();
+            let tls = self.tls.clone();
             // A connection that fails takes nothing else down with it: the
             // thread ends, the socket closes, every other client carries on.
             std::thread::spawn(move || {
                 let _guard = guard;
-                let _ = handle(stream, db, idle_timeout, auth);
+                // Socket tuning happens on the raw stream, before any
+                // wrapping: the timeouts bound gaps between bytes at the TCP
+                // layer either way.
+                stream.set_nodelay(true).ok();
+                stream.set_read_timeout(idle_timeout).ok();
+                let conn = match &tls {
+                    None => None,
+                    Some(config) => match rustls::ServerConnection::new(Arc::clone(config)) {
+                        Ok(c) => Some(c),
+                        // A connection that cannot even be set up is closed
+                        // by dropping the stream; nothing else to do.
+                        Err(_) => return,
+                    },
+                };
+                match conn {
+                    Some(c) => {
+                        let _ = handle(rustls::StreamOwned::new(c, stream), db, auth);
+                    }
+                    None => {
+                        let _ = handle(stream, db, auth);
+                    }
+                }
             });
         }
         let deadline = std::time::Instant::now() + DRAIN_TIMEOUT;
@@ -304,17 +393,13 @@ impl ConnectionCount {
     }
 }
 
-fn handle(
-    mut stream: TcpStream,
-    db: Shared,
-    idle_timeout: Option<Duration>,
-    auth: AuthConfig,
-) -> std::io::Result<()> {
-    stream.set_nodelay(true).ok();
-    // Re-armed by the OS on every `read`, so this bounds the gap between
-    // bytes, not the connection's total lifetime — a client making steady
-    // progress is never cut off by it, only one that has gone silent.
-    stream.set_read_timeout(idle_timeout).ok();
+/// Serve one connection to completion, over whatever transport it arrived
+/// on — a plain `TcpStream`, or the same socket wrapped in a TLS session.
+///
+/// The generic is what keeps TLS a one-line change per connection: framing,
+/// authentication, and dispatch are written once against `Read`/`Write` and
+/// cannot drift between the encrypted and plaintext paths.
+fn handle<S: Read + Write>(mut stream: S, db: Shared, auth: AuthConfig) -> std::io::Result<()> {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 16 * 1024];
     // Per-connection authorization state. A connection starts unauthenticated

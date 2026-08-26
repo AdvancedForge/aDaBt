@@ -11,7 +11,11 @@ adabt-engine.workspace = true
 adabt-ir.workspace = true
 adabt-storage.workspace = true
 adabt-telemetry.workspace = true
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std"] }
 
 [[bin]]
 name = "adabt-server"
 path = "src/main.rs"
+
+[dev-dependencies]
+rcgen = "0.14.7"

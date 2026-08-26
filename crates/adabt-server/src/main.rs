@@ -1,18 +1,13 @@
 //! The server binary.
 //!
-//! # Posture: trusted network only
+//! # Posture: encrypt and authenticate for anything but a trusted network
 //!
-//! This server has no authentication, no authorization and no transport
-//! encryption — every connection that can reach the listening port can read,
-//! write and drop collections. That is not an oversight to be found later; it
-//! is the honest state of a component whose auth story is a separate
-//! milestone, and shipping a rate-limited-but-unauthenticated listener while
-//! implying it is safe to expose would be worse than saying plainly what it
-//! is: **bind this to a trusted network only** — a loopback address, a private
-//! subnet behind its own perimeter, or a socket reachable only from processes
-//! that already trust each other. Do not put this behind a public interface
-//! without a proxy in front of it that adds the authentication this binary
-//! does not have.
+//! Token auth (`--auth-token`, roles via `--read-token`) stops strangers
+//! from *using* the server. TLS (`--tls-cert` / `--tls-key`) stops them from
+//! reading it in transit. Neither substitutes for the other — a token over
+//! plaintext is a password on an open wire; TLS without tokens lets anyone
+//! with a connection issue writes. Bind to a trusted network only when
+//! running with neither.
 
 use adabt_core::policy::{Mode, Policy};
 use adabt_engine::sharded::ShardedDatabase;
@@ -33,16 +28,17 @@ usage: adabt-server --data <dir> [--listen <addr>] [--level <0-11>] [--adaptive]
   --max-connections <n>       refuse a connection beyond this many open, default 1024
   --idle-timeout-secs <n>     close a connection idle this long, default 300; 0 disables it
   --slow-query-log-ms <n>     log (to stderr) any query taking at least this long; unset by default
+  --tls-cert <pem>            certificate chain (PEM); requires --tls-key; unset means plaintext
+  --tls-key <pem>             private key (PEM) for --tls-cert
 
 One thread per connection and no lock around the engine: requests contend only
 when they want the same partition. This is shared-nothing partitioning, not
 thread-per-core — there is no core pinning, no io_uring and no zero-copy path.
 `--shards 1` is the unpartitioned behaviour exactly.
 
-POSTURE: token auth available (--auth-token / ADABT_TOKEN) with roles
-(--read-token issues a read-only credential); still no encryption. A token
-stops strangers from reading; it does not stop them reading it in transit,
-so bind to a trusted network regardless.
+POSTURE: token auth (--auth-token / ADABT_TOKEN, roles via --read-token) and
+TLS (--tls-cert / --tls-key) are independent layers — use both outside a
+trusted network.
 
 SIGINT/SIGTERM (Unix): stop accepting new connections, let connections already
 open finish, checkpoint, exit.
@@ -59,6 +55,8 @@ fn main() {
     let mut slow_query_log_ms: Option<u64> = None;
     let mut auth_token: Option<String> = None;
     let mut read_token: Option<String> = None;
+    let mut tls_cert: Option<PathBuf> = None;
+    let mut tls_key: Option<PathBuf> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -106,6 +104,8 @@ fn main() {
                     std::process::exit(2);
                 }
             },
+            "--tls-cert" => tls_cert = args.next().map(PathBuf::from),
+            "--tls-key" => tls_key = args.next().map(PathBuf::from),
             "-h" | "--help" => {
                 print!("{USAGE}");
                 return;
@@ -179,9 +179,22 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // TLS flags fail at startup, loudly: half-encrypted is worse than down.
+    let server = match server.with_tls_flags(tls_cert.as_deref(), tls_key.as_deref()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("could not configure TLS: {e}");
+            std::process::exit(1);
+        }
+    };
+    let encryption = if tls_cert.is_some() {
+        "TLS"
+    } else {
+        "no encryption"
+    };
     match server.local_addr() {
         Ok(addr) => eprintln!(
-            "aDaBt listening on {addr} ({}, {shards} shard(s)) — {}, no encryption",
+            "aDaBt listening on {addr} ({}, {shards} shard(s)) — {}, {encryption}",
             if adaptive {
                 "adaptive".to_string()
             } else {

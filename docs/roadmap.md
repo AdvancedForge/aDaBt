@@ -168,8 +168,12 @@ scans; the precedence half of that is fixed and re-published.
    connection is refused `Unauthorized` until Auth succeeds — including
    Ping, so no unauthenticated oracle — with per-connection state,
    constant-time comparison, and denial that neither closes the connection
-   nor echoes the secret. Still missing: TLS (the token is only as private
-   as its transport), roles and per-collection permissions.
+   nor echoes the secret. Still missing: per-collection permissions.
+   **Landed since:** TLS — `--tls-cert`/`--tls-key` wrap every accepted
+   connection in rustls before any protocol byte is read (tested end to end
+   over real handshakes: queries survive intact, plaintext clients get a
+   TLS alert rather than a half-spoken protocol, half-configured TLS is a
+   startup error).
 5. **Ecosystem (M39).** ~~No examples directory~~ — landed (`quickstart`,
    `watch_it_optimize`). Still missing: a C ABI, bindings, semver and a
    format-compatibility promise — and the record encoding has changed twice
@@ -374,8 +378,11 @@ suite asserts on elapsed time.
 server — gate before dispatch, per-connection state, constant-time compare,
 refusals that neither close the connection nor echo the secret.
 
-Remaining: TLS (the token is only as private as its transport) and
-per-collection permission grants. **Landed since:** roles — an admin token
+Remaining: per-collection permission grants. **Landed since:** TLS —
+rustls on the accepted connection, before any protocol byte, generic over
+the stream type so plaintext and encrypted paths share one framing
+implementation (`tests/tls.rs` pins handshake-first, round-trip, and
+refusal shapes). Roles landed earlier — an admin token
 plus an optional read-only credential (`--read-token`), enforced after
 authentication with a new `Forbidden` status that tells a known caller the
 truth (re-authenticating cannot help); socket-tested in `roles.rs`. The **C

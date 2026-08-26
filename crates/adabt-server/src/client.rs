@@ -15,22 +15,35 @@ use adabt_core::record::Record;
 use adabt_core::value::Value;
 use adabt_ir::CmpOp;
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
 
 use crate::protocol::{Frame, RequestKind, StatusCode, HEADER_LEN};
 use crate::server::error_from;
 use crate::wire::{decode_rows, QuerySpec, Reader, Writer};
 
-pub struct Client {
-    stream: TcpStream,
+/// A protocol client over any byte stream.
+///
+/// The default is a plain TCP connection; [`Client::over_stream`] accepts
+/// anything that reads and writes bytes — which is how a TLS session plugs
+/// in without this type knowing certificates exist. Framing and
+/// request/response correlation are written once and cannot drift between
+/// the encrypted and plaintext paths, mirroring the server side.
+pub struct Client<S: Read + Write = std::net::TcpStream> {
+    stream: S,
     next_id: u64,
 }
 
-impl Client {
-    pub fn connect(addr: impl ToSocketAddrs) -> std::io::Result<Self> {
-        let stream = TcpStream::connect(addr)?;
+impl Client<std::net::TcpStream> {
+    pub fn connect(addr: impl std::net::ToSocketAddrs) -> std::io::Result<Self> {
+        let stream = std::net::TcpStream::connect(addr)?;
         stream.set_nodelay(true).ok();
         Ok(Self { stream, next_id: 1 })
+    }
+}
+
+impl<S: Read + Write> Client<S> {
+    /// Adopt an already-connected stream — TLS, unix socket, anything.
+    pub fn over_stream(stream: S) -> Self {
+        Self { stream, next_id: 1 }
     }
 
     fn call(&mut self, kind: RequestKind, body: Vec<u8>) -> Result<Vec<u8>> {
