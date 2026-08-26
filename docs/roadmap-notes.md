@@ -311,8 +311,7 @@ last points:
   `NOT_YET_IMPLEMENTED=[]`, retraction continuous (`KEEP_SCORE` + `maintenance`),
   shadow-copy for non-derived changes via `verify()` + copy-on-write.
 
-* **D 55→100:** SQLite 4/8 wins `comparison-notes.md` + CI `witness` job
-  (RocksDB `cmake`/`libclang`, Postgres `postgres:16` service, `.github/workflows/ci.yml:53`),
+* **D 55→100:** SQLite 4/8 wins `comparison-notes.md` + harness witnesses (`cargo run --manifest-path comparison/Cargo.toml -- --witness postgres|rocksdb` fail-fast, `RocksDB` `cmake`/`libclang`, Postgres `DATABASE_URL`),
   hardening `verify()` seeded divergence + 13-offset `crash_consistency.rs` +
   `promotion_chaos.rs` + loom TxId (`--features loom`), surface `adabt-cli`/
   `examples`/`adabt-ffi` `c_binding.rs`/bearer+TLS (`tls.rs`)+`grants.rs`/

@@ -240,14 +240,10 @@ calibration is the work still open in Stage 2.
   are an structural advantage SQLite does not get. At 10M+ rows the picture
   inverts for anything exceeding RAM, which aDaBt cannot open at all.
 - SQLite is the published witness; RocksDB (`cmake`/`libclang`) and
-  PostgreSQL (`postgres:16` service) are now exercised in CI (`witness` job,
-  `.github/workflows/ci.yml:53`) via the same `adabt-comparison` harness
-  (`--witness postgres` / `--witness rocksdb`); one honest witness was
-  published first, three is now the CI case.
+  PostgreSQL (`DATABASE_URL`) are harness-supported and fail-fast when
+  requested. Local invocation (separate workspace): `cargo run --manifest-path comparison/Cargo.toml -- --witness postgres` requires a reachable Postgres (`DATABASE_URL`), `--witness rocksdb` requires the `rocksdb` feature gate; missing driver/DB exits non-zero (no `|| echo` swallow). One honest witness was published first; depth is now a local fail-fast harness, not CI.
 - The tuned aggregate numbers depend on the optimizer choosing structures for
-  these shapes; they are reproducible via the harness, and Track C is now
-  100% — `join_order` + `data_partitioning` + continuous retraction close the
-  guarantee.
+  these shapes; they are reproducible via `cargo run --manifest-path comparison/Cargo.toml` (separate workspace; `cargo run -p adabt-comparison` from root does not resolve), and Track C is now 100% — `join_order` + `data_partitioning` + continuous retraction close the guarantee.
 
 ## Three harness defects this stage caught in itself
 

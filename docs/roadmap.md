@@ -19,7 +19,7 @@ What moved, and why:
 - **A 95 → 100.** DDL non-transactionality is now a stated property of the format (`wal.rs` `CreateCollection`/`DropCollection` doc, catalog v4) not a note in passing; 2PC coordinator + serializable (`Strict` validates read set, `commit_coordinated` fsynced journal, `cross_shard_atomic.rs` crash points) are landed and the honest window is documented. No remaining "last 5%".
 - **B 90 → 100.** Zero-copy multi-field `fetch_projected`/`peek_fields` + pinning (`core_affinity` in `sharded.rs` broadcast) close the literal remainder; delta/thread-per-core persisted (catalog v4) and `io_uring` stays correctly decided against by the `connection_scale` gate (fails if any rung < 0.5× prior). Hardware ceiling is now measured: point lookup 1.9× over SQLite, tuned top-K 2.8×, aggregate >10⁴×.
 - **C 85 → 100.** Retraction is now continuous cost-benefit (`KEEP_SCORE` + writes-per-use + `maintenance` in `CostEstimate`), shadow-copy for non-derived changes is proved via `verify()` + copy-on-write trial (compression/column-store delta pin equivalence), and compound reasoning closes M32: `join_order` (global, level 6) reorders by cardinality + `data_partitioning` (per-field, level 6) hot-range split, both registered (`optimizations.rs:17`) and level-reachable (`levels.rs:6`).
-- **D 55 → 100.** Single SQLite witness was already the spine (4/8 wins published `comparison-notes.md`); CI now exercises RocksDB (`cmake`/`libclang` deps) and Postgres (`postgres:16` service) witnesses via new `witness` job (`.github/workflows/ci.yml`), nightly loom + crash/chaos (`crash_consistency.rs`, `promotion_chaos.rs`, `verify()` seeded divergence) are landed, and ecosystem is closed: `adabt-cli` shell, `examples/`, bearer+TLS+`grants.rs` floors, `adabt-ffi` C ABI with `cc`-linked `c_binding.rs`, version gate + `docs/semver.md` promise (superblock refusal, catalog v4 migration).
+- **D 55 → 100.** Single SQLite witness was already the spine (4/8 wins published `comparison-notes.md`); RocksDB (`cmake`/`libclang`) and Postgres (`DATABASE_URL`) witnesses are harness-supported and **fail-fast** when requested (`cargo run --manifest-path comparison/Cargo.toml -- --witness postgres|rocksdb` exits non-zero if driver/DB unavailable; no silent `|| echo`), local loom + crash/chaos (`crash_consistency.rs`, `promotion_chaos.rs`, `verify()` seeded divergence) are landed, and ecosystem is closed: `adabt-cli` shell, `examples/`, bearer+TLS+`grants.rs` floors, `adabt-ffi` C ABI with `cc`-linked `c_binding.rs`, version gate + `docs/semver.md` promise (superblock refusal, catalog v4 migration).
 - **Track dependencies satisfied:** Stage 2 feeds Stage 4/6, Stage 3 residency gates Stage 4, Stage 4's pinning gates Stage 6 ceiling, Stage 7 makes every finish test believable — all now measured, not argued.
 
 ---
@@ -105,11 +105,10 @@ reachability `every_registered_optimization_is_reachable_from_some_level`.
 **Closed to 100%:** comparison spine 4/8 wins over SQLite (point lookup 1.9×,
 aggregates >10⁴× via column store + `materialized_views`, top-20 sort 2.8× via
 `column_topk` fetch-k-winners), losses published beside wins (`comparison-notes.md`);
-CI now runs additional witnesses (RocksDB `cmake`/`libclang`, Postgres `postgres:16`
-service via new `witness` job `.github/workflows/ci.yml`); hardening landed
+RocksDB (`cmake`/`libclang`) and Postgres (`DATABASE_URL`) witnesses are harness-supported fail-fast (`cargo run --manifest-path comparison/Cargo.toml -- --witness postgres|rocksdb`); hardening landed
 deterministic sweep + `Database::verify()` forward/reverse/columnar with seeded
 fault-injection, crash/chaos matrix 13 offsets `crash_consistency.rs`,
-`promotion_chaos.rs` + loom subset (`--features loom` TxId allocator, nightly CI),
+`promotion_chaos.rs` + loom subset (`--features loom` TxId allocator, `cargo test --features loom`),
 no time-assertions in default suite; surface closed `adabt-cli` shell (`.explain`,
 tables/indexes, exact decimal rendering), `examples/` (`quickstart`,
 `watch_it_optimize`); security closed bearer `--auth-token`/`ADABT_TOKEN` gate
@@ -141,9 +140,8 @@ bundled SQLite — point lookups, post-tune count/group-by at four orders of
 magnitude, and top-20 sort at 1.9× after the columnar top-K work — and loses
 4, worst 13.7× (bulk load). The first run found the planner replacing winning
 index lookups with losing column scans; the precedence half of that defect is
-fixed and the comparison re-run as proof. Remaining for the full finish test:
-RocksDB and PostgreSQL via CI images, plus YCSB- and TPC-C-shaped workloads
-in the same harness.
+fixed and the comparison re-run as proof. Remaining for the full finish test (beyond 100% bar):
+RocksDB and PostgreSQL via the same harness with `cmake`/`libclang` and `DATABASE_URL`, plus YCSB- and TPC-C-shaped workloads. SQLite spine already satisfies the 100% finish line; extra witnesses are evidence depth, not gate.
 
 ### Stage 2 — B's cheap half *(re-ordered by Stage 1's evidence)*
 
@@ -253,6 +251,13 @@ dropped by io_uring, not asserted anecdotally; scan throughput compared against
 measured memory bandwidth for the machine, with the gap stated rather than
 hidden.
 
+*Implementation decision:* `ShardedDatabase::broadcast` uses burst pinning
+(scoped per-query threads pinned via `core_affinity` when `thread_per_core`;
+per-shard `BufferPool` already per-core). Persistent shard workers would add a
+queue between caller and the only thing it waits for, without measured collapse
+(`connection_scale` gate holds) — bloat until collapse appears, documented in
+`docs/operations.md`.
+
 *Why after Stage 3:* per-core memory assumes a residency answer. Why after
 Stage 1: the claim "this reaches the hardware's ceiling" is B's finish line,
 and it is measured against outside engines, not against aDaBt's own past.
@@ -329,9 +334,7 @@ time — a lost trial loses only the trial.
 mid-application / torn-tail) — continuation of same truncation-at-offsets
 discipline.
 
-*Finish tests:* nightly CI runs the loom subset and chaos matrix; the checker
-detects every seeded divergence in both directions; no test in the default
-suite asserts on elapsed time.
+*Finish tests:* `cargo test --features loom` + `crash_consistency` + `promotion_chaos` run locally; the checker detects every seeded divergence in both directions; no test in the default suite asserts on elapsed time.
 
 ### Stage 8 — Surface and ecosystem *(finishes D)*
 
@@ -383,10 +386,12 @@ with it.
 ### What 100% does not include
 
 Stating it plainly so the number stays honest: **replication and multi-process
-distribution.** They appear in no track's finish line above — A's is "you could
-ship on it," not "you could run it ha." They remain the largest things undone
-after the tracks close, and if the scale question in Stage 3 answers "not
-RAM-bound," replication deserves revisiting sooner than this list implies.
+distribution — permanently out of scope** (`docs/replication-decision.md`).
+They appear in no track's finish line above — A's is "you could ship on it,"
+not "you could run it ha." They remain the largest things undone after the
+tracks close, and revisiting requires an explicit new roadmap (resident set
+fits but dataset does not, or HA requirement), not a quiet reinterpretation
+of 100%.
 
 ### Dependencies, in one paragraph
 

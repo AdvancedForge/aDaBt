@@ -123,8 +123,9 @@ can isolate one from another that would mask it. The harness warns when its data
 directory is memory-backed: `fsync` on tmpfs never reaches a disk, and an early
 version of these numbers was wrong because of it.
 
-`comparison/` (a separate crate, excluded from the workspace) runs aDaBt against
-SQLite on workloads chosen to include the ones aDaBt should lose. The numbers
+`comparison/` (a **separate workspace**, excluded from the root) runs aDaBt against
+SQLite on workloads chosen to include the ones aDaBt should lose. Invoke as
+`cargo run --manifest-path comparison/Cargo.toml --release` (not `cargo run -p adabt-comparison` from root, which does not resolve). The numbers
 are published in `docs/comparison-notes.md`: at its best configuration aDaBt
 wins **4 of 8** — point lookups, post-tuning count/group-by at four orders of
 magnitude through its column store and materialized views, and top-20 sort at
@@ -132,7 +133,7 @@ magnitude through its column store and materialized views, and top-20 sort at
 sorting the collection. The indexed shapes answer through self-proposed
 covering indexes (`auto_covering_index`: hash-backed for equality evidence,
 b-tree-backed for ranges) and sit at 1.5–2.4×; what remains is projection
-fetch cost, not structure choice. It loses bulk load and single-row inserts —
+fetch cost, not structure choice. `comparison` also supports `--witness postgres` (`DATABASE_URL` required) and `--witness rocksdb` (feature-gated); either exits non-zero when driver/DB unavailable — no silent fallback. It loses bulk load and single-row inserts —
 the price of per-record MVCC and WAL, which it will not trade away.
 
 ## Watching it work

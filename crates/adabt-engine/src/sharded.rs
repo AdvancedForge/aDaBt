@@ -1,10 +1,19 @@
-//! Shared-nothing execution across partitions.
+//! Shared-nothing execution across partitions — **coordinator-decides durability
+//! (windowed visibility)**, not unwrapped "atomicity".
 //!
 //! A [`ShardedDatabase`] is *N* complete databases. Each shard has its own
 //! directory, its own heap file, its own write-ahead log, its own buffer pool,
 //! its own indexes and caches, its own optimizer and its own lock. Nothing is
 //! shared between them, which is the entire point: two requests for records in
 //! different shards contend for nothing and proceed genuinely in parallel.
+//!
+//! The cross-shard guarantee is intentionally renamed from "atomicity" to
+//! "coordinator-decides durability": once the `XSH1` journal is fsynced,
+//! **recovery will land on the committed state** (put-overwrite idempotent
+//! replay, torn-tail safe, `open` re-drives before any query). Between
+//! journal fsync and last shard `apply`, concurrent readers can observe
+//! shards disagreeing — windowed visibility, documented at `commit_coordinated`,
+//! hiding it would require distributed locking and is out of scope.
 //!
 //! Records are assigned by identity — `RecordId % shards` — so every operation
 //! addressing one record touches exactly one shard, and the routing decision

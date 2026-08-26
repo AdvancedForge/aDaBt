@@ -99,6 +99,45 @@ struct Row {
 }
 
 fn main() {
+    // Fail-fast witness harness: `--witness postgres|rocksdb` must not silently
+    // become a SQLite-only run. If the requested witness cannot be reached or
+    // the binary was not built with that feature, exit non-zero.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--witness") {
+        let witness = args.get(pos + 1).map(|s| s.as_str()).unwrap_or("");
+        match witness {
+            "postgres" => {
+                let url = std::env::var("DATABASE_URL").unwrap_or_default();
+                if url.is_empty() {
+                    eprintln!("--witness postgres requires DATABASE_URL");
+                    std::process::exit(2);
+                }
+                // Try a TCP connect to the Postgres host to fail fast before
+                // running the 8-workload harness against the wrong witness.
+                if let Some(host) = url.split('@').last().and_then(|s| s.split('/').next()).and_then(|s| s.split(':').next()) {
+                    let addr = format!("{}:5432", host);
+                    if std::net::TcpStream::connect(&addr).is_err() {
+                        eprintln!("--witness postgres: cannot connect to {addr} (DATABASE_URL={url})");
+                        std::process::exit(2);
+                    }
+                }
+                eprintln!("[comparison] postgres witness requested — harness would run same 8 workloads against Postgres here; Postgres driver not vendored in this crate, failing fast to avoid pretending SQLite numbers are Postgres numbers");
+                std::process::exit(2);
+            }
+            "rocksdb" => {
+                // `adabt-comparison` has no `rocksdb` feature gate in this workspace
+                // (separate workspace, no RocksDB dep). Requesting it without a
+                // rocksdb-enabled build must fail, not fall back to SQLite.
+                eprintln!("--witness rocksdb requested but this build has no rocksdb feature (add `rocksdb` dep + `cmake`/`libclang` and rebuild)");
+                std::process::exit(2);
+            }
+            other => {
+                eprintln!("unknown --witness {other:?} (expected postgres|rocksdb)");
+                std::process::exit(2);
+            }
+        }
+    }
+
     let rows: u64 = std::env::args()
         .skip_while(|a| a != "--size")
         .nth(1)

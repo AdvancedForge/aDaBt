@@ -211,3 +211,55 @@ fn a_transactions_own_writes_need_no_read_validation() {
     );
     db.commit(txn).unwrap();
 }
+
+#[test]
+fn predicate_phantom_is_not_prevented_even_under_strict() {
+    // Strict currently validates point reads (the ids a scan observed) with
+    // first-committer-wins, which closes write-skew but not predicate phantoms:
+    // a scan that saw "no row matching age=30" does not record that predicate,
+    // so a concurrent insert of a new id with age=30 is not in the first
+    // transaction's read set and both commit. This test documents the current
+    // guarantee rather than claiming more. True phantom prevention would require
+    // predicate/ranged read tracking, which is future work and deliberately not
+    // smuggled in via collection-level aborts (too many false positives).
+    for consistency in [Consistency::Snapshot, Consistency::Strict] {
+        let t = Tmp::new(&format!("phantom-{consistency:?}"));
+        let mut db = on_call_db(t.path(), consistency);
+        // T1 scans for age=30 — sees nothing (read set is the ids it observed, none match).
+        let mut t1 = db.begin();
+        let scan = t1.scan(&mut db, "doctors").unwrap();
+        let phantom_exists = scan
+            .iter()
+            .any(|(_, r)| r.get("age") == Some(&adabt_core::value::Value::I64(30)));
+        assert!(!phantom_exists);
+
+        // T2 inserts a new doctor with age=30.
+        let mut t2 = db.begin();
+        t2.insert(
+            &mut db,
+            "doctors",
+            RecordId(99),
+            Record::new()
+                .with("who", "eve")
+                .with("on_call", true)
+                .with("age", 30i64),
+        )
+        .unwrap();
+        db.commit(t2).unwrap();
+
+        // T1 now writes based on its phantom-free view and commits — currently
+        // allowed under both levels, documenting the limit of Strict today.
+        t1.insert(
+            &mut db,
+            "doctors",
+            RecordId(100),
+            Record::new().with("who", "mallory").with("age", 31i64),
+        )
+        .unwrap();
+        db.commit(t1).unwrap();
+
+        // Both phantoms landed; a true predicate-locking Strict would have
+        // refused one of them. The count proves the phantom slipped through.
+        assert_eq!(db.count("doctors").unwrap(), 4);
+    }
+}
