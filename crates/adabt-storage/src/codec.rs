@@ -262,6 +262,51 @@ impl<'a> ValueRef<'a> {
     }
 }
 
+/// Compare a borrowed value against an owned one without upgrading either
+/// side: text and bytes are compared in place, so a probe against N stored
+/// keys costs N comparisons and zero allocations. The mirror impl lets the
+/// arguments come in either order.
+impl PartialEq<Value> for ValueRef<'_> {
+    fn eq(&self, other: &Value) -> bool {
+        match (self, other) {
+            (Self::Null, Value::Null) => true,
+            (Self::Bool(a), Value::Bool(b)) => a == b,
+            (Self::I64(a), Value::I64(b)) => a == b,
+            (Self::U64(a), Value::U64(b)) => a == b,
+            (Self::F64(a), Value::F64(b)) => a == b,
+            (
+                Self::Decimal {
+                    units: ua,
+                    scale: sa,
+                },
+                Value::Decimal {
+                    units: ub,
+                    scale: sb,
+                },
+            ) => ua == ub && sa == sb,
+            (Self::Timestamp(a), Value::Timestamp(b)) => a == b,
+            (Self::Str(a), Value::Str(b)) => a == b,
+            (Self::Bytes(a), Value::Bytes(b)) => a == b,
+            (Self::List(a), Value::List(b)) => {
+                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x == y)
+            }
+            (Self::Map(a), Value::Map(b)) => {
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b.iter())
+                        .all(|((ka, va), (kb, vb))| ka == kb && va == vb)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl PartialEq<ValueRef<'_>> for Value {
+    fn eq(&self, other: &ValueRef<'_>) -> bool {
+        other == self
+    }
+}
+
 fn read_tlv_ref<'a>(c: &mut Cursor<'a>, depth: u32) -> Result<ValueRef<'a>> {
     if depth > MAX_DEPTH {
         return Err(Error::Corruption(format!(
@@ -1201,6 +1246,19 @@ mod tests {
             }
             other => panic!("expected a borrowed str, got {other:?}"),
         }
+    }
+
+    /// Equality without upgrade: a borrowed value answers a probe against an
+    /// owned one — in both argument orders — with no ownership taken.
+    #[test]
+    fn borrowed_values_answer_owned_probes_without_upgrading() {
+        let payload = b"\x06\x05hello";
+        let (r, _) = decode_value_ref(payload).unwrap();
+        assert_eq!(r, Value::Str("hello".into()));
+        assert_eq!(Value::Str("hello".into()), r);
+        assert_ne!(r, Value::Str("goodbye".into()));
+        // Cross-variant never equals, same as the owned world.
+        assert_ne!(r, Value::Bytes(b"hello".to_vec()));
     }
 
     #[test]
