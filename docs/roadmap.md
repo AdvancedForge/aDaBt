@@ -86,7 +86,7 @@ both dynamic and declared schemas).
 | gap | why it matters |
 |---|---|
 | **Thread-per-core (M28)** | Everything is one `Mutex` deep. On any modern core count this is the dominant ceiling, and the largest single item on the track. |
-| **Zero-copy fetch, the literal remainder** | Owned records still materialize on the fetch loop. Two allocations per row is the floor *of the owned form*; the borrowed view over decoded pages is the design M27 named. Its foundation landed: `RecordCodec::peek_field` decodes one field straight out of an encoded buffer — no record map, no name interning, skip cost of one field instead of one record (tested against full decode across Fixed/Strict/Dynamic). What remains is the executor integration: a `Source` fetch that projects through this seam and a batch type that can hold borrowed rows. |
+| **Zero-copy fetch, the literal remainder** | The executor integration **landed**: `Source::peek_field` (tri-state — row gone / field absent / value) with a defaulted fetch-and-project fallback, and a fused filter that decides single-field predicates over a heap scan from peeked fields, fetching full rows only for survivors. Decode cost now tracks selectivity, not table size. What remains is the literal borrowed view: a batch type holding borrowed rows over decoded pages, so even the surviving fetch stops materializing owned records. |
 | **Clustered sort order** | The mechanism landed (see Stage 2 item 4); what remains is persisting the declaration across restarts and letting the optimizer propose it. |
 | **Cost-model honesty** | Every estimate assumes indexed point lookups are flat in collection size; measured, they grow (6.3 µs at 100k rows, 12.4 µs at 800k). The bitmap-over-hash preference is a reasoned ordering that measurement contradicted at 1M rows and left in place. Both must be decided by benchmark. |
 | **Prefix/delta compression** | Dictionary encoding landed; these two did not. |
@@ -218,13 +218,18 @@ In order:
    first-wins order, asserted by test.
    *Finish tests:* predicted-vs-actual within noise at 100k and 1M rows in
    the level matrix; bitmap-versus-hash settled by benchmark, not argument.
-2. **Borrowed-view fetch path** — **started, measured slice landed.** The
-   columnar projection was paying two allocations per *cell* for field
+2. **Borrowed-view fetch path** — **started, two measured slices landed.**
+   The columnar projection was paying two allocations per *cell* for field
    names (`to_string` plus the `Arc` conversion) on top of the record's own
    vector; `ColumnStore::arcs` interns each name once per store and hands
    out refcount bumps. A columnar scan now sits at its floor — **1
    allocation per row**, asserted beside the heap budgets in
-   `allocations.rs`. What remains of this item is the literal borrowed view:
+   `allocations.rs`. And the executor now has the peek seam: single-field
+   predicates over a heap scan are decided from `Source::peek_field` (an
+   address calculation on fixed-schema collections) with only survivors
+   fetched in full — decode cost tracks selectivity, not table size
+   (`borrowed_filter.rs`, plus decode-counting tests in the executor).
+   What remains of this item is the literal borrowed view:
    read paths seeing references into decoded pages instead of owned
    records, which needs the executor's row API to grow lifetimes.
    *Finish test:* a scan of N rows allocates O(1) per row — now asserted

@@ -77,6 +77,14 @@ impl DirectArray {
         self.bytes.len() + self.present.len() * 8 + std::mem::size_of::<Self>()
     }
 
+    /// Does this row exist? One bit, no decode. The liveness half of
+    /// `field_at`, exposed so a caller can tell "row gone" from "field
+    /// absent" — a distinction `IsNull`-shaped predicates need.
+    #[inline]
+    pub fn contains(&self, id: RecordId) -> bool {
+        self.is_present(id.0)
+    }
+
     #[inline]
     fn is_present(&self, id: u64) -> bool {
         let (w, b) = ((id / 64) as usize, id % 64);

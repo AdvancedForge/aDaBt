@@ -3039,6 +3039,32 @@ impl ActionSink for Database {
 }
 
 impl Source for Database {
+    fn peek_field(
+        &mut self,
+        collection: &str,
+        id: RecordId,
+        field: &str,
+    ) -> Result<Option<Option<adabt_core::value::Value>>> {
+        self.note_touch(collection, id);
+        if !self
+            .masked()
+            .is_some_and(|h| h.hides_direct(self.revealed(), collection))
+        {
+            if let Some(d) = self.direct.get(collection) {
+                // Row liveness first, from one bit — otherwise a dead row and
+                // a live row missing the field would be indistinguishable.
+                if !d.contains(id) {
+                    return Ok(None);
+                }
+                return Ok(Some(d.field_at(id, field)?));
+            }
+        }
+        match self.store.get(collection, id)? {
+            None => Ok(None),
+            Some(r) => Ok(Some(r.get(field).cloned())),
+        }
+    }
+
     fn fetch(&mut self, collection: &str, id: RecordId) -> Result<Option<Record>> {
         self.note_touch(collection, id);
         // The Level 10 path: no page directory, no slot table, just an address

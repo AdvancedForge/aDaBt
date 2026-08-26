@@ -85,6 +85,25 @@ const CANCEL_CHECK_INTERVAL: usize = 4096;
 pub trait Source {
     fn fetch(&mut self, collection: &str, id: RecordId) -> Result<Option<Record>>;
     fn all_ids(&mut self, collection: &str) -> Result<Vec<RecordId>>;
+
+    /// Read one field of one row without decoding the rest of the record.
+    ///
+    /// The two `Option`s carry distinct facts and the distinction is
+    /// load-bearing: the outer `None` says *the row does not exist* (a dead
+    /// record, an id out of range), while `Some(None)` says *the row exists
+    /// but has no value for this field* — a distinction only visible to
+    /// `IsNull`-shaped predicates, which must treat absent and null alike.
+    /// A source that cannot peek returns the default, which is a fetch plus
+    /// a projection: correct everywhere, free of assumptions about storage.
+    fn peek_field(
+        &mut self,
+        collection: &str,
+        id: RecordId,
+        field: &str,
+    ) -> Result<Option<Option<Value>>> {
+        Ok(self.fetch(collection, id)?.map(|r| r.get(field).cloned()))
+    }
+
     /// Compute a grouped aggregate directly from columns, allocating once per
     /// group rather than once per row. `None` when no columnar representation
     /// exists.
@@ -248,6 +267,58 @@ pub fn execute_with_budget<S: Source>(
 ///
 /// The cost is a sort over the matched ids, which is small next to the fetches
 /// that follow it and is bounded by the match count rather than the collection.
+/// The borrowed-view filter: decide every row from one peeked field, then
+/// fetch only the survivors in full.
+///
+/// Equivalence with the generic path rests on three facts, each pinned by a
+/// test elsewhere: `referenced_fields` enumerates everything the program can
+/// read, so the one-field record it evaluates against cannot be missing
+/// information; a peeked field equals the same field of the fully decoded
+/// record, including the absent-versus-null distinction (`Some(None)` builds
+/// an empty record exactly as a decode of a row without that field would);
+/// and a dead row yields outer `None` here just as `fetch` yields nothing for
+/// it there. Survivors are re-fetched through `fetch_batches`, so ordering,
+/// batching, deduplication, and cancellation are whatever the generic path's
+/// own are.
+fn filter_by_peek<S: Source>(
+    collection: &str,
+    field: &str,
+    program: &adabt_ir::vm::Program,
+    src: &mut S,
+    stats: &mut ExecStats,
+    budget: &ExecBudget,
+) -> Result<Vec<RecordBatch>> {
+    let ids = src.all_ids(collection)?;
+    let mut survivors = Vec::new();
+    for (i, id) in ids.iter().enumerate() {
+        if i % CANCEL_CHECK_INTERVAL == 0 {
+            budget.check_cancelled()?;
+        }
+        stats.rows_scanned += 1;
+        let keep = match src.peek_field(collection, *id, field)? {
+            // No row: not a candidate, same as the fetch path skipping it.
+            None => false,
+            Some(value) => {
+                let probe = match value {
+                    Some(v) => Record::new().with(field, v),
+                    None => Record::new(),
+                };
+                program.matches(&probe)
+            }
+        };
+        if keep {
+            survivors.push(*id);
+        }
+    }
+    // Survivors were already counted when their field was peeked; re-fetching
+    // them in full completes those rows rather than scanning new ones, so
+    // their contribution is folded back out.
+    let counted = stats.rows_scanned;
+    let batches = fetch_batches(collection, survivors, src, stats, budget)?;
+    stats.rows_scanned = counted;
+    Ok(batches)
+}
+
 fn fetch_batches<S: Source>(
     collection: &str,
     mut ids: Vec<RecordId>,
@@ -568,6 +639,29 @@ fn run<S: Source>(
             // three-valued cases where a reimplementation would quietly
             // diverge.
             let program = adabt_ir::vm::Program::compile(predicate);
+
+            // A predicate that reads exactly one field, sitting directly over
+            // a heap scan, can decide most rows from that one field: peek it
+            // per id (an address calculation on a fixed-schema collection),
+            // evaluate against a one-field record the program cannot see
+            // past, and fetch in full only the rows that survive. Decode cost
+            // tracks selectivity instead of table size; the answers are the
+            // same rows because peeking is defined to agree with decoding.
+            let mut referenced = Vec::new();
+            predicate.referenced_fields(&mut referenced);
+            if referenced.len() == 1 {
+                if let PhysicalOp::HeapScan { collection } = input.as_ref() {
+                    return filter_by_peek(
+                        collection,
+                        &referenced.remove(0),
+                        &program,
+                        src,
+                        stats,
+                        budget,
+                    );
+                }
+            }
+
             let mut out = Vec::new();
             for mut b in run(input, src, stats, budget)? {
                 // Evaluated across the batch as a mask, which is the shape a
@@ -1295,6 +1389,26 @@ mod tests {
         (rows, stats)
     }
 
+    fn eval_peeking<S: PeekPlanCtx + Source>(
+        src: &mut S,
+        logical: &LogicalOp,
+    ) -> (Vec<(RecordId, Record)>, ExecStats) {
+        let p = plan(logical, &src.plan_ctx());
+        let mut stats = ExecStats::default();
+        let rows = execute(&p, src, &mut stats).unwrap();
+        (rows, stats)
+    }
+
+    /// The one thing `eval_peeking` needs beyond `Source`: a plan context.
+    trait PeekPlanCtx {
+        fn plan_ctx(&self) -> PlanContext<'_>;
+    }
+    impl PeekPlanCtx for PeekCountingSource {
+        fn plan_ctx(&self) -> PlanContext<'_> {
+            self.ctx()
+        }
+    }
+
     #[test]
     fn hash_join_never_matches_a_null_key() {
         // Reachable in production despite `normalize_for_storage` stripping
@@ -1371,6 +1485,117 @@ mod tests {
         assert!(rows
             .iter()
             .all(|(_, r)| r.get("bucket") == Some(&Value::I64(3))));
+    }
+
+    /// A source whose peek is genuinely separate from its fetch, so the test
+    /// can count full decodes. The storage answer is the same map either way;
+    /// what differs is which method the executor chooses to call.
+    struct PeekCountingSource {
+        records: BTreeMap<RecordId, Record>,
+        fetches: u64,
+    }
+
+    impl PeekCountingSource {
+        fn ctx(&self) -> PlanContext<'_> {
+            let mut m = std::collections::HashMap::new();
+            m.insert("c", Vec::new());
+            PlanContext {
+                indexes: m,
+                composite: std::collections::HashMap::new(),
+                covering: std::collections::HashMap::new(),
+                partial: std::collections::HashMap::new(),
+                columnar: Vec::new(),
+                columnar_fields: HashMap::new(),
+                cardinality: HashMap::new(),
+            }
+        }
+    }
+
+    impl Source for PeekCountingSource {
+        fn fetch(&mut self, _c: &str, id: RecordId) -> Result<Option<Record>> {
+            self.fetches += 1;
+            Ok(self.records.get(&id).cloned())
+        }
+        fn all_ids(&mut self, _c: &str) -> Result<Vec<RecordId>> {
+            Ok(self.records.keys().copied().collect())
+        }
+        fn peek_field(
+            &mut self,
+            _c: &str,
+            id: RecordId,
+            field: &str,
+        ) -> Result<Option<Option<Value>>> {
+            // Row liveness from a bit, field from a slice — the shape of the
+            // real fixed-schema path, minus the decode.
+            Ok(self
+                .records
+                .contains_key(&id)
+                .then(|| self.records.get(&id).and_then(|r| r.get(field).cloned())))
+        }
+        fn index_lookup(&mut self, _: &str, _: &str, _: &Value) -> Result<Option<Vec<RecordId>>> {
+            Ok(None)
+        }
+        fn index_range(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: Bound<&Value>,
+            _: Bound<&Value>,
+        ) -> Result<Option<Vec<RecordId>>> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn a_single_field_filter_over_a_scan_fetches_only_the_rows_it_keeps() {
+        let logical = LogicalOp::scan("c").filter(Expr::eq("bucket", 3i64));
+
+        let mut cheap = PeekCountingSource {
+            records: (0..100)
+                .map(|i| {
+                    (
+                        RecordId(i),
+                        Record::new()
+                            .with("id", i)
+                            .with("bucket", (i % 5) as i64)
+                            .with("score", (i as f64) * 1.5)
+                            .with("name", format!("n{i}")),
+                    )
+                })
+                .collect(),
+            fetches: 0,
+        };
+        let (got, stats) = eval_peeking(&mut cheap, &logical);
+
+        // Same rows as the generic path...
+        let mut plain = MemSource::new(100);
+        let (want, _) = eval(&mut plain, &logical);
+        assert_eq!(got, want, "the fused filter changed the answer");
+
+        // ...but twenty full decodes instead of a hundred: one per surviving
+        // row, none for the eighty the peek rejected.
+        assert_eq!(cheap.fetches, 20);
+        assert_eq!(stats.rows_scanned, 100, "every row was considered");
+    }
+
+    #[test]
+    fn a_single_field_filter_treats_absent_and_null_alike_and_skips_dead_rows() {
+        // id 0: null bucket; id 1: bucket absent entirely; id 2: bucket = 3;
+        // id 3 and id 5: dead rows; id 4: bucket = 3.
+        let mut records = BTreeMap::new();
+        records.insert(RecordId(0), Record::new().with("bucket", Value::Null));
+        records.insert(RecordId(1), Record::new().with("name", "no bucket"));
+        records.insert(RecordId(2), Record::new().with("bucket", 3i64));
+        records.insert(RecordId(4), Record::new().with("bucket", 3i64));
+        let logical = LogicalOp::scan("c").filter(Expr::IsNull(Box::new(Expr::field("bucket"))));
+        let mut src = PeekCountingSource {
+            records,
+            fetches: 0,
+        };
+        let (rows, _) = eval_peeking(&mut src, &logical);
+        // Absent matches IS NULL exactly as null does; dead rows match nothing.
+        let ids: Vec<u64> = rows.iter().map(|(id, _)| id.0).collect();
+        assert_eq!(ids, vec![0, 1]);
     }
 
     #[test]
