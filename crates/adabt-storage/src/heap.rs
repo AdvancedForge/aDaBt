@@ -284,6 +284,9 @@ pub struct HeapStore {
     dir: PathBuf,
     /// Whether new writes are compressed. Reads handle either encoding.
     compress: bool,
+    /// Optimizer-controlled global flags persisted via the catalog.
+    delta_encoding: bool,
+    thread_per_core: bool,
     /// Hands out write ids and tracks which snapshots are still open.
     versions: Arc<VersionTracker>,
     /// Superseded versions currently retained, so reclamation can be triggered
@@ -327,6 +330,18 @@ impl HeapStore {
     pub fn live_count(&self, collection: &str) -> Option<u64> {
         let c = self.collections.get(collection)?;
         Some(c.directory.values().filter(|v| !v.is_absent()).count() as u64)
+    }
+    pub fn delta_encoding(&self) -> bool {
+        self.delta_encoding
+    }
+    pub fn thread_per_core(&self) -> bool {
+        self.thread_per_core
+    }
+    pub fn set_delta_encoding(&mut self, v: bool) {
+        self.delta_encoding = v;
+    }
+    pub fn set_thread_per_core(&mut self, v: bool) {
+        self.thread_per_core = v;
     }
 
     pub fn heap_path(dir: &Path) -> PathBuf {
@@ -411,6 +426,8 @@ impl HeapStore {
             fsm: FreeSpaceMap::new(),
             dir: dir.to_path_buf(),
             compress: false,
+            delta_encoding: true,
+            thread_per_core: false,
             versions,
             retained: 0,
             index_defs: Vec::new(),
@@ -636,6 +653,8 @@ impl HeapStore {
             }
         }
         self.next_collection_id = cat.next_collection_id;
+        self.delta_encoding = cat.delta_encoding;
+        self.thread_per_core = cat.thread_per_core;
         self.index_defs = cat
             .indexes
             .iter()
@@ -670,6 +689,8 @@ impl HeapStore {
             next_collection_id: self.next_collection_id,
             through_lsn,
             log_start_lsn: self.wal.start_lsn().0,
+            delta_encoding: self.delta_encoding,
+            thread_per_core: self.thread_per_core,
         }
     }
 
@@ -2019,6 +2040,41 @@ impl LogicalStore for HeapStore {
         let bytes = crate::compress::decompress(encoding, &payload[SLOT_PREFIX..])?;
         self.touched.insert(loc.page.0);
         Ok(Some(codec.peek_field(&bytes, field)?))
+    }
+
+    fn get_projected(
+        &mut self,
+        collection: &str,
+        id: RecordId,
+        fields: &[&str],
+    ) -> Result<Option<Record>> {
+        let Some(loc) = self
+            .coll(collection)?
+            .directory
+            .get(&id)
+            .and_then(|v| v.newest())
+        else {
+            return Ok(None);
+        };
+        let codec = &self
+            .collections
+            .get(collection)
+            .ok_or_else(|| Error::NoSuchCollection(collection.to_string()))?
+            .codec;
+        let page = self.pool.get(loc.page)?;
+        let payload = page.get(loc.slot)?;
+        if payload.len() < SLOT_PREFIX {
+            return Err(Error::Corruption(
+                "stored slot is shorter than its prefix".into(),
+            ));
+        }
+        let encoding = crate::compress::Encoding::from_bit(payload[SLOT_PREFIX - 1])?;
+        let bytes = crate::compress::decompress(encoding, &payload[SLOT_PREFIX..])?;
+        self.touched.insert(loc.page.0);
+        if fields.is_empty() {
+            return Ok(Some(Record::new()));
+        }
+        Ok(Some(codec.peek_fields(&bytes, fields)?))
     }
 
     fn update(&mut self, collection: &str, id: RecordId, mut rec: Record) -> Result<bool> {

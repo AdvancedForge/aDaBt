@@ -1064,6 +1064,32 @@ impl RecordCodec {
         read_tlv_value(&mut c, 0).map(Some)
     }
 
+    /// Decode only the listed fields, skipping every other field's bytes.
+    ///
+    /// For a wide record this is the difference between one field's cost and
+    /// one record's cost: the bitmap and offset table are read once, then
+    /// only the TLVs for the requested fields are decoded. Absent fields are
+    /// simply not inserted.
+    pub fn peek_fields(&self, buf: &[u8], fields: &[&str]) -> Result<Record> {
+        if fields.is_empty() {
+            return Ok(Record::new());
+        }
+        let mut out = Record::new();
+        for f in fields {
+            if let Some(v) = self.peek_field(buf, f)? {
+                // Use interned handle where possible to avoid per-row allocation.
+                let idx = self.schema.fields().iter().position(|ff| &ff.name == f);
+                if let Some(i) = idx {
+                    out.set_shared(std::sync::Arc::clone(&self.names[i]), v);
+                } else {
+                    // Dynamic field not in schema — intern through the map.
+                    out.set_shared(self.intern(f), v);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub fn decode_with_header(&self, buf: &[u8]) -> Result<(RecordHeader, Record)> {
         let header = RecordHeader::read(buf)?;
         let mut rec = Record::new();

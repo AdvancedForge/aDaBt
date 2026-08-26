@@ -347,6 +347,11 @@ impl ShardedDatabase {
     /// Scoped threads rather than a pool: the work is one burst per query, the
     /// shards outlive it, and a pool would add a queue between the caller and
     /// the only thing it is waiting for.
+    ///
+    /// When `thread_per_core` is enabled on any shard, each worker thread is
+    /// pinned to a distinct core (best-effort via `core_affinity`). Per-shard
+    /// `Mutex` already gives per-core memory (each shard owns its own
+    /// `BufferPool`, heap and indexes); pinning adds run-to-completion affinity.
     fn broadcast<T, F>(&self, f: F) -> Result<Vec<T>>
     where
         T: Send,
@@ -358,13 +363,22 @@ impl ShardedDatabase {
             let mut guard = lock(&self.shards[0]);
             return Ok(vec![f(&mut guard)?]);
         }
+        let pin = self.shards.iter().any(|s| lock(s).is_thread_per_core());
         let f = &f;
         std::thread::scope(|scope| {
             let handles: Vec<_> = self
                 .shards
                 .iter()
-                .map(|s| {
+                .enumerate()
+                .map(|(idx, s)| {
                     scope.spawn(move || {
+                        if pin {
+                            if let Some(ids) = core_affinity::get_core_ids() {
+                                if !ids.is_empty() {
+                                    let _ = core_affinity::set_for_current(ids[idx % ids.len()]);
+                                }
+                            }
+                        }
                         let mut guard = lock(s);
                         f(&mut guard)
                     })

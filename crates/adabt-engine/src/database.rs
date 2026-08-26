@@ -454,6 +454,10 @@ impl Database {
         for (collection, field) in db.store.declared_cluster_fields() {
             db.cluster_fields.insert(collection, field);
         }
+        // Restore optimizer-controlled global flags persisted via the catalog.
+        db.delta_encoding = db.store.delta_encoding();
+        db.thread_per_core = db.store.thread_per_core();
+        crate::column::set_delta_enabled(db.delta_encoding);
         // Apply whatever the policy asks for, so opening at level 3 gives a
         // level-3 database rather than a level-0 one that drifts up later.
         db.optimize()?;
@@ -474,6 +478,12 @@ impl Database {
     }
     pub fn durability(&self) -> Durability {
         self.store.durability()
+    }
+    pub fn is_thread_per_core(&self) -> bool {
+        self.thread_per_core
+    }
+    pub fn is_delta_encoding(&self) -> bool {
+        self.delta_encoding
     }
     /// Open a stable read view over the primary representation.
     ///
@@ -3051,6 +3061,7 @@ impl ActionSink for Database {
             Action::SetDeltaEncoding(on) => {
                 crate::column::set_delta_enabled(*on);
                 self.delta_encoding = *on;
+                self.store.set_delta_encoding(*on);
                 for store in self.columns.values_mut() {
                     store.set_delta_enabled(*on);
                 }
@@ -3058,10 +3069,7 @@ impl ActionSink for Database {
             }
             Action::SetThreadPerCore(on) => {
                 self.thread_per_core = *on;
-                // Per-shard Mutex is already shared-nothing; per-core adds
-                // pinning and per-core buffer pools. The flag is the optimizer-
-                // visible state; the execution path checks it to select the
-                // per-core pool. Full run-to-completion is M28 soak-gated.
+                self.store.set_thread_per_core(*on);
                 Ok(())
             }
             Action::SetColumnStore(on) => {
@@ -3121,6 +3129,38 @@ impl Source for Database {
         // allocates. The trait default (fetch-and-discard) still backs any
         // store that has not overridden it.
         self.store.peek_field(collection, id, field)
+    }
+
+    fn fetch_projected(
+        &mut self,
+        collection: &str,
+        id: RecordId,
+        fields: &[&str],
+    ) -> Result<Option<Record>> {
+        self.note_touch(collection, id);
+        if !self
+            .masked()
+            .is_some_and(|h| h.hides_direct(self.revealed(), collection))
+        {
+            if let Some(d) = self.direct.get(collection) {
+                if !d.contains(id) {
+                    return Ok(None);
+                }
+                if fields.is_empty() {
+                    return Ok(Some(Record::new()));
+                }
+                let mut rec = Record::new();
+                for f in fields {
+                    if let Some(v) = d.field_at(id, f)? {
+                        // Direct arrays decode fixed fields without TLV — still
+                        // per-field O(1), skipping non-requested strides.
+                        rec.set((*f).to_string(), v);
+                    }
+                }
+                return Ok(Some(rec));
+            }
+        }
+        self.store.get_projected(collection, id, fields)
     }
 
     fn fetch(&mut self, collection: &str, id: RecordId) -> Result<Option<Record>> {

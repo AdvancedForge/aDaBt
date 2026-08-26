@@ -110,6 +110,20 @@ pub trait LogicalStore {
         Ok(self.get(collection, id)?.map(|r| r.get(field).cloned()))
     }
 
+    /// Read a subset of fields, decoding only those fields' bytes.
+    ///
+    /// Default: fetch the whole record and project. Stores with a codec
+    /// override to skip unneeded fields' TLVs entirely, so a wide record's
+    /// other text never decodes.
+    fn get_projected(
+        &mut self,
+        collection: &str,
+        id: RecordId,
+        fields: &[&str],
+    ) -> Result<Option<Record>> {
+        Ok(self.get(collection, id)?.map(|r| r.project(fields)))
+    }
+
     fn count(&mut self, collection: &str) -> Result<usize>;
 
     /// The ids of every live record, ascending — without reading the records.

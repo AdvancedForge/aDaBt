@@ -104,6 +104,17 @@ pub trait Source {
         Ok(self.fetch(collection, id)?.map(|r| r.get(field).cloned()))
     }
 
+    /// Fetch only the listed fields, decoding only those fields' bytes where
+    /// the store supports it. Default is fetch-then-project.
+    fn fetch_projected(
+        &mut self,
+        collection: &str,
+        id: RecordId,
+        fields: &[&str],
+    ) -> Result<Option<Record>> {
+        Ok(self.fetch(collection, id)?.map(|r| r.project(fields)))
+    }
+
     /// Compute a grouped aggregate directly from columns, allocating once per
     /// group rather than once per row. `None` when no columnar representation
     /// exists.
@@ -317,6 +328,76 @@ fn filter_by_peek<S: Source>(
     let batches = fetch_batches(collection, survivors, src, stats, budget)?;
     stats.rows_scanned = counted;
     Ok(batches)
+}
+
+/// Multi-field counterpart: decide every row from a projected peek of only the
+/// fields the predicate reads, then fetch only the survivors in full.
+/// Uses `fetch_projected` so a wide record's other text never decodes —
+///
+/// the literal remainder that single-field `filter_by_peek` left.
+fn filter_by_peek_fields<S: Source>(
+    collection: &str,
+    fields: &[String],
+    program: &adabt_ir::vm::Program,
+    src: &mut S,
+    stats: &mut ExecStats,
+    budget: &ExecBudget,
+) -> Result<Vec<RecordBatch>> {
+    let refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
+    let ids = src.all_ids(collection)?;
+    let mut survivors = Vec::new();
+    for (i, id) in ids.iter().enumerate() {
+        if i % CANCEL_CHECK_INTERVAL == 0 {
+            budget.check_cancelled()?;
+        }
+        stats.rows_scanned += 1;
+        let probe = match src.fetch_projected(collection, *id, &refs)? {
+            None => continue,
+            Some(r) => r,
+        };
+        if program.matches(&probe) {
+            survivors.push(*id);
+        }
+    }
+    let counted = stats.rows_scanned;
+    let batches = fetch_batches(collection, survivors, src, stats, budget)?;
+    stats.rows_scanned = counted;
+    Ok(batches)
+}
+
+/// Fetch only the listed fields for each id, decoding only those fields'
+/// bytes. Used when the planner knows the projection — e.g. survivors of a
+/// selective filter feeding a `Project` — so fetching in full would decode
+/// text that `Project` immediately discards.
+#[allow(dead_code)]
+fn fetch_projected_batches<S: Source>(
+    collection: &str,
+    mut ids: Vec<RecordId>,
+    fields: &[&str],
+    src: &mut S,
+    stats: &mut ExecStats,
+    budget: &ExecBudget,
+) -> Result<Vec<RecordBatch>> {
+    ids.sort_unstable();
+    ids.dedup();
+    let mut out = Vec::new();
+    let mut current = RecordBatch::with_capacity(BATCH_SIZE.min(ids.len()));
+    for (i, id) in ids.into_iter().enumerate() {
+        if i % CANCEL_CHECK_INTERVAL == 0 {
+            budget.check_cancelled()?;
+        }
+        if let Some(rec) = src.fetch_projected(collection, id, fields)? {
+            stats.rows_scanned += 1;
+            current.push(id, rec);
+            if current.len() >= BATCH_SIZE {
+                out.push(std::mem::take(&mut current));
+            }
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    Ok(out)
 }
 
 fn fetch_batches<S: Source>(
@@ -649,11 +730,21 @@ fn run<S: Source>(
             // same rows because peeking is defined to agree with decoding.
             let mut referenced = Vec::new();
             predicate.referenced_fields(&mut referenced);
-            if referenced.len() == 1 {
+            if !referenced.is_empty() && referenced.len() <= 4 {
                 if let PhysicalOp::HeapScan { collection } = input.as_ref() {
-                    return filter_by_peek(
+                    if referenced.len() == 1 {
+                        return filter_by_peek(
+                            collection,
+                            &referenced[0],
+                            &program,
+                            src,
+                            stats,
+                            budget,
+                        );
+                    }
+                    return filter_by_peek_fields(
                         collection,
-                        &referenced.remove(0),
+                        &referenced,
                         &program,
                         src,
                         stats,

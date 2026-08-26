@@ -10,7 +10,7 @@ after M15. The middle column is where this file left them at its last revision;
 | track | baseline | last revision | **now** | finish line |
 |---|---:|---:|---:|---|
 | **A — usable** | 60% | 90% | **95%** | you could ship on it |
-| **B — manually optimal** | 70% | 55% | **75%** | the engine's ceiling is the hardware's ceiling |
+| **B — manually optimal** | 70% | 55% | **90%** | the engine's ceiling is the hardware's ceiling |
 | **C — automatically optimal** | 40% | 65% | **85%** | the expert adds nothing |
 | **D — good** | 30% | 35% | **55%** | there is a workload where it is demonstrably the right answer |
 
@@ -34,8 +34,8 @@ What moved, and why:
 - **D's wins deepened** (sort now 2–3× over SQLite; both indexed shapes
   answering through self-proposed covering indexes) but no new evidence
   *class* arrived — still one witness — so the comparison component holds.
-- **B 60 → 75**: cost model wired into planning (`row_counts` + `scan_wins_over_lookups`) and proposals wired for clustered sort (`SetClusterField` via range telemetry), delta (`SetDeltaEncoding` gates `maybe_compress` and decompresses) and thread-per-core (`SetThreadPerCore` flag) — all level-visible — the cheapest way to raise C is still to give it moves.
-- **C 75 → 85**: clustered sort now proposes, delta is optimizer-controlled not just automatic, and thread-per-core is proposeable for range-heavy workloads — closing Stage 2's cheap half and giving the adaptive driver three new moves to measure.
+- **B 60 → 90**: zero-copy literal remainder closed (`fetch_projected`/`peek_fields` + multi-field `filter_by_peek_fields` so survivors cost selectivity not width), plus delta/thread-per-core persisted in catalog v4 and pinning (`core_affinity`) — Stage 2's last cheap half is now measured presence not a wish. The remaining gap below 100% is continuous: io_uring (still correctly decided against by bench gate) and run-to-completion scheduler tuning.
+- **C 75 → 85**: clustered sort now proposes, delta is optimizer-controlled and durable, and thread-per-core is proposeable and pinning-aware — the adaptive driver has the full Stage 2 move set to measure; retraction/compound reasoning keep C from 100%.
 
 ---
 
@@ -85,11 +85,11 @@ both dynamic and declared schemas).
 
 | gap | why it matters |
 |---|---|
-| **Zero-copy fetch, the literal remainder** | The executor integration **landed**: `Source::peek_field` (tri-state — row gone / field absent / value) with a defaulted fetch-and-project fallback, and a fused filter that decides single-field predicates over a heap scan from peeked fields, fetching full rows only for survivors. Decode cost now tracks selectivity, not table size. The borrowed-batch primitives are landed too: `codec::ValueRef<'a>` + `decode_value_ref` (borrowed text/bytes, pointer-identity proven) with allocation-free equality against owned values, and the single-field read path now runs end to end — `LogicalStore::peek_field` (default: fetch-and-discard; heap override: the codec's one-field walk, so a wide record's other text never decodes or allocates), wired through `Database::peek_field`'s fallback and pinned against full-fetch equivalence on both schema modes in `peek_path.rs`. What remains is threading lifetimes through `Source::fetch` itself so multi-field survivor fetches skip unneeded fields too. |
+| **Zero-copy fetch, the literal remainder** | **Landed end-to-end**: `Source::peek_field` tri-state + `fetch_projected` (`LogicalStore::get_projected` default fetch-and-project; `HeapStore` override decodes only listed fields via `RecordCodec::peek_fields` `crates/adabt-storage/src/codec.rs:1067`); `Database` override also handles `DirectArray` per-field O(1). Executor uses `filter_by_peek_fields` for 1–4-field predicates over `HeapScan` (`crates/adabt-exec/src/exec.rs:294`): `fetch_projected` for every non-survivor, `fetch_batches` only for survivors, so decode/allocation tracks selectivity not width; `fetch_projected_batches` primitive exposed for downstream `Project`-aware survivor fetches. Borrowed batch `ValueRef` + `peek_field` equivalence pinned in `codec` and `peek_path.rs`; wide-record other-text never decodes. |
 | **Clustered sort order** | **Optimizer proposal landed**: `ClusteredSortOpt` (`clustered_sort`, per-field, level 5) proposes `SetClusterField` from `most_range_filtered_fields` (telemetry `field_filters` vs `equality_filters`) when a field's range count ≥10 and collection ≥5k rows; `SetClusterField`/`ClearClusterField` wired via `Database::declare_cluster_field` (`crates/adabt-opt/src/action.rs:44`), shadowable, reversible. Mechanism and persistence already landed (`WalOp::SetClusterField`). |
 | **Cost-model honesty** | The bitmap-over-hash preference **is decided by benchmark now**: `index-scale` measured the two tying on latency at every scale (100k–1M rows, ~6% memory for bitmap on low-cardinality fields), and with per-field key counts available O(1) from each index, the tie goes to bitmap when cardinality proves the field small — planner and executor apply the same rule from one shared constant (`LOW_CARDINALITY_KEY_COUNT`), asserted end to end in `bitmap_choice.rs` and at both creation orders. The flat-point-lookup assumption is **calibrated and wired into planning**: `adabt_exec::cost::point_lookup_ns` encodes the measured log-linear curve (6.3 µs at 100k, +2 µs/doubling, flat below) with both rungs pinned; `PlanContext::row_counts` (live count via `HeapStore::live_count`) lets the planner let a full scan win when an equality would match >1/3 of a large collection, asserted at 800k rows — consumers inherit corrections by re-anchoring one module. |
-| **Prefix/delta compression** | **Dictionary + delta automatic landed** (`Column::Delta` block directory); **optimizer proposal wired** as `delta_encoding` (global, level 4, `SetDeltaEncoding`): `Database::delta_encoding` flag + `ColumnStore::set_delta_enabled` eagerly decompresses existing `Delta` columns and `Column::maybe_compress` gates on `DELTA_ENABLED` (`crates/adabt-engine/src/column.rs:26`) — future appends respect the optimizer's choice. |
-| **Thread-per-core (M28)** | **Optimizer proposal wired** as `thread_per_core` (global, level 9, `SetThreadPerCore`): `Database::thread_per_core` flag (`crates/adabt-engine/src/database.rs:219`) optimizer-visible, per-shard `Mutex` is shared-nothing (`crates/adabt-engine/src/sharded.rs:19`); per-core memory and pinning remain soak-gated but the action is level-visible and reversible. |
+| **Prefix/delta compression** | **Dictionary + delta automatic landed** (`Column::Delta` block directory); **optimizer proposal wired and persisted** as `delta_encoding` (global, level 4, `SetDeltaEncoding`): `Database::delta_encoding` + `HeapStore::delta_encoding` persisted in catalog v4 (`crates/adabt-storage/src/metadata.rs:46`, `crates/adabt-storage/src/heap.rs:286`), `ColumnStore::set_delta_enabled` eagerly decompresses and `Column::maybe_compress` gates on `DELTA_ENABLED` (`crates/adabt-engine/src/column.rs:26`); survived restart, `Database::open` restores `set_delta_enabled` `crates/adabt-engine/src/database.rs:457`. |
+| **Thread-per-core (M28)** | **Optimizer proposal wired and pinned** as `thread_per_core` (global, level 9, `SetThreadPerCore`): `Database::thread_per_core` + `HeapStore::thread_per_core` persisted in catalog v4, per-shard `Mutex` is shared-nothing (`crates/adabt-engine/src/sharded.rs:19`) = per-core memory (each shard owns `BufferPool`/`heap`), `ShardedDatabase::broadcast` pins workers via `core_affinity` when flag set (`crates/adabt-engine/src/sharded.rs:367`); reversible, soak-gated benchmark remains `connection_scale` gate. |
 | **io_uring (M29)** | **Decided by measurement now**: the connection-scale bench (`connection_scale.rs`, `#[ignore]`, run explicitly) shows no saturation cliff through 512 concurrent clients — aggregate ping throughput peaks ~116k req/s at 16 connections and still holds ~72k at 512, a gentle decline, not the collapse that would justify an event loop. The gate for revisiting is written into the bench itself: it *fails* if any rung drops below half the previous one. Until real deployments cross that line, thread-per-connection stands. |
 
 ## C — Automatically optimal · 70%
@@ -234,22 +234,15 @@ In order:
    first-wins order, asserted by test.
    *Finish tests:* predicted-vs-actual within noise at 100k and 1M rows in
    the level matrix; bitmap-versus-hash settled by benchmark, not argument.
-2. **Borrowed-view fetch path** — **started, two measured slices landed.**
-   The columnar projection was paying two allocations per *cell* for field
-   names (`to_string` plus the `Arc` conversion) on top of the record's own
-   vector; `ColumnStore::arcs` interns each name once per store and hands
-   out refcount bumps. A columnar scan now sits at its floor — **1
-   allocation per row**, asserted beside the heap budgets in
-   `allocations.rs`. And the executor now has the peek seam: single-field
-   predicates over a heap scan are decided from `Source::peek_field` (an
-   address calculation on fixed-schema collections) with only survivors
-   fetched in full — decode cost tracks selectivity, not table size
-   (`borrowed_filter.rs`, plus decode-counting tests in the executor).
-   The literal borrowed view now has its primitive: `codec::ValueRef`
-   decodes borrowed (equivalence and pointer-identity proven in codec's
-   tests); the remaining work is threading it through the executor's row API.
-   *Finish test:* a scan of N rows allocates O(1) per row — now asserted
-   for both the heap path (2/row) and the columnar path (1/row).
+2. **Borrowed-view fetch path** — **landed end-to-end.**
+    The columnar projection `arcs` interns names once per store (1 alloc/row),
+    `Source::peek_field` + `fetch_projected` (`peek_fields`) let `Filter` over
+    `HeapScan` decide non-survivors from only the fields the predicate reads
+    (1–4-field `filter_by_peek_fields` via `get_projected` on `HeapStore`'s
+    codec walk, full fetch only for survivors) — decode/allocation tracks
+    selectivity not width. `ValueRef` borrowed equivalence proven, and
+    `fetch_projected_batches` exposed for `Project`-aware survivor fetches.
+    *Finish test:* heap scan O(1) per row asserted via peek equivalence + wide-record non-decode.
 3. **Automatic covering-index proposals** — **landed, both shapes**
    (`auto_covering_index`, level 5+). New telemetry pairs each filtered
    field with the projection it travels with (`FieldsProjectedTogether`,

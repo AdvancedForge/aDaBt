@@ -43,7 +43,7 @@ const MAGIC: &[u8; 8] = b"aDaBtCat";
 // it does not recognise, and recovery falls back to the log, which is exactly
 // the degraded-but-correct path this file exists to make unnecessary rather
 // than the path that makes it unsafe to change the format.
-const FORMAT_VERSION: u32 = 3;
+const FORMAT_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectionMeta {
@@ -66,7 +66,7 @@ pub struct IndexMeta {
     pub kind: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Catalog {
     pub collections: Vec<CollectionMeta>,
     pub indexes: Vec<IndexMeta>,
@@ -78,6 +78,24 @@ pub struct Catalog {
     pub through_lsn: u64,
     /// The oldest entry the log still holds. Zero means the log is complete.
     pub log_start_lsn: u64,
+    /// Whether delta-varint encoding is enabled (optimizer-controlled).
+    pub delta_encoding: bool,
+    /// Whether thread-per-core execution is enabled (optimizer-controlled).
+    pub thread_per_core: bool,
+}
+
+impl Default for Catalog {
+    fn default() -> Self {
+        Self {
+            collections: Vec::new(),
+            indexes: Vec::new(),
+            next_collection_id: 0,
+            through_lsn: 0,
+            log_start_lsn: 0,
+            delta_encoding: true,
+            thread_per_core: false,
+        }
+    }
 }
 
 pub fn path(dir: &Path) -> PathBuf {
@@ -98,6 +116,9 @@ pub fn write(dir: &Path, identity: u128, cat: &Catalog) -> Result<()> {
     body.extend_from_slice(&cat.next_collection_id.to_le_bytes());
     body.extend_from_slice(&cat.through_lsn.to_le_bytes());
     body.extend_from_slice(&cat.log_start_lsn.to_le_bytes());
+    // v4: optimizer-controlled global flags, default true/false backward-compatible.
+    body.push(cat.delta_encoding as u8);
+    body.push(cat.thread_per_core as u8);
 
     body.extend_from_slice(&(cat.collections.len() as u32).to_le_bytes());
     for c in &cat.collections {
@@ -150,7 +171,11 @@ pub fn read(dir: &Path, identity: u128) -> Option<Catalog> {
         return None;
     }
     let mut r = Reader { buf: body, pos: 0 };
-    if r.take(MAGIC.len())? != MAGIC || r.u32()? != FORMAT_VERSION {
+    if r.take(MAGIC.len())? != MAGIC {
+        return None;
+    }
+    let version = r.u32()?;
+    if version != FORMAT_VERSION && version != 3 {
         return None;
     }
     if u128::from_le_bytes(r.take(16)?.try_into().ok()?) != identity {
@@ -162,6 +187,10 @@ pub fn read(dir: &Path, identity: u128) -> Option<Catalog> {
         log_start_lsn: r.u64()?,
         ..Default::default()
     };
+    if version >= 4 {
+        cat.delta_encoding = r.u8()? != 0;
+        cat.thread_per_core = r.u8()? != 0;
+    }
     let n = r.u32()? as usize;
     for _ in 0..n {
         let name = r.string()?;
@@ -314,6 +343,8 @@ mod tests {
             next_collection_id: 8,
             through_lsn: 4242,
             log_start_lsn: 0,
+            delta_encoding: true,
+            thread_per_core: false,
         }
     }
 
