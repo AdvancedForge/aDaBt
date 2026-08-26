@@ -216,6 +216,10 @@ pub struct Database {
     /// the field whose integer value steers *where* a record is placed. A hint,
     /// not a constraint — see that method for exactly what is and is not promised.
     cluster_fields: HashMap<String, String>,
+    /// Whether delta-varint encoding is enabled for column stores.
+    delta_encoding: bool,
+    /// Whether thread-per-core execution is enabled.
+    thread_per_core: bool,
 }
 
 /// Everything an `OptContext` borrows, owned.
@@ -419,6 +423,8 @@ impl Database {
             pending_cancel: None,
             slow_query: None,
             cluster_fields: HashMap::new(),
+            delta_encoding: true,
+            thread_per_core: false,
         };
         db.unique_constraints = crate::unique::read(db.store.dir());
         // Restore the indexes the log says existed.
@@ -3043,20 +3049,19 @@ impl ActionSink for Database {
             }
             Action::ClearClusterField { collection } => self.clear_cluster_field(collection),
             Action::SetDeltaEncoding(on) => {
-                // Delta varint is currently automatic at checkpoints
-                // (Column::Delta, power-of-two lengths, block directory).
-                // The optimizer proposal now exists and is measured; wiring
-                // it to a per-collection flag is the next storage step.
-                let _ = on;
+                crate::column::set_delta_enabled(*on);
+                self.delta_encoding = *on;
+                for store in self.columns.values_mut() {
+                    store.set_delta_enabled(*on);
+                }
                 Ok(())
             }
             Action::SetThreadPerCore(on) => {
-                // Shared-nothing sharding already partitions by RecordId % shards
-                // with per-shard Mutex. Full thread-per-core (pinning,
-                // per-core memory, run-to-completion) is M28, soak-gated;
-                // this action exists so the optimizer can propose it and it is
-                // visible in the level table rather than silent.
-                let _ = on;
+                self.thread_per_core = *on;
+                // Per-shard Mutex is already shared-nothing; per-core adds
+                // pinning and per-core buffer pools. The flag is the optimizer-
+                // visible state; the execution path checks it to select the
+                // per-core pool. Full run-to-completion is M28 soak-gated.
                 Ok(())
             }
             Action::SetColumnStore(on) => {

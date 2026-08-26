@@ -20,6 +20,22 @@ use adabt_core::record::Record;
 use adabt_core::value::Value;
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static DELTA_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Enable or disable delta-varint encoding for future compressions.
+///
+/// When disabled, existing `Delta` columns are kept as-is until explicitly
+/// rebuilt; new appends will not attempt delta conversion. `ColumnStore`
+/// exposes a helper to eagerly decompress when the optimizer disables it.
+pub fn set_delta_enabled(enabled: bool) {
+    DELTA_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn is_delta_enabled() -> bool {
+    DELTA_ENABLED.load(Ordering::Relaxed)
+}
 
 /// One row's candidacy in a top-K selection: its id and whatever the key
 /// column holds for it.
@@ -259,6 +275,9 @@ impl Column {
     /// fit `i64`), which is checked in one pass; anything else keeps the
     /// plain form and tries again at the next doubling.
     fn maybe_compress(col: &mut Column) {
+        if !is_delta_enabled() {
+            return;
+        }
         let taken = std::mem::take(col);
         let (plain, as_u64): (Vec<Option<i64>>, bool) = match taken {
             Column::I64(v) => (v, false),
@@ -550,6 +569,28 @@ impl ColumnStore {
             store.append(id, rec);
         }
         store
+    }
+
+    /// Enable or disable delta-varint for this store's future compressions.
+    ///
+    /// When disabling, eagerly decompresses any existing `Delta` columns so
+    /// the optimizer's disable is visible without waiting for a rebuild.
+    pub fn set_delta_enabled(&mut self, enabled: bool) {
+        set_delta_enabled(enabled);
+        if !enabled {
+            for col in self.columns.values_mut() {
+                if matches!(col, Column::Delta { .. }) {
+                    let taken = std::mem::take(col);
+                    if let Some((rows, was_u64)) = taken.delta_rows() {
+                        *col = if was_u64 {
+                            Column::U64(rows.into_iter().map(|r| r.map(|x| x as u64)).collect())
+                        } else {
+                            Column::I64(rows)
+                        };
+                    }
+                }
+            }
+        }
     }
 
     /// Append a row. Public because maintenance appends rather than updating:
