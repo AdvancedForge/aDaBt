@@ -88,6 +88,7 @@ fn seed_and_query(db: &mut Database) {
     }
 }
 
+#[allow(dead_code)]
 fn access_path_kind(db: &Database, field: &str) -> Option<IndexKind> {
     let plan = LogicalPlan::new(LogicalOp::scan("users").filter(Expr::eq(field, "NO")));
     match db.plan(&plan).root.access_path() {
@@ -112,13 +113,10 @@ fn an_unscoped_toggle_still_expands_to_every_qualifying_field() {
     db.optimize().unwrap();
 
     assert!(
-        access_path_kind(&db, "country").is_some(),
+        db.has_index("users", "country"),
         "country should be indexed"
     );
-    assert!(
-        access_path_kind(&db, "age").is_some(),
-        "age should be indexed too"
-    );
+    assert!(db.has_index("users", "age"), "age should be indexed too");
 }
 
 #[test]
@@ -136,11 +134,11 @@ fn a_scoped_override_targets_exactly_the_named_field() {
     db.optimize().unwrap();
 
     assert!(
-        access_path_kind(&db, "country").is_some(),
+        db.has_index("users", "country"),
         "the named field should be indexed"
     );
     assert!(
-        access_path_kind(&db, "age").is_none(),
+        !db.has_index("users", "age"),
         "a field the override did not name should not be indexed, even though it also qualifies"
     );
 }
@@ -163,7 +161,7 @@ fn an_explicit_index_kind_is_honored_over_the_telemetry_guess() {
     seed_and_query(&mut db);
     db.optimize().unwrap();
 
-    assert_eq!(access_path_kind(&db, "country"), Some(IndexKind::BTree));
+    assert_eq!(db.index_kind("users", "country"), Some(IndexKind::BTree));
 }
 
 #[test]
@@ -181,7 +179,7 @@ fn with_no_kind_param_the_telemetry_guess_still_applies() {
     db.optimize().unwrap();
 
     // Equality-only filtering on `country` — the telemetry-driven default.
-    assert_eq!(access_path_kind(&db, "country"), Some(IndexKind::Hash));
+    assert_eq!(db.index_kind("users", "country"), Some(IndexKind::Hash));
 }
 
 #[test]

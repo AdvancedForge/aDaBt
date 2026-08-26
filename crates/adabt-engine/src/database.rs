@@ -1616,6 +1616,18 @@ impl Database {
         out
     }
 
+    pub fn has_index(&self, collection: &str, field: &str) -> bool {
+        self.indexes
+            .get(collection)
+            .is_some_and(|list| list.iter().any(|i| i.field() == field))
+    }
+
+    pub fn index_kind(&self, collection: &str, field: &str) -> Option<IndexKind> {
+        self.indexes
+            .get(collection)
+            .and_then(|list| list.iter().find(|i| i.field() == field).map(|i| i.kind()))
+    }
+
     /// Memory held by every derived structure, for the resource axis.
     pub fn derived_memory_bytes(&self) -> usize {
         self.index_memory_bytes()

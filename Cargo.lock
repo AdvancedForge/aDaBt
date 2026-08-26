@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "adabt-bench"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "adabt-core",
  "adabt-engine",
@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "adabt-cli"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "adabt-core",
  "adabt-engine",
@@ -28,14 +28,14 @@ dependencies = [
 
 [[package]]
 name = "adabt-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "adabt-engine"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "adabt-core",
  "adabt-exec",
@@ -51,7 +51,7 @@ dependencies = [
 
 [[package]]
 name = "adabt-exec"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "adabt-core",
  "adabt-index",
@@ -62,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "adabt-ffi"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "adabt-core",
  "adabt-engine",
@@ -70,7 +70,7 @@ dependencies = [
 
 [[package]]
 name = "adabt-index"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "adabt-core",
  "adabt-ir",
@@ -79,14 +79,14 @@ dependencies = [
 
 [[package]]
 name = "adabt-ir"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "adabt-core",
 ]
 
 [[package]]
 name = "adabt-opt"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "adabt-core",
  "adabt-ir",
@@ -95,7 +95,7 @@ dependencies = [
 
 [[package]]
 name = "adabt-server"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "adabt-core",
  "adabt-engine",
@@ -108,7 +108,7 @@ dependencies = [
 
 [[package]]
 name = "adabt-storage"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "adabt-core",
  "adabt-telemetry",
@@ -119,14 +119,14 @@ dependencies = [
 
 [[package]]
 name = "adabt-telemetry"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "adabt-core",
 ]
 
 [[package]]
 name = "adabt-testkit"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "adabt-core",
 ]
