@@ -1,9 +1,9 @@
 //! Multi-statement transactions, single-shard snapshot isolation.
 //!
-//! A [`Transaction`] is a value: [`Database::begin`] hands one out, its reads
+//! A [`Transaction`] is a value: [`Database::begin`](crate::database::Database::begin) hands one out, its reads
 //! and writes accumulate in memory against a fixed snapshot, and
-//! [`Database::commit`] is the one moment any of it touches the database at
-//! all. Dropping it without committing — or calling [`Database::abort`], which
+//! [`Database::commit`](crate::database::Database::commit) is the one moment any of it touches the database at
+//! all. Dropping it without committing — or calling [`Database::abort`](crate::database::Database::abort), which
 //! exists for the same purpose plus symmetry with `commit` — does exactly
 //! nothing, because nothing was ever done.
 //!
@@ -38,8 +38,8 @@
 //! It cannot, and the reason is structural rather than a property of the
 //! stamps: `Database`'s methods take `&mut self`, and this codebase has no
 //! internal concurrency — no threads mutate one `Database` while another reads
-//! it. [`Database::commit`] runs to completion as one synchronous call; nothing
-//! else can call [`Database::snapshot`] until it returns, because doing so
+//! it. [`Database::commit`](crate::database::Database::commit) runs to completion as one synchronous call; nothing
+//! else can call [`Database::snapshot`](crate::database::Database::snapshot) until it returns, because doing so
 //! would require a second live borrow of the same `&mut Database`, which the
 //! borrow checker forbids. A snapshot opened before commit began has an `at`
 //! fixed before any of the five stamps exist and sees none of them; one opened
@@ -49,7 +49,7 @@
 //!
 //! (This stops being true the moment `Database` gains real internal
 //! concurrency — a reader with a live `&self` borrow while a writer holds
-//! `&mut self` elsewhere. Nothing here does that, and [`LogicalStore`]'s own
+//! `&mut self` elsewhere. Nothing here does that, and [`LogicalStore`](adabt_core::store::LogicalStore)'s own
 //! documentation is explicit that its `&mut self` reads exist precisely to
 //! keep it that way.)
 //!
@@ -64,12 +64,12 @@
 //!
 //! Schema validity and unique constraints are checked at commit, once, across
 //! the whole write-set, before anything is applied — deliberately duplicating
-//! a check [`Database::update`] will make again on the way in, because the
+//! a check the ordinary update path will make again on the way in, because the
 //! alternative is validating everything and applying each write as it passes,
 //! which leaves a window in which an unrelated later failure aborts a
 //! transaction that has already partly landed. Checking everything first and
 //! applying second is the same all-or-nothing shape
-//! [`Database::insert_batch`] uses, for the same reason.
+//! [`Database::insert_batch`](crate::database::Database::insert_batch) uses, for the same reason.
 //!
 //! # DDL is not transactional
 //!

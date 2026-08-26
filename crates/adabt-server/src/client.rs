@@ -66,7 +66,7 @@ impl<S: Read + Write> Client<S> {
     /// Read the next reply frame off this connection, requiring that it
     /// carries `id`.
     ///
-    /// Unlike [`Client::call`], the frame is returned as-is: status not
+    /// Unlike `Client::call`, the frame is returned as-is: status not
     /// interpreted, body not decoded. That is what an adversarial test wants
     /// — the raw shape of what a hostile request earned.
     pub fn next_reply(&mut self, id: u64) -> Result<Frame> {

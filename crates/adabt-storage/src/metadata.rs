@@ -55,7 +55,7 @@ pub struct CollectionMeta {
     /// never hands out an id that was already used, even one whose record has
     /// since been deleted.
     pub next_record_id: u64,
-    /// The declared clustering field, if any. See [`WalOp::SetClusterField`].
+    /// The declared clustering field, if any. See [`WalOp::SetClusterField`](crate::wal::WalOp::SetClusterField).
     pub cluster_field: Option<String>,
 }
 

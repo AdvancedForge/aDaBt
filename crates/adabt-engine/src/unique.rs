@@ -4,7 +4,7 @@
 //! rather than in storage.** Enforcing it needs an index to check against
 //! efficiently, but the index is a means, not the point — dropping and
 //! rebuilding it must never make a duplicate value legal, which is exactly the
-//! property [`crate::database::Database::pinned_scopes`] exists to protect: the
+//! property `Database::pinned_scopes` exists to protect: the
 //! adaptive driver may retract an index it judges unused, but never one a
 //! constraint depends on. A dropped constraint releases the pin; the index
 //! itself is left in place, since whether it is still worth keeping for

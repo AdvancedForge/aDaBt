@@ -700,7 +700,7 @@ impl ShardedDatabase {
     /// **Ids are generated `seq * shard_count + shard_index`**, where `seq` is
     /// that one shard's own local counter. That guarantees two things at once:
     /// every id already satisfies `id % shard_count == shard_index`, so
-    /// [`ShardedDatabase::owner`] always agrees with where the record actually
+    /// `ShardedDatabase::owner` always agrees with where the record actually
     /// lives — no cross-shard coordination is needed, or possible, to keep
     /// routing consistent — and two shards allocating concurrently can never
     /// produce the same id, because their outputs land in disjoint residue

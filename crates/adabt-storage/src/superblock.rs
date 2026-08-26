@@ -27,7 +27,7 @@
 //! trying to make impossible.
 //!
 //! An *older* version is a migration, and migrations are enumerated explicitly
-//! in [`migrate`] rather than inferred. There are none yet; the mechanism is
+//! in `migrate` rather than inferred. There are none yet; the mechanism is
 //! here so that the next format change is a version bump rather than an
 //! incident.
 

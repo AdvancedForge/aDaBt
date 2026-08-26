@@ -196,8 +196,8 @@ fn a_coordinated_commit_is_visible_everywhere_and_cleans_up() {
 fn a_torn_journal_tail_is_a_prefix_not_a_corruption() {
     let t = Tmp::new("torn");
     {
-        let db = seeded(t.path()).unwrap();
-        let _ = &db;
+        // Seeded so the torn tail's last row exists in its old state.
+        let _db = seeded(t.path()).unwrap();
         let writes = transfer();
         let mut full = Vec::new();
         full.extend_from_slice(b"XSH1");

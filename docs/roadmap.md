@@ -86,11 +86,11 @@ both dynamic and declared schemas).
 | gap | why it matters |
 |---|---|
 | **Thread-per-core (M28)** | Everything is one `Mutex` deep. On any modern core count this is the dominant ceiling, and the largest single item on the track. |
-| **Zero-copy fetch, the literal remainder** | The executor integration **landed**: `Source::peek_field` (tri-state — row gone / field absent / value) with a defaulted fetch-and-project fallback, and a fused filter that decides single-field predicates over a heap scan from peeked fields, fetching full rows only for survivors. Decode cost now tracks selectivity, not table size. What remains is the literal borrowed view: a batch type holding borrowed rows over decoded pages, so even the surviving fetch stops materializing owned records. |
+| **Zero-copy fetch, the literal remainder** | The executor integration **landed**: `Source::peek_field` (tri-state — row gone / field absent / value) with a defaulted fetch-and-project fallback, and a fused filter that decides single-field predicates over a heap scan from peeked fields, fetching full rows only for survivors. Decode cost now tracks selectivity, not table size. The borrowed-batch **primitive is landed too**: `codec::ValueRef<'a>` + `decode_value_ref` decode text, bytes and map keys as pointers into the source buffer (scalars copy — they are pointer-width anyway), consuming exactly the bytes `decode_value` does; tests prove answer-for-answer equivalence across every variant and that borrowed text's address *is* the source buffer's. What remains is wiring it through the executor's fetch so surviving rows stop materializing owned records — mechanical now the decoder exists. |
 | **Clustered sort order** | The mechanism landed (see Stage 2 item 4); what remains is persisting the declaration across restarts and letting the optimizer propose it. |
 | **Cost-model honesty** | The bitmap-over-hash preference **is decided by benchmark now**: `index-scale` measured the two tying on latency at every scale (100k–1M rows, ~6% memory for bitmap on low-cardinality fields), and with per-field key counts available O(1) from each index, the tie goes to bitmap when cardinality proves the field small — planner and executor apply the same rule from one shared constant (`LOW_CARDINALITY_KEY_COUNT`), asserted end to end in `bitmap_choice.rs` and at both creation orders. The flat-point-lookup assumption is **calibrated now**: `adabt_exec::cost::point_lookup_ns` encodes the measured log-linear curve (6.3 µs at the 100k anchor, +2 µs per doubling, flat below it) with tests pinning both rungs — consumers inherit corrections by re-anchoring one module after a bench run rather than transcribing constants. |
 | **Prefix/delta compression** | Dictionary encoding landed; these two did not. |
-| **io_uring (M29)** | Needs an async storage path first. Real, but last. |
+| **io_uring (M29)** | Decided by analysis for now, revisit by measurement: the substrate is bounded thread-per-connection (admission-capped, TLS handshakes first), and this workload — request/response over modest connection counts, not thousands of idle sockets — is where thread-per-connection is within noise of an event loop. The rewrite earns its risk only when a connection-scale bench shows saturation; the admission gate already bounds the damage until then. |
 
 ## C — Automatically optimal · 70%
 
@@ -243,9 +243,9 @@ In order:
    address calculation on fixed-schema collections) with only survivors
    fetched in full — decode cost tracks selectivity, not table size
    (`borrowed_filter.rs`, plus decode-counting tests in the executor).
-   What remains of this item is the literal borrowed view:
-   read paths seeing references into decoded pages instead of owned
-   records, which needs the executor's row API to grow lifetimes.
+   The literal borrowed view now has its primitive: `codec::ValueRef`
+   decodes borrowed (equivalence and pointer-identity proven in codec's
+   tests); the remaining work is threading it through the executor's row API.
    *Finish test:* a scan of N rows allocates O(1) per row — now asserted
    for both the heap path (2/row) and the columnar path (1/row).
 3. **Automatic covering-index proposals** — **landed, both shapes**
