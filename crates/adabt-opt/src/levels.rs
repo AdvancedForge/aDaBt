@@ -103,6 +103,10 @@ pub fn level_preset(level: u8) -> Vec<LevelEntry> {
         out.push(entry("auto_covering_index", &[]));
         out.push(entry("clustered_sort", &[]));
     }
+    if level >= 6 {
+        out.push(entry("join_order", &[]));
+        out.push(entry("data_partitioning", &[]));
+    }
     if level >= 8 {
         // Freezing is what makes direct addressing legal for a collection that
         // did not start out fixed, which is why it sits below it.

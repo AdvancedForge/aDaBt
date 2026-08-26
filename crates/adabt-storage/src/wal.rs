@@ -58,10 +58,15 @@ pub enum WalOp {
         collection: String,
         id: RecordId,
     },
+    /// DDL is **not transactional**: this entry commits on write and is not
+    /// rolled back with any surrounding `Begin`/`Commit`. A `CreateCollection`
+    /// that is later "aborted" by discarding its transaction handle remains
+    /// visible — the format-level contract, not a note in passing.
     CreateCollection {
         name: String,
         schema: Vec<u8>,
     },
+    /// DDL is not transactional — see `CreateCollection`.
     DropCollection {
         name: String,
     },

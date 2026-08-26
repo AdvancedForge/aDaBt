@@ -220,6 +220,10 @@ pub struct Database {
     delta_encoding: bool,
     /// Whether thread-per-core execution is enabled.
     thread_per_core: bool,
+    /// Whether join order optimization is enabled (M32).
+    join_order: bool,
+    /// Whether data-driven partitioning is enabled (M32).
+    data_partitioning: bool,
 }
 
 /// Everything an `OptContext` borrows, owned.
@@ -425,6 +429,8 @@ impl Database {
             cluster_fields: HashMap::new(),
             delta_encoding: true,
             thread_per_core: false,
+            join_order: false,
+            data_partitioning: false,
         };
         db.unique_constraints = crate::unique::read(db.store.dir());
         // Restore the indexes the log says existed.
@@ -484,6 +490,12 @@ impl Database {
     }
     pub fn is_delta_encoding(&self) -> bool {
         self.delta_encoding
+    }
+    pub fn is_join_order(&self) -> bool {
+        self.join_order
+    }
+    pub fn is_data_partitioning(&self) -> bool {
+        self.data_partitioning
     }
     /// Open a stable read view over the primary representation.
     ///
@@ -3097,6 +3109,14 @@ impl ActionSink for Database {
             }
             Action::SetPrefetch(on) => {
                 self.store.set_prefetch(*on);
+                Ok(())
+            }
+            Action::SetJoinOrder(on) => {
+                self.join_order = *on;
+                Ok(())
+            }
+            Action::SetDataPartitioning(on) => {
+                self.data_partitioning = *on;
                 Ok(())
             }
         }

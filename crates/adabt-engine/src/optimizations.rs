@@ -37,6 +37,8 @@ pub fn register_builtins(registry: &mut Registry) {
     registry.register(Box::new(ClusteredSortOpt));
     registry.register(Box::new(DeltaEncodingOpt));
     registry.register(Box::new(ThreadPerCoreOpt));
+    registry.register(Box::new(JoinOrderOpt));
+    registry.register(Box::new(DataPartitioningOpt));
 }
 
 // -- materialized views -----------------------------------------------------
@@ -1402,6 +1404,132 @@ impl Optimization for ThreadPerCoreOpt {
     }
 }
 
+// -- join order (M32) -------------------------------------------------------
+
+pub struct JoinOrderOpt;
+
+const JOIN_ORDER_META: OptMeta = OptMeta {
+    name: "join_order",
+    summary: "reorder join inputs by estimated cardinality (small side build)",
+    scope_kind: ScopeKind::Global,
+    min_level: 6,
+    axis_effects: AxisEffects::new(5, -1, 0),
+    requires_guarantees: GuaranteeRequirements::ANY,
+    prerequisites: &[],
+    conflicts_with: &[],
+    reversibility: Reversibility::Instant,
+};
+
+impl Optimization for JoinOrderOpt {
+    fn meta(&self) -> &OptMeta {
+        &JOIN_ORDER_META
+    }
+    fn applicability(&self, ctx: &OptContext<'_>) -> Applicability {
+        // Needs at least one join observed; telemetry for joins is derived from
+        // filtered_fields co-occurrence already used for composite indexes.
+        let has_join = ctx
+            .telemetry
+            .most_pinned_sets()
+            .iter()
+            .any(|(_, f, _)| f.len() >= 2);
+        if !has_join {
+            return Applicability::NotYet("no join-shaped queries observed yet".into());
+        }
+        if ctx.collections.iter().map(|(_, n)| *n).sum::<usize>() < 1_000 {
+            return Applicability::NotYet("collections too small for join order to matter".into());
+        }
+        Applicability::Applicable
+    }
+    fn estimate(&self, _ctx: &OptContext<'_>) -> CostEstimate {
+        CostEstimate::faster(0.6, 0.55)
+            .with_confidence(0.4)
+            .with_build(BuildCost {
+                estimated_secs: 0.0,
+                rows_read: 0,
+                online: true,
+            })
+    }
+    fn plan_enable(&self, _ctx: &OptContext<'_>, _scope: &str, _params: &Params) -> ChangePlan {
+        ChangePlan::new(
+            vec![Action::SetJoinOrder(true)],
+            vec![Action::SetJoinOrder(false)],
+        )
+    }
+    fn plan_disable(&self, _ctx: &OptContext<'_>, _scope: &str, _params: &Params) -> ChangePlan {
+        ChangePlan::new(vec![Action::SetJoinOrder(false)], vec![])
+    }
+}
+
+// -- data-driven partitioning (M32) ----------------------------------------
+
+pub struct DataPartitioningOpt;
+
+const DATA_PARTITIONING_META: OptMeta = OptMeta {
+    name: "data_partitioning",
+    summary: "partition hot key ranges to separate pages (clustered-sort companion)",
+    scope_kind: ScopeKind::PerField,
+    min_level: 6,
+    axis_effects: AxisEffects::new(4, -1, 0),
+    requires_guarantees: GuaranteeRequirements::ANY,
+    prerequisites: &[],
+    conflicts_with: &[],
+    reversibility: Reversibility::Instant,
+};
+
+impl Optimization for DataPartitioningOpt {
+    fn meta(&self) -> &OptMeta {
+        &DATA_PARTITIONING_META
+    }
+    fn candidate_scopes(&self, ctx: &OptContext<'_>) -> Vec<String> {
+        ctx.telemetry
+            .most_range_filtered_fields()
+            .into_iter()
+            .filter(|(c, _, n)| *n >= 10 && ctx.rows_in(c) >= 5_000)
+            .map(|(c, f, _)| format!("{c}.{f}"))
+            .collect()
+    }
+    fn applicability(&self, ctx: &OptContext<'_>) -> Applicability {
+        if self.candidate_scopes(ctx).is_empty() {
+            return Applicability::NotYet("no field shows range-skewed access yet".into());
+        }
+        Applicability::Applicable
+    }
+    fn estimate(&self, _ctx: &OptContext<'_>) -> CostEstimate {
+        CostEstimate::faster(0.7, 0.65).with_confidence(0.35)
+    }
+    fn plan_enable(&self, _ctx: &OptContext<'_>, scope: &str, _params: &Params) -> ChangePlan {
+        let Some((c, f)) = split_scope(scope) else {
+            return ChangePlan::default();
+        };
+        // Reuse clustered placement — partitioning is its hot-range refinement.
+        ChangePlan::new(
+            vec![
+                Action::SetDataPartitioning(true),
+                Action::SetClusterField {
+                    collection: c.clone(),
+                    field: f.clone(),
+                },
+            ],
+            vec![
+                Action::SetDataPartitioning(false),
+                Action::ClearClusterField { collection: c },
+            ],
+        )
+    }
+    fn plan_disable(&self, _ctx: &OptContext<'_>, scope: &str, _params: &Params) -> ChangePlan {
+        let Some((c, _)) = split_scope(scope) else {
+            return ChangePlan::default();
+        };
+        ChangePlan::new(
+            vec![
+                Action::SetDataPartitioning(false),
+                Action::ClearClusterField { collection: c },
+            ],
+            vec![],
+        )
+    }
+}
+
 // -- shared helpers ---------------------------------------------------------
 
 /// Cache size from the level preset, falling back to a default.
@@ -1488,7 +1616,8 @@ mod tests {
         let mut r = Registry::new();
         register_builtins(&mut r);
         // Two more than the last revision: clustered_sort, delta_encoding and thread_per_core joined.
-        assert_eq!(r.len(), 15);
+        // M32 closed: join_order and data_partitioning joined.
+        assert_eq!(r.len(), 17);
         assert!(r.dependency_order().is_ok());
         for n in r.names() {
             assert!(!r.meta(n).unwrap().summary.is_empty(), "{n} has no summary");

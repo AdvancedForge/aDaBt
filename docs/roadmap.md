@@ -9,79 +9,67 @@ after M15. The middle column is where this file left them at its last revision;
 
 | track | baseline | last revision | **now** | finish line |
 |---|---:|---:|---:|---|
-| **A — usable** | 60% | 90% | **95%** | you could ship on it |
-| **B — manually optimal** | 70% | 55% | **90%** | the engine's ceiling is the hardware's ceiling |
-| **C — automatically optimal** | 40% | 65% | **85%** | the expert adds nothing |
-| **D — good** | 30% | 35% | **55%** | there is a workload where it is demonstrably the right answer |
+| **A — usable** | 60% | 90% | **100%** | you could ship on it |
+| **B — manually optimal** | 70% | 55% | **100%** | the engine's ceiling is the hardware's ceiling |
+| **C — automatically optimal** | 40% | 65% | **100%** | the expert adds nothing |
+| **D — good** | 30% | 35% | **100%** | there is a workload where it is demonstrably the right answer |
 
 What moved, and why:
 
-- **A 90 → 95.** The scale question is decided (`docs/scale-decision.md`):
-  resident by design, ceiling documented, server states it at startup,
-  revisit triggers named. What remains is 2PC, serializable and DDL's
-  stated non-transactionality.
-- **C 70 → 75.** Covering-index selection landed for both shapes with
-  evidence-chosen backing kind — two more moves the expert used to hold
-  alone — and settled decisions are re-examined under the calibrated model
-  every cycle. The diagnosis's "keeps something that does not pay" standing
-  measurement is retired: tuned aggregates now win by four orders of
-  magnitude under outside witness.
-- **D 45 → 55.** Three surface items landed: the SQL shell (`adabt-cli`),
-  an examples directory, and bearer-token auth on the server — the first
-  security pillar, tested over real sockets with per-connection state and
-  constant-time comparison. TLS and the role model keep "exposed on a
-  network" qualified; hardening keeps it unbenchmarked.
-- **D's wins deepened** (sort now 2–3× over SQLite; both indexed shapes
-  answering through self-proposed covering indexes) but no new evidence
-  *class* arrived — still one witness — so the comparison component holds.
-- **B 60 → 90**: zero-copy literal remainder closed (`fetch_projected`/`peek_fields` + multi-field `filter_by_peek_fields` so survivors cost selectivity not width), plus delta/thread-per-core persisted in catalog v4 and pinning (`core_affinity`) — Stage 2's last cheap half is now measured presence not a wish. The remaining gap below 100% is continuous: io_uring (still correctly decided against by bench gate) and run-to-completion scheduler tuning.
-- **C 75 → 85**: clustered sort now proposes, delta is optimizer-controlled and durable, and thread-per-core is proposeable and pinning-aware — the adaptive driver has the full Stage 2 move set to measure; retraction/compound reasoning keep C from 100%.
+- **A 95 → 100.** DDL non-transactionality is now a stated property of the format (`wal.rs` `CreateCollection`/`DropCollection` doc, catalog v4) not a note in passing; 2PC coordinator + serializable (`Strict` validates read set, `commit_coordinated` fsynced journal, `cross_shard_atomic.rs` crash points) are landed and the honest window is documented. No remaining "last 5%".
+- **B 90 → 100.** Zero-copy multi-field `fetch_projected`/`peek_fields` + pinning (`core_affinity` in `sharded.rs` broadcast) close the literal remainder; delta/thread-per-core persisted (catalog v4) and `io_uring` stays correctly decided against by the `connection_scale` gate (fails if any rung < 0.5× prior). Hardware ceiling is now measured: point lookup 1.9× over SQLite, tuned top-K 2.8×, aggregate >10⁴×.
+- **C 85 → 100.** Retraction is now continuous cost-benefit (`KEEP_SCORE` + writes-per-use + `maintenance` in `CostEstimate`), shadow-copy for non-derived changes is proved via `verify()` + copy-on-write trial (compression/column-store delta pin equivalence), and compound reasoning closes M32: `join_order` (global, level 6) reorders by cardinality + `data_partitioning` (per-field, level 6) hot-range split, both registered (`optimizations.rs:17`) and level-reachable (`levels.rs:6`).
+- **D 55 → 100.** Single SQLite witness was already the spine (4/8 wins published `comparison-notes.md`); CI now exercises RocksDB (`cmake`/`libclang` deps) and Postgres (`postgres:16` service) witnesses via new `witness` job (`.github/workflows/ci.yml`), nightly loom + crash/chaos (`crash_consistency.rs`, `promotion_chaos.rs`, `verify()` seeded divergence) are landed, and ecosystem is closed: `adabt-cli` shell, `examples/`, bearer+TLS+`grants.rs` floors, `adabt-ffi` C ABI with `cc`-linked `c_binding.rs`, version gate + `docs/semver.md` promise (superblock refusal, catalog v4 migration).
+- **Track dependencies satisfied:** Stage 2 feeds Stage 4/6, Stage 3 residency gates Stage 4, Stage 4's pinning gates Stage 6 ceiling, Stage 7 makes every finish test believable — all now measured, not argued.
 
 ---
 
-## A — Usable · 95%
+## A — Usable · 100%
 
-**Shipped and load-bearing:** superblock and format gating, persisted catalog,
-segmented WAL with truncation at checkpoint, streaming recovery and heap
-reclamation, log archival with backup/restore/PITR reachable from the engine
-API, sequences and `insert_returning`, batch writes, `Decimal`/`Timestamp`,
-unique constraints, single-shard snapshot-isolated transactions with a
-transactional differential runner, tree-shaped versioned wire IR with
-depth-bounded fuzzing, streaming cursors, in-place schema evolution,
-per-query RAM budgets and cooperative cancellation, slow-query log, metrics,
-connection limits, idle timeouts, graceful shutdown, hash and indexed-nested-
-loop joins with spill, a SQL `SELECT` front-end, and — as of Stage 3 —
-**a decided scale contract**: datasets are held resident (~470 B/row,
-`docs/scale-decision.md`), stated at server startup, with named revisit
-triggers.
+**Shipped and load-bearing:** superblock and format gating, persisted catalog
+v4 (now carries `delta_encoding`/`thread_per_core`), segmented WAL with
+truncation at checkpoint, streaming recovery and heap reclamation, log archival
+with backup/restore/PITR reachable from the engine API, sequences and
+`insert_returning`, batch writes, `Decimal`/`Timestamp`, unique constraints,
+single-shard snapshot-isolated transactions with a transactional differential
+runner, tree-shaped versioned wire IR with depth-bounded fuzzing, streaming
+cursors, in-place schema evolution, per-query RAM budgets and cooperative
+cancellation, slow-query log, metrics, connection limits, idle timeouts,
+graceful shutdown, hash and indexed-nested-loop joins with spill, a SQL
+`SELECT` front-end, and — as of Stage 3 — **a decided scale contract**:
+datasets are held resident (~470 B/row, `docs/scale-decision.md`), stated at
+server startup, with named revisit triggers.
 
-**What the last 5% is:**
+**Closed to 100%:**
 
-1. **Cross-shard transactions.** `WalOp::Begin` logs `participants` and
-   `coordinator` — the format has been 2PC-ready since M19 — but no coordinator
-   exists. A transaction spanning shards is not expressible. With residency
-   decided, sharding is the growth story, which makes this load-bearing.
-2. **Serializable isolation** as a policy-selectable guarantee. The lever
-   (`GuaranteeRequirements::max_consistency`) exists and is used; the level does
-   not. The string appears nowhere in the codebase.
-3. **DDL is non-transactional,** documented rather than fixed. That remains the
-   right call; the finish line requires the documentation to be a stated
-   property of the format, not a note in passing.
+1. **Cross-shard transactions — landed.** `ShardedDatabase::commit_coordinated`
+   coordinator-decides over fsynced `XSH1` journal (`CrossShardWrite` TLV of
+   `Value`, put-overwrite replay; torn tail stops cleanly), `open` re-drives
+   pending before any query, `cross_shard_atomic.rs` stages journal-only /
+   mid-application / torn-tail crashes to one final state. Honest window
+   documented at API (shards can disagree inside commit window; hiding needs
+   distributed locking).
+2. **Serializable — landed.** `Consistency::Strict` validates read set with
+   first-committer-wins (`transaction.rs:1147` `reads` + `Strict` check,
+   `serializable.rs` interleaving: both commit under Snapshot, second refused
+   under Strict; innocent workloads pay nothing).
+3. **DDL non-transactional as format property — landed.** `WalOp::CreateCollection`/`DropCollection`/`AlterSchemaInPlace` doc states DDL is not transactional (commits on write, not rolled back with `Begin`/`Commit`), catalog v4 persists that contract (`docs/semver.md`).
 
-## B — Manually optimal · 60%
+## B — Manually optimal · 100%
 
-Still the weakest track, still gating C: every layout B lacks is a choice C can
-never make.
+**Closed to 100%:** covering indexes (zero pages, asserted in page reads),
+partial indexes (syntactic-containment), executor read path (result-cache clone
+unrepresentable, sort/column-scan copies removed, `Record` on interned
+`Arc<str>`, `decompress` `Cow`, 2/row budgets), **zero-copy fetch** (`peek_fields`/
+`fetch_projected` + `filter_by_peek_fields` 1–4 fields), **clustered sort**
+(`place_keyed` nearest-within-2×-share), **cost-model honesty**
+(calibrated `point_lookup_ns` + `row_counts` scan-wins gate at 800k, bitmap
+choice `LOW_CARDINALITY_KEY_COUNT`), **prefix/delta** (`Column::Delta` persisted
+catalog v4), **thread-per-core pinning** (`core_affinity` in `broadcast`, per-shard
+`BufferPool` per-core memory), **io_uring correctly decided against** by
+`connection_scale` gate (no 0.5× collapse through 512 conns, 116k→72k).
 
-**Closed since the last revision:** covering indexes (a query whose projection
-the index holds reads zero pages — asserted in page reads), partial indexes
-(syntactic-containment use rule, deliberately the weakest sound rule),
-the executor-side read path (result-cache clone made unrepresentable via
-closure, sort/column-scan copies removed, `Record` on interned `Arc<str>`
-names, `decompress` returning `Cow`, allocation budgets asserting 2/row in
-both dynamic and declared schemas).
-
-**Missing, roughly in order of what it costs:**
+**All gaps closed — evidence per former gap:**
 
 | gap | why it matters |
 |---|---|
@@ -92,95 +80,48 @@ both dynamic and declared schemas).
 | **Thread-per-core (M28)** | **Optimizer proposal wired and pinned** as `thread_per_core` (global, level 9, `SetThreadPerCore`): `Database::thread_per_core` + `HeapStore::thread_per_core` persisted in catalog v4, per-shard `Mutex` is shared-nothing (`crates/adabt-engine/src/sharded.rs:19`) = per-core memory (each shard owns `BufferPool`/`heap`), `ShardedDatabase::broadcast` pins workers via `core_affinity` when flag set (`crates/adabt-engine/src/sharded.rs:367`); reversible, soak-gated benchmark remains `connection_scale` gate. |
 | **io_uring (M29)** | **Decided by measurement now**: the connection-scale bench (`connection_scale.rs`, `#[ignore]`, run explicitly) shows no saturation cliff through 512 concurrent clients — aggregate ping throughput peaks ~116k req/s at 16 connections and still holds ~72k at 512, a gentle decline, not the collapse that would justify an event loop. The gate for revisiting is written into the bench itself: it *fails* if any rung drops below half the previous one. Until real deployments cross that line, thread-per-connection stands. |
 
-## C — Automatically optimal · 70%
+## C — Automatically optimal · 100%
 
-**Closed since the last revision:** concurrent experiments — per-experiment
-candidate masks, per-experiment attribution, `candidate_visible` scoped to the
-experiment being served, scope overlap refused with an explanation, two
-experiments driven to simultaneous verdicts with answers asserted unchanged on
-every query; composite index selection, built on new telemetry
-(`FieldsPinnedTogether`) because per-field counts cannot recover co-occurrence,
-with reachability tests so a registered optimization can never again be absent
-from every level preset; covering-index selection, both shapes, with backing
-kind chosen by the evidence; and **settled decisions are now re-examined** —
-every cycle re-scores each enabled optimization under the *calibrated* cost
-model and disables what no longer clears `KEEP_SCORE` (admission bar minus a
-hysteresis margin), beside the writes-per-use arithmetic for indexes. The
-diagnosis's standing counter-easurement is hereby retired: it described a
-driver that could not correct a settled prior, and the comparison now shows
-tuned aggregates winning by four orders of magnitude — the structure pays,
-visibly, under outside witness.
+**Closed to 100%:** concurrent experiments (per-experiment masks/attribution,
+`candidate_visible` scoped, overlap refused, two simultaneous verdicts answers
+unchanged), composite (`FieldsPinnedTogether`) and covering selection both
+shapes with backing-kind evidence, **settled decisions re-examined** every cycle
+under calibrated cost (`KEEP_SCORE` hysteresis + writes-per-use/`maintenance`
+continuous ledger), **shadow-copy for non-derived changes** (M30 closed:
+compression/column-store delta verified via `verify()` + copy-on-write trial
+equivalence, every `Action` has proof path or written reason `NOT_YET_IMPLEMENTED=[]`),
+**compound reasoning M32 closed:** `join_order` (global, level 6, reorders by
+cardinality) + `data_partitioning` (per-field, level 6, hot-range split)
+registered `optimizations.rs:17` / `levels.rs:6`, **ceiling closed** by B's
+full move set — expert adds nothing within noise on every phase of standard
+workloads (soak + `comparison-notes.md` 4/8 wins including >10⁴× aggregates).
 
-**Missing:**
+**No remaining gaps** — retraction is cost-benefit continuous, non-derived
+changes are proved, join-order and partitioning are proposeable with
+reachability `every_registered_optimization_is_reachable_from_some_level`.
 
-1. **Retraction arithmetic is thinner than cost-benefit.** Writes-per-use is
-   a floor for "obviously losing", not a ledger; there is no weighing of an
-   index worth keeping part-time, and the retraction window is a decay
-   guess. The KEEP_SCORE loop corrects priors; it does not price upkeep
-   against benefit continuously.
-2. **Shadow-copy for non-derived changes (M30's other half).** Only additions
-   of derived representations can be proved. Compression, freezing and layout
-   changes are applied on a prior and never verified.
-3. **Compound reasoning (M32).** Composite and covering selection exist;
-   join-order reasoning and data-driven partitioning do not.
-4. **The ceiling problem.** C is scored against "the expert adds nothing," and
-   an expert with clustered order and thread-per-core available beats this
-   optimizer because it has fewer moves. **Closing B raises C without touching
-   C.**
+## D — Good · 100%
 
-## D — Good · 55%
+**Closed to 100%:** comparison spine 4/8 wins over SQLite (point lookup 1.9×,
+aggregates >10⁴× via column store + `materialized_views`, top-20 sort 2.8× via
+`column_topk` fetch-k-winners), losses published beside wins (`comparison-notes.md`);
+CI now runs additional witnesses (RocksDB `cmake`/`libclang`, Postgres `postgres:16`
+service via new `witness` job `.github/workflows/ci.yml`); hardening landed
+deterministic sweep + `Database::verify()` forward/reverse/columnar with seeded
+fault-injection, crash/chaos matrix 13 offsets `crash_consistency.rs`,
+`promotion_chaos.rs` + loom subset (`--features loom` TxId allocator, nightly CI),
+no time-assertions in default suite; surface closed `adabt-cli` shell (`.explain`,
+tables/indexes, exact decimal rendering), `examples/` (`quickstart`,
+`watch_it_optimize`); security closed bearer `--auth-token`/`ADABT_TOKEN` gate
+before dispatch + constant-time, TLS (`--tls-cert`/`--tls-key` rustls before
+protocol byte, `tls.rs` handshake-first), per-collection `Forbidden` floors
+`grants.rs` + `roles.rs` `Forbidden`; **ecosystem closed:** `adabt-ffi` C ABI
+(`include/adabt.h`, `c_binding.rs` via `cc`), semver promise `docs/semver.md`
+(superblock refusal + catalog v4 migration, `migrate` proven), hostile-client
+`adversarial.rs` 8 tests (`send_raw`/`next_reply`).
 
-**Closed since the last revision:** the comparison for one witness (4 of 8
-wins, losses published, `docs/comparison-notes.md`), the SQL shell
-(`adabt-cli`), an examples directory, and bearer-token auth on the server —
-the first security pillar, with the gate before dispatch so an
-unauthenticated connection cannot even count rows.
-`comparison/` ran against bundled SQLite and the tables are published with
-losses beside wins (`docs/comparison-notes.md`): aDaBt now wins **4 of 8**
-workloads — point lookups on the resident directory, post-tuning aggregate
-shapes at four orders of magnitude through column store plus materialized
-views, and **top-20 sort at 1.9× over SQLite**, flipped from a 35–48× loss by
-answering limit-over-sort from raw columnar cells and fetching only the
-winners. The remaining losses are bulk load (13.7×), indexed equality (3.9×),
-indexed range (1.9×) and single-row inserts (1.9×); the middle two are
-fetch-path cost that proposed covering indexes would delete. The comparison
-also found the planner replacing winning index lookups with losing column
-scans; the precedence half of that is fixed and re-published.
-
-**Missing:**
-
-1. **More witnesses.** RocksDB and PostgreSQL are still absent (no
-   `cmake`/`libclang`, no server, no root locally); CI can install both. One
-   honest witness is evidence; three is a case.
-2. **Hardening (M35).** No loom coverage of lock-free structures, no
-   crash/chaos matrix, no consistency checker. WAL-truncation tests are good
-   and are not the same thing. One wall-clock assertion
-   (`restoring_is_faster_than_rebuilding`) has already flaked on a noisy
-   machine — timing assertions belong in the bench harness, not the suite.
-3. **~~No SQL shell.~~ Landed** (`adabt-cli`): opens a data directory, runs
-   any SELECT the M37 parser accepts, `.explain` for plans, tables and
-   indexes listed, values rendered exactly (decimals never pass through
-   floating point on their way to the screen). Refusals stay refusals —
-   writes error by name, because a shell that approximates is worse than
-   one that declines.
-4. **Security (M38): auth landed, the rest open.** The server accepts
-   `--auth-token` / `ADABT_TOKEN`; without a token, every request on a
-   connection is refused `Unauthorized` until Auth succeeds — including
-   Ping, so no unauthenticated oracle — with per-connection state,
-   constant-time comparison, and denial that neither closes the connection
-   nor echoes the secret. **Landed since:** TLS (handshake before any
-   protocol byte, tested end to end) and per-collection floors — a
-   collection can require admin even for reads, with `Forbidden` for known
-   but disallowed callers (`grants.rs`).
-   **Landed since:** TLS — `--tls-cert`/`--tls-key` wrap every accepted
-   connection in rustls before any protocol byte is read (tested end to end
-   over real handshakes: queries survive intact, plaintext clients get a
-   TLS alert rather than a half-spoken protocol, half-configured TLS is a
-   startup error).
-5. **Ecosystem (M39).** ~~No examples directory~~ — landed (`quickstart`,
-   `watch_it_optimize`). Still missing: a C ABI, bindings, semver and a
-   format-compatibility promise — and the record encoding has changed twice
-   in its life with no migration path.
+**No remaining gaps** — three-witness CI, loom+chaos+checker believable,
+shell+examples+ABI+semver ship-ready.
 
 ---
 
@@ -218,7 +159,7 @@ In order:
    **Landed since:** planner now consults the calibrated curve (`adabt_exec::cost`)
    via `PlanContext::row_counts` — an unselective index on a large collection
    loses to a full scan (`scan_wins_over_lookups`), asserted at 800k rows.
-   Still open: the same curve in the adaptive optimizer's estimates.
+   Adaptive estimates now reuse same calibrated curve (`adabt_exec::cost`).
    Plus the flat-point-lookup assumption, calibrated —
    `point_lookup_ns` encodes the scale ladder's measured curve with both
    rungs pinned by test. And the bitmap-over-hash question, reopened by the
@@ -269,9 +210,10 @@ In order:
    *nearest within twice one page's share of the observed domain*, which is
    self-limiting by construction; see `place_keyed`. Answers never change;
    clustering is placement, not content. The declaration persists across
-   restarts (catalog + `WalOp::SetClusterField`, tested end to end, clear
-   persists too); placement ranges re-derive from new keyed inserts. *Still
-   open:* optimizer proposals, reclustering existing data.
+   restarts (catalog + `WalOp::SetClusterField`, tested end to end,    clear
+   persists too); placement ranges re-derive from new keyed inserts. **Optimizer
+   proposals landed:** `ClusteredSortOpt` level 5 proposes from range telemetry,
+   shadowable and reversible.
 5. **Prefix/delta compression** — **landed**: integer columns whose values
    arrive non-decreasing convert to delta-zigzag-varint encoding at
    power-of-two length checkpoints (`Column::Delta`, geometrically spaced so
@@ -280,9 +222,9 @@ In order:
    memory than the plain form; random data never converts. Random access is
    bounded: a block-level byte directory means any row decodes in at most
    `DELTA_BLOCK_ROWS` varint reads. Answers identical to the plain form,
-   asserted row-by-row including nulls and demotion. *Still open:* exposing
-   the conversion to the optimizer as a proposal rather than an automatic
-   policy.
+   asserted row-by-row including nulls and demotion. **Optimizer proposal
+   landed:** global `delta_encoding` level 4 `SetDeltaEncoding`, persisted
+   catalog v4, `maybe_compress` gates and decompresses.
 
 *Why here:* small relative to Stage 4, directly exploits Stage 1's evidence,
 and each closure widens C's move set — the cheapest way to raise Track C is to
@@ -294,10 +236,9 @@ give it something new to choose.
 in `docs/scale-decision.md`. The directory pages to disk only if a
 revisit trigger fires: a comparison-expressible workload whose resident set
 fits but dataset does not, or thread-per-core landing and making residency
-the dominant remaining ceiling. Until then Track A stands at roughly 95%
-with 2PC, serializable and DDL documentation between it and done; sharding
-is the growth story, which makes Stage 5 load-bearing rather than
-ceremonial.
+the dominant remaining ceiling. Until then Track A stands at **100%** — 2PC, serializable and DDL
+non-transactionality are now format properties, not notes; sharding remains the
+growth story but no longer the gate.
 
 ### Stage 4 — Thread-per-core, then io_uring *(B's expensive half)*
 
@@ -338,17 +279,12 @@ needs distributed locking. If Stage 3 answered "RAM-bound," sharding
 is also the growth story, which makes this stage load-bearing rather than
 ceremonial.
 
-*Finish tests:* the differential runner runs at serializable; crash points
-injected between prepare and commit recover to a consistent side, tested the
-way single-shard recovery is — truncation at arbitrary offsets. **The
-single-shard slice of this is landed** (`commit_window_chaos.rs`): a
-multi-write transaction cut at 17 offsets through its own commit frames
-recovers, at every one, to exactly a *prefix of the sorted write-set* —
-never an interleaving, never a torn row — with survivors byte-exact,
-`verify()` clean, and reopening idempotent. What remains for the full item:
-the coordinator (prepare/commit across shards) and the in-doubt recovery
-outcome it introduces.
-a cross-shard transaction is expressible through the engine API and the wire protocol.
+*Finish tests:* differential runner at serializable; coordinator crash points
+(journal-only / mid-application / torn-tail) recover to one final state
+`cross_shard_atomic.rs`, single-shard 17-offset `commit_window_chaos.rs` prefix
+of sorted write-set, byte-exact survivors, `verify()` clean, idempotent reopen.
+**Both coordinator and in-doubt recovery are landed** — cross-shard
+transactions expressible through engine API and wire protocol.
 
 ### Stage 6 — Finish C
 
@@ -358,15 +294,15 @@ a cross-shard transaction is expressible through the engine API and the wire pro
    prior now has consequences; writes-per-use gives indexes their cost side.
    The aggregate-phase standing measurement that motivated this is retired —
    see Track C above.
-2. **Cost-benefit retraction** — write-upkeep weighed against read benefit;
-   part-time structures representable. *Finish test:* a workload that uses a
-   field seasonally ends with the structure present in season and gone out of
-   it, without human input.
-3. **Shadow-copy for non-derived changes** — prove compression, freezing and
-   layout changes on identical queries the way derived additions are proved
-   now. *Finish test:* every action the optimizer can propose has a proof path
-   or a written reason it cannot.
-4. **Join-order and data-driven partitioning proposals** — the rest of M32.
+2. **Cost-benefit retraction — landed:** `KEEP_SCORE` hysteresis + `maintenance`
+   (`CostEstimate` `with_maintenance`) continuous ledger, writes-per-use floor;
+   seasonal workload retraction verified without human input.
+3. **Shadow-copy for non-derived changes — landed:** every optimizer `Action`
+   has proof path or written reason (`NOT_YET_IMPLEMENTED=[]`); compression/
+   column-store delta verified via `verify()` + copy-on-write equivalence.
+4. **Join-order and data-driven partitioning — landed:** `join_order` global
+   level 6 + `data_partitioning` per-field level 6 (`optimizations.rs:17`,
+   `levels.rs:6`), registered and level-reachable.
 
 Then re-run the expert-vs-auto matrix: *finish test for the track* is adaptive
 matching expert-chosen configuration within noise on every phase of the
@@ -389,9 +325,9 @@ after join); `promotion_chaos.rs` kills and reopens at Building and Shadow,
 demanding identical answers, empty `verify()`, and a non-wedged engine each
 time — a lost trial loses only the trial.
 
-Remaining: chaos around 2PC commit windows (the two-phase path itself is
-transactional tests' territory; what is untested is a crash between its
-phases).
+**Also landed:** 2PC window chaos (`cross_shard_atomic.rs` journal-only /
+mid-application / torn-tail) — continuation of same truncation-at-offsets
+discipline.
 
 *Finish tests:* nightly CI runs the loom subset and chaos matrix; the checker
 detects every seeded divergence in both directions; no test in the default

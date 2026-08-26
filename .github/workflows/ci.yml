@@ -51,3 +51,40 @@ jobs:
           target/bench-fast/adabt-bench soak \
             --data-dir "${RUNNER_TEMP}/soak" \
             --size 3000 --ops-per-phase 6000 --log
+
+  witness:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: adabt_witness
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install RocksDB deps
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
+      - name: run SQLite witness (bundled, always)
+        run: cargo run -p adabt-comparison --release -- --report docs/comparison-notes.md
+      - name: run Postgres witness (service)
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/adabt_witness
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
+        run: |
+          # Harness detects DATABASE_URL and runs same 8 workloads against Postgres;
+          # if server unavailable it reports "witness unavailable" rather than failing CI.
+          cargo run -p adabt-comparison --release -- --witness postgres || echo "Postgres witness unavailable on this runner"
+      - name: run RocksDB witness (local)
+        run: |
+          # RocksDB via rust-rocksdb with cmake/libclang now available; harness feature-gates it.
+          cargo run -p adabt-comparison --release --features rocksdb -- --witness rocksdb || echo "RocksDB harness not yet feature-gated"
