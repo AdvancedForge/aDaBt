@@ -93,6 +93,23 @@ pub trait LogicalStore {
     /// the reference model for reasons that are not bugs.
     fn scan(&mut self, collection: &str) -> Result<Vec<(RecordId, Record)>>;
 
+    /// One field of one record, decoding only what that field needs.
+    ///
+    /// `Ok(None)` — the row is gone. `Ok(Some(None))` — the row lives but
+    /// has no such field. `Ok(Some(Some(v)))` — here it is. The default
+    /// implementation fetches and discards, which is correct everywhere and
+    /// wasteful anywhere a record is wider than the question; storage layers
+    /// holding encoded rows override it with the codec's single-field walk
+    /// so an absent neighbour's text never allocates.
+    fn peek_field(
+        &mut self,
+        collection: &str,
+        id: RecordId,
+        field: &str,
+    ) -> Result<Option<Option<Value>>> {
+        Ok(self.get(collection, id)?.map(|r| r.get(field).cloned()))
+    }
+
     fn count(&mut self, collection: &str) -> Result<usize>;
 
     /// The ids of every live record, ascending — without reading the records.

@@ -25,6 +25,7 @@ use adabt_core::policy::Durability;
 use adabt_core::record::Record;
 use adabt_core::schema::Schema;
 use adabt_core::store::{normalize_for_storage, LogicalStore};
+use adabt_core::value::Value;
 #[cfg(feature = "loom")]
 use loom::sync::Arc;
 use std::collections::{BTreeMap, HashMap};
@@ -1975,6 +1976,38 @@ impl LogicalStore for HeapStore {
         };
         self.touched.insert(loc.page.0);
         Ok(Some(self.read_at(collection, loc)?))
+    }
+
+    fn peek_field(
+        &mut self,
+        collection: &str,
+        id: RecordId,
+        field: &str,
+    ) -> Result<Option<Option<Value>>> {
+        let Some(loc) = self
+            .coll(collection)?
+            .directory
+            .get(&id)
+            .and_then(|v| v.newest())
+        else {
+            return Ok(None);
+        };
+        let codec = &self
+            .collections
+            .get(collection)
+            .ok_or_else(|| Error::NoSuchCollection(collection.to_string()))?
+            .codec;
+        let page = self.pool.get(loc.page)?;
+        let payload = page.get(loc.slot)?;
+        if payload.len() < SLOT_PREFIX {
+            return Err(Error::Corruption(
+                "stored slot is shorter than its prefix".into(),
+            ));
+        }
+        let encoding = crate::compress::Encoding::from_bit(payload[SLOT_PREFIX - 1])?;
+        let bytes = crate::compress::decompress(encoding, &payload[SLOT_PREFIX..])?;
+        self.touched.insert(loc.page.0);
+        Ok(Some(codec.peek_field(&bytes, field)?))
     }
 
     fn update(&mut self, collection: &str, id: RecordId, mut rec: Record) -> Result<bool> {

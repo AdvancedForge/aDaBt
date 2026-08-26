@@ -3083,10 +3083,11 @@ impl Source for Database {
                 return Ok(Some(d.field_at(id, field)?));
             }
         }
-        match self.store.get(collection, id)? {
-            None => Ok(None),
-            Some(r) => Ok(Some(r.get(field).cloned())),
-        }
+        // The heap-backed fallback answers through the codec's single-field
+        // walk: a wide record's other text never decodes, let alone
+        // allocates. The trait default (fetch-and-discard) still backs any
+        // store that has not overridden it.
+        self.store.peek_field(collection, id, field)
     }
 
     fn fetch(&mut self, collection: &str, id: RecordId) -> Result<Option<Record>> {
