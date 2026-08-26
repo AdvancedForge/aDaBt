@@ -86,12 +86,16 @@
 //!
 //! # What this does not do
 //!
-//! Snapshot isolation, not serializability: two transactions with disjoint
-//! write-sets can still commit a result no serial execution would have
-//! produced (the classic write-skew anomaly). Serializability is later,
-//! policy-selectable work, matching how every other guarantee in this project
-//! is offered — as a choice, not a default forced on workloads that do not
-//! need it.
+//! Snapshot isolation by default; serializable on request. Two transactions
+//! with disjoint write-sets can, under plain snapshot isolation, commit a
+//! result no serial execution would have produced (the classic write-skew
+//! anomaly) — and that remains true when the policy says
+//! [`adabt_core::policy::Consistency::Snapshot`]. When the policy says
+//! [`adabt_core::policy::Consistency::Strict`], commit validates the read
+//! set with the same first-committer-wins rule the write set always had: a
+//! transaction whose observations went stale aborts, and the skew is closed.
+//! Reads are recorded either way so the guarantee stays a choice made at the
+//! policy, not a fork in the transaction code path.
 //!
 //! And nothing here reaches across shards. A `Transaction` is born from one
 //! `Database` and can only write to it; a transfer between two shards needs a
@@ -118,6 +122,15 @@ pub struct Transaction {
     id: TransactionId,
     snapshot: Snapshot,
     writes: HashMap<(String, RecordId), Write>,
+    /// Every row this transaction observed through its snapshot — via `get`
+    /// (including reads that found nothing) and `scan`. Recorded always, so
+    /// the isolation decision can be made at commit rather than frozen at
+    /// begin; validated only when the policy demands serializable, where a
+    /// read row modified since the snapshot aborts the commit and closes
+    /// write skew. Under plain snapshot isolation this list is written but
+    /// never read, which is the cost of keeping one code path for both
+    /// guarantees.
+    reads: std::collections::HashSet<(String, RecordId)>,
 }
 
 impl Transaction {
@@ -126,6 +139,7 @@ impl Transaction {
             id,
             snapshot,
             writes: HashMap::new(),
+            reads: std::collections::HashSet::new(),
         }
     }
 
@@ -152,12 +166,17 @@ impl Transaction {
         &self.writes
     }
 
+    /// Every row this transaction read through its snapshot.
+    pub(crate) fn reads(&self) -> &std::collections::HashSet<(String, RecordId)> {
+        &self.reads
+    }
+
     /// Read as this transaction sees it: its own buffered writes first, then
     /// its snapshot. A record this transaction deleted reads as absent even
     /// though the snapshot still holds it; one it inserted reads back even
     /// though the snapshot predates it.
     pub fn get(
-        &self,
+        &mut self,
         db: &mut crate::Database,
         collection: &str,
         id: RecordId,
@@ -168,6 +187,10 @@ impl Transaction {
                 Write::Delete => None,
             });
         }
+        // A row the transaction observed through the snapshot is part of its
+        // read set — absence included, since "no row here yet" is exactly
+        // what write skew exploits.
+        self.reads.insert((collection.to_string(), id));
         db.get_at(collection, id, &self.snapshot)
     }
 
@@ -175,7 +198,7 @@ impl Transaction {
     /// own writes overlaid. Ascending by id, matching every other scan in this
     /// project.
     pub fn scan(
-        &self,
+        &mut self,
         db: &mut crate::Database,
         collection: &str,
     ) -> Result<Vec<(RecordId, Record)>> {
@@ -195,6 +218,12 @@ impl Transaction {
                     rows.remove(id);
                 }
             }
+        }
+        // Every row the scan observed joins the read set, same as `get` —
+        // a predicate evaluated over a scan is precisely what write skew
+        // reads behind.
+        for id in rows.keys() {
+            self.reads.insert((collection.to_string(), *id));
         }
         Ok(rows.into_iter().collect())
     }

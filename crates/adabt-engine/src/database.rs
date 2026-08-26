@@ -1172,6 +1172,30 @@ impl Database {
             }
         }
 
+        // Serializable posture (`Consistency::Strict`): the read set gets the
+        // same first-committer-wins check the write set already had. This is
+        // what closes write skew — a transaction whose *observations* went
+        // stale between its snapshot and its commit aborts instead of
+        // committing a result no serial execution would have produced. Under
+        // `Consistency::Snapshot` this pass does not run and the guarantee is
+        // snapshot isolation exactly as documented. (The enum's ordinal runs
+        // strongest-first, so an inequality here would silently include
+        // `Eventual`; the guarantee is named exactly or not at all.)
+        if self.policy.guarantees.consistency == adabt_core::policy::Consistency::Strict {
+            for (collection, id) in txn.reads() {
+                if !txn.writes().contains_key(&(collection.clone(), *id)) {
+                    if let Some(ts) = self.store.latest_write_ts(collection, *id)? {
+                        if ts.0 > snapshot_at.0 {
+                            return Err(Error::TransactionConflict {
+                                collection: collection.clone(),
+                                id: *id,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         // Every check above passed against state that cannot have changed in
         // between — nothing else can touch `&mut self` while this call is on
         // the stack — so nothing from here on can fail for a reason this

@@ -318,7 +318,13 @@ and it is measured against outside engines, not against aDaBt's own past.
 
 A coordinator over the format that has been waiting since M19, and
 serializable as a selectable guarantee mapped onto conflict detection over the
-version chains that already exist. If Stage 3 answered "RAM-bound," sharding
+version chains that already exist. **Serializable is landed** —
+`Consistency::Strict`, declared since the guarantees existed and enforced
+nowhere, now means it: commit validates the read set with the same
+first-committer-wins rule as the write set, closing write skew
+(`serializable.rs` runs the same interleaving under both settings — both
+commits under Snapshot, second refused under Strict; innocent workloads pay
+nothing). If Stage 3 answered "RAM-bound," sharding
 is also the growth story, which makes this stage load-bearing rather than
 ceremonial.
 

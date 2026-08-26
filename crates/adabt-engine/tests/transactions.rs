@@ -87,7 +87,7 @@ fn a_reader_started_before_the_commit_sees_neither_write() {
     // about a shared commit timestamp argues cannot happen here.
     let t = Tmp::new("isolation");
     let mut db = open(t.path());
-    let reader = db.begin();
+    let mut reader = db.begin();
 
     let mut writer = db.begin();
     writer
@@ -117,7 +117,7 @@ fn a_reader_begun_after_the_commit_sees_both_writes() {
         .unwrap();
     db.commit(writer).unwrap();
 
-    let reader = db.begin();
+    let mut reader = db.begin();
     assert_eq!(
         reader.get(&mut db, "accounts", RecordId(1)).unwrap(),
         Some(rec(1, "a", 100))

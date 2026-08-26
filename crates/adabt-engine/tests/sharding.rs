@@ -525,7 +525,7 @@ fn a_transaction_on_one_shard_is_invisible_to_a_reader_on_the_same_shard_until_c
     let shard = db.shard(2).unwrap();
     let mut guard = shard.lock().unwrap();
 
-    let reader = guard.begin();
+    let mut reader = guard.begin();
     let mut writer = guard.begin();
     writer
         .insert(&mut guard, "users", RecordId(5), rec(5))
