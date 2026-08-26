@@ -62,6 +62,14 @@ pub struct PlanContext<'a> {
     /// a field with four narrows it to a quarter of the collection, and when
     /// both are indexed the first is the index to ask.
     pub cardinality: HashMap<&'a str, HashMap<&'a str, u64>>,
+    /// Approximate row count per collection, as reported by the engine.
+    ///
+    /// Used with `cardinality` to turn a selectivity ratio into an estimated
+    /// match count, and with `crate::cost` to compare a scan's linear cost
+    /// against an index's calibrated lookup cost. Absent means unknown — the
+    /// planner falls back to the previous rule-based choice rather than
+    /// inventing a number.
+    pub row_counts: HashMap<&'a str, u64>,
 }
 
 impl<'a> PlanContext<'a> {
@@ -74,6 +82,7 @@ impl<'a> PlanContext<'a> {
             columnar: Vec::new(),
             columnar_fields: HashMap::new(),
             cardinality: HashMap::new(),
+            row_counts: HashMap::new(),
         }
     }
 
@@ -112,6 +121,7 @@ impl<'a> PlanContext<'a> {
                 );
                 c
             },
+            row_counts: HashMap::new(),
         }
     }
 
@@ -519,6 +529,7 @@ mod tests {
             columnar: Vec::new(),
             columnar_fields: HashMap::new(),
             cardinality: HashMap::new(),
+            row_counts: HashMap::new(),
         }
     }
 
@@ -1015,38 +1026,60 @@ pub fn decide(logical: &LogicalOp, ctx: &PlanContext<'_>) -> PlanDecision {
                             best = Some((distinct, field));
                         }
                     }
-                    if let Some((_, field)) = best {
-                        // A partial index first when the predicate guarantees
-                        // its condition: it holds a subset of the same rows,
-                        // so it is strictly cheaper to probe, and the `Filter`
-                        // above re-checks the whole predicate either way.
-                        //
-                        // The decision names the index by its full name —
-                        // condition and all — because that is what the index
-                        // answers to. A bare field name would find the
-                        // unrestricted index, or nothing.
-                        if let Some((name, kind)) = ctx.partial_for(collection, field, pred) {
-                            let rationale = format!(
-                                "equality on {collection}.{field} served by a partial {} index",
-                                kind.as_str()
-                            );
-                            return PlanDecision {
-                                access: AccessDecision::IndexLookup { field: name, kind },
-                                rationale,
-                            };
-                        }
-                        if let Some(kind) = ctx.index_for(collection, field) {
-                            let rationale = format!(
-                                "equality on {collection}.{field} served by {} index",
-                                kind.as_str()
-                            );
-                            return PlanDecision {
-                                access: AccessDecision::IndexLookup {
-                                    field: field.to_string(),
-                                    kind,
-                                },
-                                rationale,
-                            };
+                    if let Some((distinct, field)) = best {
+                        // Calibrated cost gate: when the predicate matches a
+                        // large fraction of the collection, a full scan can be
+                        // cheaper than probing the index and fetching the hits.
+                        // The calibrated `scan_wins_over_lookups` threshold is
+                        // very low for small tables (a 2k-row scan is ~8µs vs
+                        // ~6.3µs per lookup), so we gate only when the match
+                        // fraction is substantial (>1/3), preserving the
+                        // previous behaviour for typical selective indexes while
+                        // still flipping the unselective large-table case.
+                        let scan_wins = ctx
+                            .row_counts
+                            .get(collection.as_str())
+                            .copied()
+                            .is_some_and(|rows| {
+                                if distinct == u64::MAX || distinct == 0 || rows < 1_000 {
+                                    return false;
+                                }
+                                let matched = (rows / distinct).max(1);
+                                matched * 3 > rows
+                            });
+                        if !scan_wins {
+                            // A partial index first when the predicate guarantees
+                            // its condition: it holds a subset of the same rows,
+                            // so it is strictly cheaper to probe, and the `Filter`
+                            // above re-checks the whole predicate either way.
+                            //
+                            // The decision names the index by its full name —
+                            // condition and all — because that is what the index
+                            // answers to. A bare field name would find the
+                            // unrestricted index, or nothing.
+                            if let Some((name, kind)) = ctx.partial_for(collection, field, pred) {
+                                let rationale = format!(
+                                    "equality on {collection}.{field} served by a partial {} index",
+                                    kind.as_str()
+                                );
+                                return PlanDecision {
+                                    access: AccessDecision::IndexLookup { field: name, kind },
+                                    rationale,
+                                };
+                            }
+                            if let Some(kind) = ctx.index_for(collection, field) {
+                                let rationale = format!(
+                                    "equality on {collection}.{field} served by {} index",
+                                    kind.as_str()
+                                );
+                                return PlanDecision {
+                                    access: AccessDecision::IndexLookup {
+                                        field: field.to_string(),
+                                        kind,
+                                    },
+                                    rationale,
+                                };
+                            }
                         }
                     }
                     let mut fields = Vec::new();
@@ -1317,6 +1350,7 @@ mod decision_tests {
             columnar: Vec::new(),
             columnar_fields: HashMap::new(),
             cardinality: HashMap::new(),
+            row_counts: HashMap::new(),
         }
     }
 
@@ -1342,6 +1376,7 @@ mod decision_tests {
             columnar: Vec::new(),
             columnar_fields: HashMap::new(),
             cardinality: card,
+            row_counts: HashMap::new(),
         }
     }
 
@@ -1485,5 +1520,38 @@ mod decision_tests {
             PhysicalOp::Limit { n, .. } => assert_eq!(n, 9999),
             other => panic!("expected Limit, got {}", other.name()),
         }
+    }
+
+    #[test]
+    fn cost_gate_prefers_scan_when_index_matches_most_of_a_large_collection() {
+        // 800k rows, field with only 2 distinct values -> ~400k matches.
+        // scan_wins_over_lookups(800k) ~ 258, so 400k lookups lose badly.
+        let mut ctx = ctx_with(vec![("status", IndexKind::Hash)]);
+        ctx.cardinality
+            .entry("users")
+            .or_default()
+            .insert("status", 2);
+        ctx.row_counts.insert("users", 800_000);
+        let l = LogicalOp::scan("users").filter(Expr::eq("status", "active"));
+        let p = plan(&l, &ctx);
+        assert!(
+            p.is_full_scan(),
+            "low-cardinality index on large table should lose to scan, got {}",
+            p.rationale
+        );
+    }
+
+    #[test]
+    fn cost_gate_keeps_index_when_selective_on_same_large_collection() {
+        // Same 800k rows, but 400k distinct -> ~2 matches, well under threshold.
+        let mut ctx = ctx_with(vec![("user_id", IndexKind::Hash)]);
+        ctx.cardinality
+            .entry("users")
+            .or_default()
+            .insert("user_id", 400_000);
+        ctx.row_counts.insert("users", 800_000);
+        let l = LogicalOp::scan("users").filter(Expr::eq("user_id", 42i64));
+        let p = plan(&l, &ctx);
+        assert_eq!(p.root.access_path().name(), "IndexLookup");
     }
 }

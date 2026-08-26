@@ -2102,6 +2102,12 @@ impl Database {
                 }
             }
         }
+        let mut row_counts: HashMap<&str, u64> = HashMap::new();
+        for c in m.keys().copied().chain(columnar.iter().copied()) {
+            if let Some(n) = self.store.live_count(c) {
+                row_counts.insert(c, n);
+            }
+        }
         PlanContext {
             indexes: m,
             composite,
@@ -2110,6 +2116,7 @@ impl Database {
             columnar,
             columnar_fields,
             cardinality: card,
+            row_counts,
         }
     }
 

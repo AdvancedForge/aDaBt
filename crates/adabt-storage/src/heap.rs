@@ -318,6 +318,17 @@ pub enum RecoverTarget {
 }
 
 impl HeapStore {
+    /// Approximate live row count without taking `&mut`.
+    ///
+    /// Used by the planner's calibrated cost model: an index that matches a
+    /// large fraction of the collection can be more expensive than a scan, but
+    /// that comparison needs both `rows` and `distinct`. This is the `rows`
+    /// half, and keeping it `&self` lets `plan_context` be `&self`.
+    pub fn live_count(&self, collection: &str) -> Option<u64> {
+        let c = self.collections.get(collection)?;
+        Some(c.directory.values().filter(|v| !v.is_absent()).count() as u64)
+    }
+
     pub fn heap_path(dir: &Path) -> PathBuf {
         dir.join("heap.adabt")
     }

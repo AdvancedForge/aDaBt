@@ -1338,6 +1338,7 @@ mod tests {
                 columnar: Vec::new(),
                 columnar_fields: HashMap::new(),
                 cardinality: HashMap::new(),
+                row_counts: HashMap::new(),
             }
         }
     }
@@ -1507,6 +1508,7 @@ mod tests {
                 columnar: Vec::new(),
                 columnar_fields: HashMap::new(),
                 cardinality: HashMap::new(),
+                row_counts: HashMap::new(),
             }
         }
     }
@@ -1650,6 +1652,7 @@ mod tests {
                 columnar: Vec::new(),
                 columnar_fields: HashMap::new(),
                 cardinality: HashMap::new(),
+                row_counts: HashMap::new(),
             },
         );
         let mut stats = ExecStats::default();
