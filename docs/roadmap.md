@@ -88,7 +88,7 @@ both dynamic and declared schemas).
 | **Thread-per-core (M28)** | Everything is one `Mutex` deep. On any modern core count this is the dominant ceiling, and the largest single item on the track. |
 | **Zero-copy fetch, the literal remainder** | The executor integration **landed**: `Source::peek_field` (tri-state — row gone / field absent / value) with a defaulted fetch-and-project fallback, and a fused filter that decides single-field predicates over a heap scan from peeked fields, fetching full rows only for survivors. Decode cost now tracks selectivity, not table size. What remains is the literal borrowed view: a batch type holding borrowed rows over decoded pages, so even the surviving fetch stops materializing owned records. |
 | **Clustered sort order** | The mechanism landed (see Stage 2 item 4); what remains is persisting the declaration across restarts and letting the optimizer propose it. |
-| **Cost-model honesty** | The bitmap-over-hash preference **is decided by benchmark now**: `index-scale` measured the two tying on latency at every scale (100k–1M rows, ~6% memory for bitmap on low-cardinality fields), and with per-field key counts available O(1) from each index, the tie goes to bitmap when cardinality proves the field small — planner and executor apply the same rule from one shared constant (`LOW_CARDINALITY_KEY_COUNT`), asserted end to end in `bitmap_choice.rs` and at both creation orders. Still open: the flat-point-lookup assumption (measured 6.3 µs at 100k rows → 12.4 µs at 800k) awaits a size-aware term in the estimates. |
+| **Cost-model honesty** | The bitmap-over-hash preference **is decided by benchmark now**: `index-scale` measured the two tying on latency at every scale (100k–1M rows, ~6% memory for bitmap on low-cardinality fields), and with per-field key counts available O(1) from each index, the tie goes to bitmap when cardinality proves the field small — planner and executor apply the same rule from one shared constant (`LOW_CARDINALITY_KEY_COUNT`), asserted end to end in `bitmap_choice.rs` and at both creation orders. The flat-point-lookup assumption is **calibrated now**: `adabt_exec::cost::point_lookup_ns` encodes the measured log-linear curve (6.3 µs at the 100k anchor, +2 µs per doubling, flat below it) with tests pinning both rungs — consumers inherit corrections by re-anchoring one module after a bench run rather than transcribing constants. |
 | **Prefix/delta compression** | Dictionary encoding landed; these two did not. |
 | **io_uring (M29)** | Needs an async storage path first. Real, but last. |
 
@@ -215,8 +215,11 @@ In order:
    serves through the index, aggregate wins untouched. Landed alongside it:
    **columnar top-K** (`docs/comparison-notes.md`), which took the worst
    loss on the board to a 1.9× win over SQLite and added a move to C's set.
-   Still open: the flat-point-lookup assumption every estimate carries.
-   **Landed since:** the bitmap-over-hash question, reopened by the
+   Still open: wiring the calibrated curve (`adabt_exec::cost`) into the
+   adaptive optimizer's estimates.
+   **Landed since:** the flat-point-lookup assumption, calibrated —
+   `point_lookup_ns` encodes the scale ladder's measured curve with both
+   rungs pinned by test. Plus the bitmap-over-hash question, reopened by the
    cardinality signal exactly as its own comment predicted and settled by
    measurement — low-cardinality fields serve through their bitmap (same
    latency, ~6% memory), everything else keeps hash-first; one shared
@@ -320,15 +323,23 @@ and it is measured against outside engines, not against aDaBt's own past.
 
 ### Stage 5 — Cross-shard 2PC and serializable *(finishes A)*
 
-A coordinator over the format that has been waiting since M19, and
-serializable as a selectable guarantee mapped onto conflict detection over the
-version chains that already exist. **Serializable is landed** —
+**Both halves are landed.**
+Serializable —
 `Consistency::Strict`, declared since the guarantees existed and enforced
 nowhere, now means it: commit validates the read set with the same
 first-committer-wins rule as the write set, closing write skew
 (`serializable.rs` runs the same interleaving under both settings — both
 commits under Snapshot, second refused under Strict; innocent workloads pay
-nothing). If Stage 3 answered "RAM-bound," sharding
+nothing). And the coordinator exists: `ShardedDatabase::commit_coordinated`
+runs the coordinator-decides protocol over a fsynced journal of the whole
+write-set (`CrossShardWrite`, riding the WAL's own value TLV), applies
+shard-by-shard with put-overwrite semantics so replay over any partially-
+applied prefix converges, and `open` re-drives anything left pending before
+answering a query. `cross_shard_atomic.rs` stages every crash point by hand
+— journal-only, mid-application, torn journal tail — and holds all of them
+to one final state. The honest boundary, documented at the API: another
+connection can observe shards disagreeing inside the window; hiding that
+needs distributed locking. If Stage 3 answered "RAM-bound," sharding
 is also the growth story, which makes this stage load-bearing rather than
 ceremonial.
 

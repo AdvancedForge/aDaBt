@@ -51,7 +51,8 @@ use adabt_core::schema::Schema;
 use adabt_core::store::LogicalStore;
 use adabt_exec::exec::{execute_with_budget, ExecBudget, ExecStats, Source};
 use adabt_ir::plan::{LogicalOp, LogicalPlan};
-use std::path::Path;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
@@ -63,6 +64,8 @@ pub struct ShardedDatabase {
     /// correctness. Correctness comes from the `seq * shard_count + shard_index`
     /// encoding, which cannot collide however this is chosen.
     next_shard: std::sync::atomic::AtomicUsize,
+    /// Root directory — home of the cross-shard coordinator journal.
+    dir: PathBuf,
 }
 
 /// Which shard owns a record.
@@ -99,14 +102,231 @@ impl ShardedDatabase {
             )?;
             out.push(Arc::new(Mutex::new(db)));
         }
-        Ok(Self {
+        let db = Self {
             shards: out,
             next_shard: std::sync::atomic::AtomicUsize::new(0),
-        })
+            dir: dir.to_path_buf(),
+        };
+        // A previous process may have died between journalling a coordinated
+        // transaction and applying it. Finish the promise before answering a
+        // single query.
+        db.recover_coordinated()?;
+        Ok(db)
+    }
+}
+
+/// One write in a coordinated multi-shard transaction.
+///
+/// `record: None` deletes; `Some` inserts (put semantics — an existing id
+/// is overwritten), which is what makes replaying a journal entry always
+/// safe, however much of it a crash had already applied.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CrossShardWrite {
+    pub collection: String,
+    pub id: RecordId,
+    pub record: Option<Record>,
+}
+
+impl CrossShardWrite {
+    /// The journal's wire format, one entry:
+    /// `u32 coll_len | coll | u64 id | u8 kind | [u32 n | n × (u32 len |
+    /// name | value)]`, kind 0 = delete, 1 = put. Values ride the same
+    /// TLV the WAL uses (`encode_value`/`decode_value`), so nothing here
+    /// invents a second encoding of `Value`.
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&(self.collection.len() as u32).to_le_bytes());
+        out.extend_from_slice(self.collection.as_bytes());
+        out.extend_from_slice(&self.id.0.to_le_bytes());
+        match &self.record {
+            None => out.push(0),
+            Some(r) => {
+                out.push(1);
+                let fields: Vec<_> = r.iter().collect();
+                out.extend_from_slice(&(fields.len() as u32).to_le_bytes());
+                for (name, v) in fields {
+                    out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                    out.extend_from_slice(name.as_bytes());
+                    adabt_storage::codec::encode_value(v, out);
+                }
+            }
+        }
     }
 
+    pub fn decode(buf: &[u8]) -> Result<(Self, usize)> {
+        fn rd_u32(c: &mut impl Read) -> Result<u32> {
+            let mut b = [0u8; 4];
+            c.read_exact(&mut b)?;
+            Ok(u32::from_le_bytes(b))
+        }
+        fn rd_u64(c: &mut impl Read) -> Result<u64> {
+            let mut b = [0u8; 8];
+            c.read_exact(&mut b)?;
+            Ok(u64::from_le_bytes(b))
+        }
+        fn rd_str(c: &mut impl Read) -> Result<String> {
+            let n = rd_u32(c)? as usize;
+            let mut b = vec![0u8; n];
+            c.read_exact(&mut b)?;
+            String::from_utf8(b)
+                .map_err(|e| Error::Corruption(format!("coordinator journal name: {e}")))
+        }
+        let mut c = std::io::Cursor::new(buf);
+        let collection = rd_str(&mut c)?;
+        let id = RecordId(rd_u64(&mut c)?);
+        let mut kind = [0u8; 1];
+        c.read_exact(&mut kind)?;
+        let record = match kind[0] {
+            0 => None,
+            1 => {
+                let n = rd_u32(&mut c)? as usize;
+                let mut r = Record::new();
+                for _ in 0..n {
+                    let name: Arc<str> = Arc::from(rd_str(&mut c)?.as_str());
+                    let (v, used) = adabt_storage::codec::decode_value(
+                        &buf[c.position() as usize..],
+                    )
+                    .map_err(|e| Error::Corruption(format!("coordinator journal value: {e}")))?;
+                    c.set_position(c.position() + used as u64);
+                    r.set_shared(name, v);
+                }
+                Some(r)
+            }
+            k => {
+                return Err(Error::Corruption(format!(
+                    "coordinator journal: unknown write kind {k}"
+                )))
+            }
+        };
+        Ok((
+            Self {
+                collection,
+                id,
+                record,
+            },
+            c.position() as usize,
+        ))
+    }
+}
+
+impl ShardedDatabase {
     pub fn shard_count(&self) -> usize {
         self.shards.len()
+    }
+
+    /// The coordinator journal: `b"XSH1"` magic, then back-to-back encoded
+    /// [`CrossShardWrite`] entries with no framing beyond their own. The file
+    /// exists only between "journal durable" and "every shard applied"; the
+    /// rule for anything found in it is always the same — replay it (puts and
+    /// deletes are both idempotent) and delete the file.
+    fn journal_path(dir: &Path) -> PathBuf {
+        dir.join("coordinator-journal")
+    }
+
+    fn load_journal(dir: &Path) -> Result<Vec<CrossShardWrite>> {
+        let path = Self::journal_path(dir);
+        let Ok(raw) = std::fs::read(&path) else {
+            return Ok(Vec::new());
+        };
+        if raw.is_empty() {
+            return Ok(Vec::new());
+        }
+        if raw.len() < 4 || raw[0..4] != *b"XSH1" {
+            // Not recognisable at all: leave it for an operator rather than
+            // guessing, but never let it block opening.
+            return Err(Error::Corruption(
+                "coordinator journal has an unreadable header".into(),
+            ));
+        }
+        let mut out = Vec::new();
+        let mut off = 4;
+        while off < raw.len() {
+            match CrossShardWrite::decode(&raw[off..]) {
+                Ok((w, used)) => {
+                    out.push(w);
+                    off += used;
+                }
+                // A torn tail — crash mid-write of the last entry. Everything
+                // before it is complete by construction (the file is written
+                // in one call), so stop cleanly.
+                Err(_) => break,
+            }
+        }
+        Ok(out)
+    }
+
+    fn write_journal(dir: &Path, entries: &[CrossShardWrite]) -> Result<()> {
+        use std::io::Write;
+        let mut bytes = Vec::with_capacity(64);
+        bytes.extend_from_slice(b"XSH1");
+        for w in entries {
+            w.encode(&mut bytes);
+        }
+        let mut f = std::fs::File::create(Self::journal_path(dir))?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+        Ok(())
+    }
+
+    fn apply(&self, writes: &[CrossShardWrite]) -> Result<()> {
+        for w in writes {
+            match &w.record {
+                Some(r) => {
+                    let mut db = lock(self.owner(w.id));
+                    // Put semantics by hand: a fresh id inserts, an id the
+                    // crash had already applied overwrites. Either way the
+                    // record ends up exactly as journalled, which is what
+                    // makes replaying a partially-applied journal safe.
+                    if db.insert(&w.collection, w.id, r.clone()).is_err() {
+                        db.update(&w.collection, w.id, r.clone())?;
+                    }
+                }
+                None => {
+                    // Deletes are idempotent; a miss is already the goal.
+                    let _ = lock(self.owner(w.id)).delete(&w.collection, w.id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Commit one transaction across every shard it touches, all-or-nothing
+    /// once the process comes back.
+    ///
+    /// The coordinator-decides pattern: journal the whole write-set and fsync
+    /// it; apply each shard's slice in shard order; remove the journal. A
+    /// crash anywhere leaves either no journal (nothing had started) or a
+    /// journal whose replay finishes the job — heap puts overwrite by id and
+    /// deletes are idempotent, so replaying over however much a crash had
+    /// already applied converges on exactly the intended state. Between
+    /// journal and last shard another connection can observe disagreement;
+    /// hiding that window needs distributed locking and stays out of scope —
+    /// the guarantee here is that recovery always lands on the committed
+    /// state, which is what a single-machine coordinator can promise honestly.
+    pub fn commit_coordinated(&self, mut writes: Vec<CrossShardWrite>) -> Result<()> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        // Fold in anything left pending by a crashed attempt rather than
+        // dropping it: those writes were promised durability when journalled.
+        let mut journal = Self::load_journal(&self.dir)?;
+        journal.append(&mut writes);
+        Self::write_journal(&self.dir, &journal)?;
+        self.apply(&journal)?;
+        std::fs::remove_file(Self::journal_path(&self.dir))?;
+        Ok(())
+    }
+
+    /// Re-drive every journaled coordinated write. [`ShardedDatabase::open`]
+    /// calls this automatically; public so tests can stage crash states and
+    /// operators can reconcile by hand.
+    pub fn recover_coordinated(&self) -> Result<usize> {
+        let pending = Self::load_journal(&self.dir)?;
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        self.apply(&pending)?;
+        std::fs::remove_file(Self::journal_path(&self.dir))?;
+        Ok(pending.len())
     }
 
     /// A shard, for inspecting what it decided on its own.

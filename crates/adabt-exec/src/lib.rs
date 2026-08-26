@@ -1,6 +1,7 @@
 //! Query planning and execution.
 
 pub mod batch;
+pub mod cost;
 pub mod exec;
 pub mod physical;
 pub mod planner;
