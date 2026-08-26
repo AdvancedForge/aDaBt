@@ -46,6 +46,10 @@ Guarantee is **coordinator-decides durability**, not linearizable atomicity: bet
 
 `IndexKind::{Hash,BTree,Bitmap}`, `LOW_CARDINALITY_KEY_COUNT=256`, covering (`COVER_SEP` `\x01`) and composite (`COMPOSITE_SEP` `\0`) names, `partial` predicate syntactic-containment. `ColumnStore` (`column_topk` k-winners), `DirectArray` (Fixed schemas, `physical_record_size` stride), `MaterializedViews` (exact while integer, `verify` excludes).
 
+## Execution / Optimizer
+
+`Source::fetch` + `peek_field` (tri-state) + `fetch_projected`/`get_projected` (`RecordCodec::peek_fields`, `LogicalStore::get_projected`, `Database::fetch_projected` handles `DirectArray` per-field O(1) and `HeapStore` codec walk; `filter_by_peek_fields` 1–4 fields, `fetch_projected_batches` for Project-aware callers). `ExecBudget` (`max_ram_bytes` + `cancel` polled every 4096 rows). `Optimization` 17/17 level-reachable (`plan_cache`, `result_cache`, `buffer_pool`, `auto_index`, `auto_composite_index`, `auto_covering_index`, `record_compression`, `column_store`, `freeze_schema`, `direct_lookup`, `prefetch`, `materialized_view`, `clustered_sort`, `delta_encoding`, `thread_per_core`, `join_order`, `data_partitioning`) via `Action::{CreateIndex,SetColumnStore,SetDeltaEncoding,SetThreadPerCore,SetJoinOrder,SetDataPartitioning,SetClusterField,...}` — all `is_shadowable` or written reason, `NOT_YET_IMPLEMENTED=[]`.
+
 ## Errors
 
 `Error::RecordExists`, `TransactionConflict {collection,id}`, `Corruption`, `Unsupported`, `RestoreTargetUnreachable`, `NoSuchCollection`. `Frame::decode` is lenient (7-byte TLS alert parses, not half-answer).

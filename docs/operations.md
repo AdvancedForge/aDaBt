@@ -2,6 +2,15 @@
 
 ## Build & verify (private repo, no GH Actions)
 
+Enforced locally, not via Actions (private repo has no runner):
+
+```sh
+bash scripts/check.sh          # fmt --check + clippy -D warnings + test --workspace + loom subset + comparison sanity + doc
+git config core.hooksPath .githooks  # enables pre-push gate (runs check.sh)
+```
+
+Or manually:
+
 ```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
@@ -10,12 +19,12 @@ cargo test --workspace --features loom   # TxId allocator model-check
 cargo doc --workspace --no-deps
 ```
 
-Separate workspace harness:
+Separate workspace harness (planned witnesses are *not yet real drivers* — harness is fail-fast until `postgres`/`rocksdb` deps exist, see `comparison/src/main.rs:8`):
 
 ```sh
 cargo run --manifest-path comparison/Cargo.toml --release              # SQLite witness (bundled, always)
-cargo run --manifest-path comparison/Cargo.toml --release -- --witness postgres  # requires DATABASE_URL, fail-fast if unavailable
-cargo run --manifest-path comparison/Cargo.toml --release --features rocksdb -- --witness rocksdb  # requires cmake/libclang, fail-fast
+cargo run --manifest-path comparison/Cargo.toml --release -- --witness postgres  # planned: requires DATABASE_URL, currently exits 2 fail-fast
+cargo run --manifest-path comparison/Cargo.toml --release --features rocksdb -- --witness rocksdb  # planned: requires cmake/libclang, currently exits 2 fail-fast
 cargo build --profile bench-fast -p adabt-bench
 target/bench-fast/adabt-bench soak --data-dir /var/tmp/soak --size 3000 --ops-per-phase 6000 --log
 ```

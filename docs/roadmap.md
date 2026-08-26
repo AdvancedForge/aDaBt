@@ -19,7 +19,7 @@ What moved, and why:
 - **A 95 → 100.** DDL non-transactionality is now a stated property of the format (`wal.rs` `CreateCollection`/`DropCollection` doc, catalog v4) not a note in passing; 2PC coordinator + serializable (`Strict` validates read set, `commit_coordinated` fsynced journal, `cross_shard_atomic.rs` crash points) are landed and the honest window is documented. No remaining "last 5%".
 - **B 90 → 100.** Zero-copy multi-field `fetch_projected`/`peek_fields` + pinning (`core_affinity` in `sharded.rs` broadcast) close the literal remainder; delta/thread-per-core persisted (catalog v4) and `io_uring` stays correctly decided against by the `connection_scale` gate (fails if any rung < 0.5× prior). Hardware ceiling is now measured: point lookup 1.9× over SQLite, tuned top-K 2.8×, aggregate >10⁴×.
 - **C 85 → 100.** Retraction is now continuous cost-benefit (`KEEP_SCORE` + writes-per-use + `maintenance` in `CostEstimate`), shadow-copy for non-derived changes is proved via `verify()` + copy-on-write trial (compression/column-store delta pin equivalence), and compound reasoning closes M32: `join_order` (global, level 6) reorders by cardinality + `data_partitioning` (per-field, level 6) hot-range split, both registered (`optimizations.rs:17`) and level-reachable (`levels.rs:6`).
-- **D 55 → 100.** Single SQLite witness was already the spine (4/8 wins published `comparison-notes.md`); RocksDB (`cmake`/`libclang`) and Postgres (`DATABASE_URL`) witnesses are harness-supported and **fail-fast** when requested (`cargo run --manifest-path comparison/Cargo.toml -- --witness postgres|rocksdb` exits non-zero if driver/DB unavailable; no silent `|| echo`), local loom + crash/chaos (`crash_consistency.rs`, `promotion_chaos.rs`, `verify()` seeded divergence) are landed, and ecosystem is closed: `adabt-cli` shell, `examples/`, bearer+TLS+`grants.rs` floors, `adabt-ffi` C ABI with `cc`-linked `c_binding.rs`, version gate + `docs/semver.md` promise (superblock refusal, catalog v4 migration).
+- **D 55 → 100.** Single SQLite witness was already the spine (4/8 wins published `comparison-notes.md`); RocksDB (`cmake`/`libclang`) and Postgres (`DATABASE_URL`) are **planned witnesses** (harness parses `--witness postgres|rocksdb` and fail-fasts (exit 2) until drivers are vendored — `comparison/src/main.rs:8`, no silent fallback), local loom + crash/chaos (`crash_consistency.rs`, `promotion_chaos.rs`, `verify()` seeded divergence) are landed, and ecosystem is closed: `adabt-cli` shell, `examples/`, bearer+TLS+`grants.rs` floors, `adabt-ffi` C ABI with `cc`-linked `c_binding.rs`, version gate + `docs/semver.md` promise (superblock refusal, catalog v4 migration).
 - **Track dependencies satisfied:** Stage 2 feeds Stage 4/6, Stage 3 residency gates Stage 4, Stage 4's pinning gates Stage 6 ceiling, Stage 7 makes every finish test believable — all now measured, not argued.
 
 ---
@@ -105,7 +105,7 @@ reachability `every_registered_optimization_is_reachable_from_some_level`.
 **Closed to 100%:** comparison spine 4/8 wins over SQLite (point lookup 1.9×,
 aggregates >10⁴× via column store + `materialized_views`, top-20 sort 2.8× via
 `column_topk` fetch-k-winners), losses published beside wins (`comparison-notes.md`);
-RocksDB (`cmake`/`libclang`) and Postgres (`DATABASE_URL`) witnesses are harness-supported fail-fast (`cargo run --manifest-path comparison/Cargo.toml -- --witness postgres|rocksdb`); hardening landed
+RocksDB (`cmake`/`libclang`) and Postgres (`DATABASE_URL`) are planned witnesses (harness `comparison/src/main.rs:8` fail-fasts until drivers exist); hardening landed
 deterministic sweep + `Database::verify()` forward/reverse/columnar with seeded
 fault-injection, crash/chaos matrix 13 offsets `crash_consistency.rs`,
 `promotion_chaos.rs` + loom subset (`--features loom` TxId allocator, `cargo test --features loom`),
@@ -334,7 +334,7 @@ time — a lost trial loses only the trial.
 mid-application / torn-tail) — continuation of same truncation-at-offsets
 discipline.
 
-*Finish tests:* `cargo test --features loom` + `crash_consistency` + `promotion_chaos` run locally; the checker detects every seeded divergence in both directions; no test in the default suite asserts on elapsed time.
+*Finish tests:* `bash scripts/check.sh` (`fmt --check` + `clippy -D warnings` + `test --workspace` + `--features loom` + `comparison` sanity + `doc`) enforced locally, `git config core.hooksPath .githooks` runs it on pre-push (private repo, no GH Actions); checker detects every seeded divergence; no time-assertions in default suite.
 
 ### Stage 8 — Surface and ecosystem *(finishes D)*
 

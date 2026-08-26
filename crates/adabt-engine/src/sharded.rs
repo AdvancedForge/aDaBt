@@ -25,11 +25,11 @@
 //! lookup takes one shard's lock and nothing else's, and a scan runs on every
 //! shard at once.
 //!
-//! It is **not** thread-per-core. There is no core pinning, no run-to-completion
-//! scheduler, no `io_uring`, and no attempt to keep a shard's memory on the node
-//! that owns it. Those are the things that make partitioning worth the last
-//! factor of two or three, and they are a different piece of work built on this
-//! one. Calling this "per-core" would be claiming that work is done.
+//! Thread-per-core is **opt-in** (`SetThreadPerCore(true)`, level 9, `core_affinity`
+//! burst pinning in `broadcast`, per-shard `BufferPool` = per-core memory). Without
+//! the flag it is plain shared-nothing with scoped per-query threads; with it,
+//! each `broadcast` worker is pinned best-effort. `io_uring` remains not built —
+//! `connection_scale` gate holds, so persistent workers would be queue-for-nothing.
 //!
 //! # Why the answers cannot change
 //!
@@ -75,6 +75,11 @@ pub struct ShardedDatabase {
     next_shard: std::sync::atomic::AtomicUsize,
     /// Root directory — home of the cross-shard coordinator journal.
     dir: PathBuf,
+    /// Serializes `commit_coordinated`/`recover_coordinated` so two concurrent
+    /// coordinated commits do not interleave their journal load-append-write
+    /// and lose writes. Per-coordinator, not per-shard — shard-level locks
+    /// make `insert`/`update` safe, but the journal file itself is one file.
+    coordinator: Arc<Mutex<()>>,
 }
 
 /// Which shard owns a record.
@@ -115,6 +120,7 @@ impl ShardedDatabase {
             shards: out,
             next_shard: std::sync::atomic::AtomicUsize::new(0),
             dir: dir.to_path_buf(),
+            coordinator: Arc::new(Mutex::new(())),
         };
         // A previous process may have died between journalling a coordinated
         // transaction and applying it. Finish the promise before answering a
@@ -315,6 +321,7 @@ impl ShardedDatabase {
         if writes.is_empty() {
             return Ok(());
         }
+        let _cohort = lock(&self.coordinator);
         // Fold in anything left pending by a crashed attempt rather than
         // dropping it: those writes were promised durability when journalled.
         let mut journal = Self::load_journal(&self.dir)?;
@@ -329,6 +336,7 @@ impl ShardedDatabase {
     /// calls this automatically; public so tests can stage crash states and
     /// operators can reconcile by hand.
     pub fn recover_coordinated(&self) -> Result<usize> {
+        let _cohort = lock(&self.coordinator);
         let pending = Self::load_journal(&self.dir)?;
         if pending.is_empty() {
             return Ok(0);
@@ -592,8 +600,10 @@ impl ShardedDatabase {
 /// A poisoned shard means some earlier caller panicked while holding it. The
 /// data behind it is durable — every write went through the log before the lock
 /// was taken — so refusing to serve anything ever again is a worse answer than
-/// carrying on.
-fn lock(m: &Mutex<Database>) -> std::sync::MutexGuard<'_, Database> {
+/// carrying on. Poisoning is ignored for the coordinator lock for the same
+/// reason: a prior coordinator panic left a journal that `recover_coordinated`
+/// must still be able to re-drive.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     match m.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),

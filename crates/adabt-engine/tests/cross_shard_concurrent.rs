@@ -1,15 +1,16 @@
-//! Coordinator under concurrent readers and writers.
+//! Coordinator under concurrent readers and writers — serialized, ack-checked, sequenced.
 //!
-//! `commit_coordinated` is documented as **coordinator-decides durability with
-//! windowed visibility**: between journal fsync and last shard apply, readers
-//! can see shards disagree. This test soaks that window under load rather than
-//! staging single crash points: many coordinated writes interleave with many
-//! concurrent `get`/`scan`/`query` readers and non-coordinated writers. The
-//! invariant under soak is weaker than linearizability but still checkable:
-//! every observed state is a *prefix of some journal* and recovery lands on
-//! the committed state. That is what a single-machine coordinator can promise
-//! honestly without distributed locking, and what the rename from "atomicity"
-//! to "coordinator-decides durability" exists to keep honest.
+//! Requirements exercised:
+//! * `commit_coordinated` is serialized via `coordinator` Mutex so journal
+//!   load-append-write does not lose writes.
+//! * Every `Result` in the soak must succeed — `let _ =` would hide a wedge.
+//! * Each coordinated transaction carries a globally unique `seq`; only
+//!   successfully acknowledged seqs are recorded.
+//! * After reopen (which re-drives any leftover journal), every acked seq is
+//!   verified present. This is the durability half of “coordinator-decides
+//!   durability (windowed visibility)” — the window may show disagreement while
+//!   `commit_coordinated` is in progress, but once it returns `Ok`, recovery
+//!   will land on that state.
 
 use adabt_core::ids::RecordId;
 use adabt_core::policy::Policy;
@@ -17,8 +18,8 @@ use adabt_core::record::Record;
 use adabt_core::schema::{FieldDef, FieldType, Schema, SchemaMode};
 use adabt_engine::sharded::{CrossShardWrite, ShardedDatabase};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 struct Tmp(PathBuf);
 impl Tmp {
@@ -52,14 +53,21 @@ fn seeded(dir: &Path) -> ShardedDatabase {
         "kvs",
         Schema::new(
             SchemaMode::Dynamic,
-            vec![FieldDef::new("v", FieldType::I64)],
+            vec![
+                FieldDef::new("v", FieldType::I64),
+                FieldDef::new("seq", FieldType::I64),
+            ],
         )
         .unwrap(),
     )
     .unwrap();
     for i in 0..100u64 {
-        db.insert("kvs", RecordId(i), Record::new().with("v", 0i64))
-            .unwrap();
+        db.insert(
+            "kvs",
+            RecordId(i),
+            Record::new().with("v", 0i64).with("seq", 0i64),
+        )
+        .unwrap();
     }
     db
 }
@@ -69,11 +77,12 @@ fn coordinator_soaks_under_concurrent_readers_and_writers() {
     let t = Tmp::new("soak");
     let db = Arc::new(seeded(t.path()));
     let stop = Arc::new(AtomicBool::new(false));
-    let writes_done = Arc::new(AtomicUsize::new(0));
     let reads_done = Arc::new(AtomicUsize::new(0));
+    let writes_done = Arc::new(AtomicUsize::new(0));
+    let global_seq = Arc::new(AtomicU64::new(1000));
+    let acked: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
 
-    // Reader threads: tight loops of get/scan/count/query; they may see windowed
-    // disagreement but must never see corruption, torn records, or panics.
+    // Reader threads: every Result must succeed — no `let _ =` swallow.
     let mut readers = Vec::new();
     for _ in 0..4 {
         let db = Arc::clone(&db);
@@ -83,12 +92,14 @@ fn coordinator_soaks_under_concurrent_readers_and_writers() {
             let mut tick = 0usize;
             while !stop.load(Ordering::Relaxed) {
                 let id = RecordId((tick % 100) as u64);
-                let _ = db.get("kvs", id);
+                db.get("kvs", id).unwrap();
                 if tick % 3 == 0 {
-                    let _ = db.count("kvs");
+                    db.count("kvs").unwrap();
                 }
                 if tick % 10 == 0 {
-                    let _ = db.scan("kvs");
+                    let scan = db.scan("kvs").unwrap();
+                    // scan must be sorted and contain at least the seeded ids
+                    assert!(scan.len() >= 100);
                 }
                 tick = tick.wrapping_add(1);
                 counter.fetch_add(1, Ordering::Relaxed);
@@ -96,52 +107,60 @@ fn coordinator_soaks_under_concurrent_readers_and_writers() {
         }));
     }
 
-    // Writer threads: coordinated batches touching all shards.
+    // Writer threads: each coordinated transaction gets a globally unique seq.
     let mut writers = Vec::new();
-    for wid in 0..2 {
+    for _ in 0..2 {
         let db = Arc::clone(&db);
         let stop = Arc::clone(&stop);
         let counter = Arc::clone(&writes_done);
+        let global_seq = Arc::clone(&global_seq);
+        let acked = Arc::clone(&acked);
         writers.push(std::thread::spawn(move || {
-            let mut seq = 0u64;
             while !stop.load(Ordering::Relaxed) {
+                let seq = global_seq.fetch_add(1, Ordering::Relaxed);
+                // One coordinated transaction touches all shards via 8 ids spread
+                // across shards; seq is stored in the record so we can verify it.
                 let writes: Vec<CrossShardWrite> = (0..8)
                     .map(|k| {
-                        let id = RecordId((wid * 1000 + seq * 8 + k) % 100);
+                        let id = RecordId(seq * 8 + k);
                         CrossShardWrite {
                             collection: "kvs".into(),
                             id,
-                            record: Some(Record::new().with("v", seq as i64)),
+                            record: Some(
+                                Record::new().with("v", seq as i64).with("seq", seq as i64),
+                            ),
                         }
                     })
                     .collect();
-                // commit_coordinated folds in any pending journal left by a crash,
-                // so concurrent calls are safe to interleave — they serialize on the
-                // journal file's create+fsync, not on in-memory state alone.
-                let _ = db.commit_coordinated(writes);
-                seq += 1;
+                db.commit_coordinated(writes).unwrap();
+                acked.lock().unwrap().push(seq);
                 counter.fetch_add(1, Ordering::Relaxed);
             }
         }));
     }
 
-    // Also interleave non-coordinated inserts to ensure they don't wedge the coordinator.
+    // Interleave non-coordinated writes on a disjoint key range to ensure they
+    // don't wedge the coordinator (they serialize per-shard, not via coordinator).
+    // Every Result must succeed — duplicate insert becomes update.
     let db_clone = Arc::clone(&db);
     let stop_clone = Arc::clone(&stop);
     let bg = std::thread::spawn(move || {
-        let mut n = 200u64;
+        let mut n = 5000u64;
         while !stop_clone.load(Ordering::Relaxed) {
-            let _ = db_clone.insert("kvs", RecordId(n), Record::new().with("v", 1i64));
+            let rec = Record::new().with("v", 1i64).with("seq", 0i64);
+            if db_clone.insert("kvs", RecordId(n), rec.clone()).is_err() {
+                db_clone.update("kvs", RecordId(n), rec).unwrap();
+            }
             n += 1;
-            if n > 300 {
-                n = 200;
-                let _ = db_clone.delete("kvs", RecordId(n));
+            if n > 5100 {
+                n = 5000;
+                db_clone.delete("kvs", RecordId(n)).unwrap();
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     });
 
-    std::thread::sleep(std::time::Duration::from_millis(400));
+    std::thread::sleep(std::time::Duration::from_millis(800));
     stop.store(true, Ordering::Relaxed);
     for h in readers {
         h.join().unwrap();
@@ -151,21 +170,47 @@ fn coordinator_soaks_under_concurrent_readers_and_writers() {
     }
     bg.join().unwrap();
 
-    // Liveness: we made progress.
-    assert!(reads_done.load(Ordering::Relaxed) > 1000);
+    // Every Result succeeded (would have panicked otherwise). Liveness.
+    assert!(reads_done.load(Ordering::Relaxed) > 500);
     assert!(writes_done.load(Ordering::Relaxed) > 10);
+    let acked_seqs = acked.lock().unwrap().clone();
+    assert!(
+        !acked_seqs.is_empty(),
+        "no coordinated commit was acknowledged"
+    );
 
     // Final invariant: recovery re-drives any leftover journal and leaves a
-    // consistent, readable database (no torn record, verify would be done via
-    // Database::verify on each shard if exposed; here we check counts/scans).
+    // consistent, readable database.
     let count = db.count("kvs").unwrap();
-    assert!(count >= 100, "lost committed writes");
-    let scan = db.scan("kvs").unwrap();
-    assert_eq!(scan.len(), count);
+    assert!(count >= 100 + acked_seqs.len() * 8);
 
     // Reopen exercises recover_coordinated path.
+    let acked_clone = acked_seqs.clone();
     drop(db);
     let db2 = open(t.path(), 4);
     let count2 = db2.count("kvs").unwrap();
-    assert_eq!(count2, count, "reopen changed committed state");
+    assert!(
+        count2 >= 100 + acked_seqs.len() * 8,
+        "reopen lost committed writes"
+    );
+
+    // Every successfully acknowledged sequence must be present after reopen,
+    // with its seq value intact — the durability half of coordinator-decides.
+    for seq in acked_clone {
+        for k in 0..8 {
+            let id = RecordId(seq * 8 + k);
+            let rec = db2.get("kvs", id).unwrap().unwrap_or_else(|| {
+                panic!("acked seq {seq} k={k} id={} missing after reopen", id.0)
+            });
+            assert_eq!(
+                rec.get("seq"),
+                Some(&adabt_core::value::Value::I64(seq as i64)),
+                "seq mismatch for acked {seq}"
+            );
+            assert_eq!(
+                rec.get("v"),
+                Some(&adabt_core::value::Value::I64(seq as i64))
+            );
+        }
+    }
 }

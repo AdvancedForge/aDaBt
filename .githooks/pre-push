@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Enforced gate for private repo — replaces GH Actions.
+# To enable: git config core.hooksPath .githooks
+set -euo pipefail
+echo "[pre-push] running scripts/check.sh"
+bash scripts/check.sh
