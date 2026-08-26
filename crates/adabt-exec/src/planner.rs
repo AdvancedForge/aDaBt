@@ -128,19 +128,48 @@ impl<'a> PlanContext<'a> {
         // a bitmap's footprint scales with distinct values times rows, and
         // this engine's ceiling IS its memory; hash-first is the choice that
         // cannot explode on a high-cardinality field nobody has told us is
-        // low-cardinality. A cardinality signal would reopen the question,
-        // and belongs beside the selectivity work when it comes.
-        let mut best = None;
+        // low-cardinality.
+        //
+        // The cardinality signal this comment awaited now exists — and it
+        // reopens the question exactly as predicted: when the field's own
+        // key count says low-cardinality, the blow-up risk is off the table,
+        // so the measured tie goes to the bitmap. The executor applies the
+        // same rule (`Database::index_lookup`), from the same constant, so
+        // planning and execution cannot disagree about which structure
+        // serves the probe.
+        let cardinality = self
+            .cardinality
+            .get(collection)
+            .and_then(|c| c.get(field))
+            .copied()
+            .unwrap_or(u64::MAX);
+        let low_cardinality = cardinality <= adabt_index::LOW_CARDINALITY_KEY_COUNT as u64;
+        // Presence flags, so the decision never depends on creation order.
+        let mut hash = false;
+        let mut bitmap = false;
+        let mut other = None;
         for (f, kind) in list {
             if *f == field {
                 match kind {
-                    IndexKind::Hash => return Some(IndexKind::Hash),
-                    IndexKind::Bitmap => best = Some(IndexKind::Bitmap),
-                    IndexKind::BTree => best = best.or(Some(IndexKind::BTree)),
+                    IndexKind::Hash => hash = true,
+                    IndexKind::Bitmap => bitmap = true,
+                    k => other = other.or(Some(*k)),
                 }
             }
         }
-        best
+        if low_cardinality {
+            // Measured tie on latency; bitmap's memory advantage decides.
+            bitmap
+                .then_some(IndexKind::Bitmap)
+                .or_else(|| hash.then_some(IndexKind::Hash))
+                .or(other)
+        } else if hash {
+            Some(IndexKind::Hash).or(other)
+        } else if bitmap {
+            Some(IndexKind::Bitmap).or(other)
+        } else {
+            other
+        }
     }
 
     /// A covering index on one of the pinned fields whose projection contains
@@ -517,6 +546,72 @@ mod tests {
             &l,
             &ctx_with(vec![
                 ("country", IndexKind::BTree),
+                ("country", IndexKind::Hash),
+            ]),
+        );
+        match p.root.access_path() {
+            PhysicalOp::IndexLookup { kind, .. } => assert_eq!(*kind, IndexKind::Hash),
+            other => panic!("expected an index lookup, got {}", other.name()),
+        }
+    }
+
+    /// `ctx_with` plus per-field cardinality estimates.
+    fn ctx_with_card(pairs: Vec<(&'static str, IndexKind)>, card: u64) -> PlanContext<'static> {
+        let mut ctx = ctx_with(pairs);
+        let mut c = HashMap::new();
+        let mut inner = HashMap::new();
+        inner.insert("country", card);
+        c.insert("users", inner);
+        ctx.cardinality = c;
+        ctx
+    }
+
+    #[test]
+    fn a_low_cardinality_field_plans_its_bitmap_over_a_hash_tie() {
+        // The measurement said the two tie on latency and the bitmap holds
+        // ~6% of the memory; with cardinality proving the field small, the
+        // memory decides. Creation order must not matter — test both orders.
+        let l = LogicalOp::scan("users").filter(Expr::eq("country", "NO"));
+        for pairs in [
+            vec![("country", IndexKind::Hash), ("country", IndexKind::Bitmap)],
+            vec![("country", IndexKind::Bitmap), ("country", IndexKind::Hash)],
+        ] {
+            let p = plan(&l, &ctx_with_card(pairs, 4));
+            match p.root.access_path() {
+                PhysicalOp::IndexLookup { kind, .. } => {
+                    assert_eq!(*kind, IndexKind::Bitmap)
+                }
+                other => panic!("expected an index lookup, got {}", other.name()),
+            }
+        }
+    }
+
+    #[test]
+    fn a_high_cardinality_field_keeps_the_hash_first_ordering() {
+        let l = LogicalOp::scan("users").filter(Expr::eq("user_id", 7));
+        let _ = &l;
+        let l = LogicalOp::scan("users").filter(Expr::eq("country", "NO"));
+        let p = plan(
+            &l,
+            &ctx_with_card(
+                vec![("country", IndexKind::Bitmap), ("country", IndexKind::Hash)],
+                900_000,
+            ),
+        );
+        match p.root.access_path() {
+            PhysicalOp::IndexLookup { kind, .. } => assert_eq!(*kind, IndexKind::Hash),
+            other => panic!("expected an index lookup, got {}", other.name()),
+        }
+    }
+
+    #[test]
+    fn unknown_cardinality_preserves_the_shipped_hash_first_choice() {
+        // No estimate: behave exactly as before the signal existed.
+        let l = LogicalOp::scan("users").filter(Expr::eq("country", "NO"));
+        let p = plan(
+            &l,
+            &ctx_with(vec![
+                ("country", IndexKind::Bitmap),
                 ("country", IndexKind::Hash),
             ]),
         );

@@ -88,7 +88,7 @@ both dynamic and declared schemas).
 | **Thread-per-core (M28)** | Everything is one `Mutex` deep. On any modern core count this is the dominant ceiling, and the largest single item on the track. |
 | **Zero-copy fetch, the literal remainder** | The executor integration **landed**: `Source::peek_field` (tri-state — row gone / field absent / value) with a defaulted fetch-and-project fallback, and a fused filter that decides single-field predicates over a heap scan from peeked fields, fetching full rows only for survivors. Decode cost now tracks selectivity, not table size. What remains is the literal borrowed view: a batch type holding borrowed rows over decoded pages, so even the surviving fetch stops materializing owned records. |
 | **Clustered sort order** | The mechanism landed (see Stage 2 item 4); what remains is persisting the declaration across restarts and letting the optimizer propose it. |
-| **Cost-model honesty** | Every estimate assumes indexed point lookups are flat in collection size; measured, they grow (6.3 µs at 100k rows, 12.4 µs at 800k). The bitmap-over-hash preference is a reasoned ordering that measurement contradicted at 1M rows and left in place. Both must be decided by benchmark. |
+| **Cost-model honesty** | The bitmap-over-hash preference **is decided by benchmark now**: `index-scale` measured the two tying on latency at every scale (100k–1M rows, ~6% memory for bitmap on low-cardinality fields), and with per-field key counts available O(1) from each index, the tie goes to bitmap when cardinality proves the field small — planner and executor apply the same rule from one shared constant (`LOW_CARDINALITY_KEY_COUNT`), asserted end to end in `bitmap_choice.rs` and at both creation orders. Still open: the flat-point-lookup assumption (measured 6.3 µs at 100k rows → 12.4 µs at 800k) awaits a size-aware term in the estimates. |
 | **Prefix/delta compression** | Dictionary encoding landed; these two did not. |
 | **io_uring (M29)** | Needs an async storage path first. Real, but last. |
 
@@ -215,9 +215,13 @@ In order:
    serves through the index, aggregate wins untouched. Landed alongside it:
    **columnar top-K** (`docs/comparison-notes.md`), which took the worst
    loss on the board to a 1.9× win over SQLite and added a move to C's set.
-   Still open: the flat-point-lookup assumption every estimate carries,
-   and the bitmap-over-hash preference measurement contradicted at 1M rows.
-   **Landed since:** selectivity in the access decision — `PlanContext`
+   Still open: the flat-point-lookup assumption every estimate carries.
+   **Landed since:** the bitmap-over-hash question, reopened by the
+   cardinality signal exactly as its own comment predicted and settled by
+   measurement — low-cardinality fields serve through their bitmap (same
+   latency, ~6% memory), everything else keeps hash-first; one shared
+   constant drives planner and executor alike (`bitmap_choice.rs`).
+   Plus selectivity in the access decision — `PlanContext`
    now carries per-field cardinality read from each index's own key count
    (O(1), and defined only for fields that are indexed, which is the right
    boundary), and among equality candidates the planner probes the most

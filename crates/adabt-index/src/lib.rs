@@ -21,6 +21,19 @@ use std::ops::Bound;
 
 pub use adabt_core::index_kind::IndexKind;
 
+/// The cardinality under which a field counts as low-cardinality for index
+/// selection.
+///
+/// `adabt-bench index-scale` measured bitmap and hash lookups tying at every
+/// scale tried (100k–1M rows, differences inside run-to-run noise) while the
+/// bitmap held ~6% of the memory — on a *low-cardinality* field, where a
+/// bitmap's footprint (distinct values × rows / 8) cannot explode. Above
+/// this bound that guarantee is gone and hash-first is the choice that
+/// cannot blow up on a field nobody said was small. One number, shared by
+/// the planner and the executor, so both halves of access selection make the
+/// same call from the same measurement.
+pub const LOW_CARDINALITY_KEY_COUNT: usize = 256;
+
 /// A secondary index over one field.
 pub trait Index: Send {
     fn kind(&self) -> IndexKind;
@@ -28,7 +41,6 @@ pub trait Index: Send {
 
     fn insert(&mut self, key: Value, id: RecordId);
     fn remove(&mut self, key: &Value, id: RecordId);
-
     /// Ids whose indexed field equals `key`, in ascending id order.
     fn lookup(&self, key: &Value) -> Vec<RecordId>;
 

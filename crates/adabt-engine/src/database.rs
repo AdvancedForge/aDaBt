@@ -3209,7 +3209,25 @@ impl Source for Database {
         Ok(self
             .indexes
             .get(collection)
-            .and_then(|l| l.iter().find(|i| i.field() == field))
+            .and_then(|l| {
+                let candidates: Vec<_> = l.iter().filter(|i| i.field() == field).collect();
+                if candidates.is_empty() {
+                    return None;
+                }
+                // The measured rule, applied where it can act: on a
+                // low-cardinality field a bitmap answers at hash's latency
+                // for ~6% of the memory (adabt-bench index-scale), so when
+                // one exists take it. Otherwise first-created wins, the
+                // shipped order.
+                candidates
+                    .iter()
+                    .find(|i| {
+                        matches!(i.kind(), adabt_index::IndexKind::Bitmap)
+                            && i.key_count() <= adabt_index::LOW_CARDINALITY_KEY_COUNT
+                    })
+                    .or_else(|| candidates.first())
+                    .copied()
+            })
             .map(|i| i.lookup(key)))
     }
 
