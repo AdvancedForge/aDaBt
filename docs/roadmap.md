@@ -398,8 +398,16 @@ the catalog — is exactly the one whose loss is recoverable: an unreadable
 catalog rebuilds from the log with every record intact (tested end to end).
 That is semantic versioning for the disk: refuse forward, enumerate backward.
 
-*Finish tests:* a hostile-client suite runs against the exposed server;
-a fresh clone reaches a working example in a stated number of commands;
+*Finish tests:* ~~a hostile-client suite runs against the exposed server~~ —
+**landed** (`adversarial.rs`, 8 tests over real sockets): garbage bytes,
+impossible length prefixes, bad magic, wrong version, truncated headers,
+unknown request kinds, malformed bodies, and a concurrent vandal — each
+proves the same three-part contract: the misbehaving connection is closed
+or refused without a half-answer, the server neither crashes nor wedges,
+and every other connection carries on. The client gained `send_raw` /
+`next_reply` so conformance and fuzz tooling can speak frames the typed
+surface would never construct.
+A fresh clone reaches a working example in a stated number of commands;
 a format-breaking change fails CI unless the version gate and migration land
 with it.
 

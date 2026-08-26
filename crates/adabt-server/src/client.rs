@@ -49,9 +49,27 @@ impl<S: Read + Write> Client<S> {
     fn call(&mut self, kind: RequestKind, body: Vec<u8>) -> Result<Vec<u8>> {
         let id = self.next_id;
         self.next_id += 1;
-        let frame = Frame::new(kind.code(), id, body);
-        self.stream.write_all(&frame.encode()).map_err(Error::Io)?;
+        self.send_raw(Frame::new(kind.code(), id, body))?;
+        self.read_reply(id)
+    }
 
+    /// Put one pre-built frame on the wire.
+    ///
+    /// The escape hatch from the typed method surface: a protocol fuzzer,
+    /// a conformance test, or a proxy needs to send frames the *client*
+    /// would never construct — unknown kinds, malformed bodies, hostile
+    /// lengths — while still using this connection's framing and ids.
+    pub fn send_raw(&mut self, frame: Frame) -> Result<()> {
+        self.stream.write_all(&frame.encode()).map_err(Error::Io)
+    }
+
+    /// Read the next reply frame off this connection, requiring that it
+    /// carries `id`.
+    ///
+    /// Unlike [`Client::call`], the frame is returned as-is: status not
+    /// interpreted, body not decoded. That is what an adversarial test wants
+    /// — the raw shape of what a hostile request earned.
+    pub fn next_reply(&mut self, id: u64) -> Result<Frame> {
         let mut buf: Vec<u8> = Vec::new();
         let mut chunk = [0u8; 16 * 1024];
         loop {
@@ -62,14 +80,7 @@ impl<S: Read + Write> Client<S> {
                         reply.request_id
                     )));
                 }
-                let status = StatusCode::from_code(reply.kind).ok_or_else(|| {
-                    Error::Corruption(format!("unknown status code {}", reply.kind))
-                })?;
-                return if status.is_ok() {
-                    Ok(reply.body)
-                } else {
-                    Err(error_from(status, &reply.body))
-                };
+                return Ok(reply);
             }
             let n = self.stream.read(&mut chunk).map_err(Error::Io)?;
             if n == 0 {
@@ -80,6 +91,19 @@ impl<S: Read + Write> Client<S> {
                 )));
             }
             buf.extend_from_slice(&chunk[..n]);
+        }
+    }
+
+    /// The typed path: `next_reply` plus status interpretation — an ok
+    /// status yields the body, anything else becomes the mapped error.
+    fn read_reply(&mut self, id: u64) -> Result<Vec<u8>> {
+        let reply = self.next_reply(id)?;
+        let status = StatusCode::from_code(reply.kind)
+            .ok_or_else(|| Error::Corruption(format!("unknown status code {}", reply.kind)))?;
+        if status.is_ok() {
+            Ok(reply.body)
+        } else {
+            Err(error_from(status, &reply.body))
         }
     }
 
