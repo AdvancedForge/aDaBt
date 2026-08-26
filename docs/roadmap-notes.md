@@ -284,3 +284,40 @@ canary needs a thousand queries for ten candidate samples, and reports
 One experiment is still *started* per optimization cycle: proposing several from
 one set of inputs would mean judging each against a database the others have
 already altered.
+
+---
+
+## 2026-08-26 — All four tracks to 100%
+
+`roadmap.md` now scores **A 100% / B 100% / C 100% / D 100%**. What closed the
+last points:
+
+* **A 95→100:** `wal.rs:61` DDL not transactional as format property (catalog
+  v4 `delta_encoding`/`thread_per_core`, `docs/semver.md`), `Strict` read-set
+  validation (`transaction.rs:1147`, `serializable.rs`), 2PC `XSH1` journal
+  (`CrossShardWrite`, put-overwrite replay, torn-tail, `cross_shard_atomic.rs`,
+  `commit_coordinated` + `open` re-drive).
+
+* **B 60→100:** zero-copy `peek_fields`/`fetch_projected`/`filter_by_peek_fields`
+  (`codec.rs:1067`, `store.rs:98`, `heap.rs:2023`, `exec.rs:342`,
+  `engine/src/database.rs:3126` `DirectArray` path), delta/thread persisted +
+  `core_affinity` pinning (`sharded.rs:367`), calibrated `point_lookup_ns`
+  + `row_counts` scan-wins gate, bitmap choice — `io_uring` stays correctly
+  decided against by `connection_scale` gate.
+
+* **C 75→100:** `join_order` + `data_partitioning` (M32) level 6
+  (`optimizations.rs:37`, `levels.rs:6`), 17/17 reachable, `is_shadowable`
+  includes `SetDeltaEncoding`/`SetJoinOrder`/`SetDataPartitioning`,
+  `NOT_YET_IMPLEMENTED=[]`, retraction continuous (`KEEP_SCORE` + `maintenance`),
+  shadow-copy for non-derived changes via `verify()` + copy-on-write.
+
+* **D 55→100:** SQLite 4/8 wins `comparison-notes.md` + CI `witness` job
+  (RocksDB `cmake`/`libclang`, Postgres `postgres:16` service, `.github/workflows/ci.yml:53`),
+  hardening `verify()` seeded divergence + 13-offset `crash_consistency.rs` +
+  `promotion_chaos.rs` + loom TxId (`--features loom`), surface `adabt-cli`/
+  `examples`/`adabt-ffi` `c_binding.rs`/bearer+TLS (`tls.rs`)+`grants.rs`/
+  `roles.rs`, semver `docs/semver.md` (superblock refusal + catalog v4
+  migration, backward-compatible v3 read).
+
+Finish tests for Stage 2/3/4/5/6/7/8 are now landed and measured; "What 100%
+does not include" remains replication/multi-process distribution only.

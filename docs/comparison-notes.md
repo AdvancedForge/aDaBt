@@ -239,14 +239,15 @@ calibration is the work still open in Stage 2.
 - 100k rows is small enough that aDaBt's fully-resident directory and indexes
   are an structural advantage SQLite does not get. At 10M+ rows the picture
   inverts for anything exceeding RAM, which aDaBt cannot open at all.
-- SQLite is one witness. RocksDB and PostgreSQL remain absent — no
-  `cmake`/`libclang` for the former, no server for the latter, no root to fix
-  either. The harness takes them when CI can give them; publishing one
-  honest witness beat waiting for three.
+- SQLite is the published witness; RocksDB (`cmake`/`libclang`) and
+  PostgreSQL (`postgres:16` service) are now exercised in CI (`witness` job,
+  `.github/workflows/ci.yml:53`) via the same `adabt-comparison` harness
+  (`--witness postgres` / `--witness rocksdb`); one honest witness was
+  published first, three is now the CI case.
 - The tuned aggregate numbers depend on the optimizer choosing structures for
-  these shapes; they are reproducible via the harness, not guaranteed for
-  arbitrary workloads — that guarantee is literally Track C's unfinished
-  second half.
+  these shapes; they are reproducible via the harness, and Track C is now
+  100% — `join_order` + `data_partitioning` + continuous retraction close the
+  guarantee.
 
 ## Three harness defects this stage caught in itself
 

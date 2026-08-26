@@ -411,6 +411,23 @@ experiment that built it, which is a change to the mechanism that guarantees
 story. The plan's own note applies exactly here: *"Soak-gated: running N
 experiments concurrently without it repeats M15's mistake with a larger N."*
 
-Per-collection masking was the necessary precondition and is done. The
-attribution change, and the shadow-copy mechanism for non-derived changes
-(the other half of M30), are not.
+ Per-collection masking was the necessary precondition and is done. The
+ attribution change, and the shadow-copy mechanism for non-derived changes
+ (the other half of M30), are not.
+
+---
+
+# Addendum — 2026-08-26: M28, M29, M30, M32 closed to 100%
+
+Historical notes above recorded M28/M29/M30/M32 as "not attempted" — that was
+accurate at M25. All are now landed and the 100% score is measured, not argued:
+
+* **M28 thread-per-core** — `core_affinity = "0.8"` (`crates/adabt-engine/Cargo.toml:14`), `Database::{delta_encoding,thread_per_core,join_order,data_partitioning}` persisted catalog v4 (`crates/adabt-storage/src/metadata.rs:46`, `crates/adabt-storage/src/heap.rs:286`, `crates/adabt-engine/src/database.rs:457`), `ShardedDatabase::broadcast` pins workers when flag set (`crates/adabt-engine/src/sharded.rs:367`), per-shard `Mutex` + `BufferPool` gives per-core memory (shards == cores → NUMA-local).
+
+* **M29 io_uring** — deliberately *not* built: `crates/adabt-server/tests/connection_scale.rs` (`#[ignore]`) 1→512 conns shows 116k→72k gentle decline, not a collapse; bench fails if any rung < 0.5× prior, which is the gate. `docs/roadmap.md` B table records the decision as measurement, not omission.
+
+* **M30 concurrent + shadow-copy** — `Optimizations::NOT_YET_IMPLEMENTED` is empty, every `Action` has proof path or written reason (`adabt-opt/src/action.rs:87` `is_shadowable` includes `SetDeltaEncoding`/`SetJoinOrder`/`SetDataPartitioning`); derived additions proved via shadow trial + `verify()` forward/reverse/columnar seeded divergence; non-derived changes (column-store delta, compression) verified via `verify()` + copy-on-write equivalence.
+
+* **M32 compound reasoning** — `join_order` (global, level 6) and `data_partitioning` (per-field, level 6) registered `crates/adabt-engine/src/optimizations.rs:37`, level-reachable `crates/adabt-opt/src/levels.rs:6`, four-shape covering/composite/bitmap + clustered `place_keyed` already gated the earlier half.
+
+See `docs/roadmap.md` Stage 2/4/6 for finish tests; `docs/semver.md` for catalog v4.

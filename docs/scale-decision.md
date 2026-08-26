@@ -44,9 +44,7 @@ ceiling on ordinary developer hardware is single-digit millions of records.
 
 ## What the decision changes
 
-- **Track A** moves to roughly 95%: cross-shard 2PC, serializable as a
-  selectable level, and DDL's documented non-transactionality are what
-  remain between here and "you could ship on it."
+- **Track A** is now **100%**: cross-shard 2PC (`commit_coordinated` + `XSH1` journal), serializable `Strict` level, and DDL's non-transactionality as a stated format property (`wal.rs` DDL docs, catalog v4) are closed between decision and "you could ship on it."
 - **Sharding is the growth story.** With residency fixed by decision,
   more data means more shards, not a paged directory — which makes Stage 5
   load-bearing rather than ceremonial.

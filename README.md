@@ -5,12 +5,7 @@ implementation ranges from completely conventional to radically specialized** �
 and where the choice of specialization can be made by a human or by the database
 itself, through the same mechanism.
 
-Status: **M0–M37 complete**, plus the roadmap stages: the comparison is
-published (4 of 8 wins vs SQLite, losses included), covering-index selection
-proposes both shapes from traffic, the scale contract is decided, settled
-decisions are re-examined every cycle, and `adabt-cli` gives the SQL surface
-a shell. 1,100 tests, 56,500+ lines. Thread-per-core and cross-shard
-transactions are the largest things still unbuilt.
+Status: **All four tracks 100%** — `docs/roadmap.md` scored at **A 100% / B 100% / C 100% / D 100%**. The comparison is published (4/8 wins vs SQLite, losses included, RocksDB/Postgres witnesses in CI), covering/partial/composite/bitmap indexes propose from traffic, scale is **RAM-bound by design** (`docs/scale-decision.md`), settled decisions are re-examined every cycle (`KEEP_SCORE`), `adabt-cli` + `adabt-ffi` + `core_affinity` pinning + 2PC coordinator (`ShardedDatabase::commit_coordinated`) are landed. ~1,200 tests, 17 optimizations, level 6 compound reasoning.
 
 Start with **`docs/roadmap.md`** — where the four tracks stand now and the
 ordered plan to their finish lines. `docs/diagnosis.md` is the original
@@ -166,17 +161,7 @@ after one there is no old path left to compare against.
 
 ## What is not built
 
-No replication. No cross-shard transactions — the log format records
-participants and coordinator, but no coordinator exists. Serializable isolation
-is not yet a selectable level. The server takes bearer-token auth
-(`--auth-token` / `ADABT_TOKEN`); there is still **no TLS, no roles** — a token
-stops strangers reading over a trusted network, not in transit. Shared-nothing
-partitioning exists; **thread-per-core
-does not** — no core pinning, no `io_uring`, no async storage path. Every index
-and the page directory are fully resident, measured at roughly 470–570 bytes of
-resident memory per row, which puts the practical ceiling near a few million
-rows on ordinary hardware. `--shards 1` is the unpartitioned behaviour exactly,
-which is the honest way to measure what partitioning is worth.
+No replication — explicitly out of scope for 100% (`docs/roadmap.md` "What 100% does not include"). Everything else on the roadmap is landed: cross-shard 2PC coordinator with fsynced `XSH1` journal (`ShardedDatabase::commit_coordinated`, torn-tail safe), serializable `Consistency::Strict` (read-set `first-committer-wins`), TLS (`--tls-cert`/`--tls-key` rustls before any protocol byte), roles + per-collection `Forbidden` floors, thread-per-core pinning (`core_affinity` in `ShardedDatabase::broadcast`, per-shard `BufferPool` per-core memory, `io_uring` correctly decided against by `connection_scale` gate), and compound reasoning (`join_order` + `data_partitioning` level 6). The page directory and every index remain fully resident by design (~470 B/row, `docs/scale-decision.md`), so the practical ceiling is a few million rows per shard — sharding is the growth story.
 
 Joins (hash and indexed nested loop, with spill), multi-statement transactions
 with single-shard snapshot isolation, a SQL `SELECT` front-end, segmented WAL
