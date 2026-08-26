@@ -168,7 +168,10 @@ scans; the precedence half of that is fixed and re-published.
    connection is refused `Unauthorized` until Auth succeeds — including
    Ping, so no unauthenticated oracle — with per-connection state,
    constant-time comparison, and denial that neither closes the connection
-   nor echoes the secret. Still missing: per-collection permissions.
+   nor echoes the secret. **Landed since:** TLS (handshake before any
+   protocol byte, tested end to end) and per-collection floors — a
+   collection can require admin even for reads, with `Forbidden` for known
+   but disallowed callers (`grants.rs`).
    **Landed since:** TLS — `--tls-cert`/`--tls-key` wrap every accepted
    connection in rustls before any protocol byte is read (tested end to end
    over real handshakes: queries survive intact, plaintext clients get a
@@ -321,8 +324,15 @@ ceremonial.
 
 *Finish tests:* the differential runner runs at serializable; crash points
 injected between prepare and commit recover to a consistent side, tested the
-way single-shard recovery is — truncation at arbitrary offsets; a cross-shard
-transaction is expressible through the engine API and the wire protocol.
+way single-shard recovery is — truncation at arbitrary offsets. **The
+single-shard slice of this is landed** (`commit_window_chaos.rs`): a
+multi-write transaction cut at 17 offsets through its own commit frames
+recovers, at every one, to exactly a *prefix of the sorted write-set* —
+never an interleaving, never a torn row — with survivors byte-exact,
+`verify()` clean, and reopening idempotent. What remains for the full item:
+the coordinator (prepare/commit across shards) and the in-doubt recovery
+outcome it introduces.
+a cross-shard transaction is expressible through the engine API and the wire protocol.
 
 ### Stage 6 — Finish C
 
@@ -378,7 +388,14 @@ suite asserts on elapsed time.
 server — gate before dispatch, per-connection state, constant-time compare,
 refusals that neither close the connection nor echo the secret.
 
-Remaining: per-collection permission grants. **Landed since:** TLS —
+~~Remaining: per-collection permission grants~~ — **landed**:
+`with_collection_floor(collection, role)` walls a collection off from
+lower-role connections, every request kind that names it, reads included —
+the one thing the connection-level role model cannot say. Checked after
+authentication and role authorization, before the engine is touched;
+a known-but-disallowed caller gets `Forbidden`, wire garbage gets the
+`BadRequest`/`Internal` verdict dispatch always gave it. Socket-tested in
+`grants.rs`. **Landed since:** TLS —
 rustls on the accepted connection, before any protocol byte, generic over
 the stream type so plaintext and encrypted paths share one framing
 implementation (`tests/tls.rs` pins handshake-first, round-trip, and

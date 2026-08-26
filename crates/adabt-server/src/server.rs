@@ -120,6 +120,11 @@ impl Role {
             ),
         }
     }
+
+    /// Is `self` at least as powerful as `floor`?
+    fn at_least(self, floor: Role) -> bool {
+        matches!((self, floor), (_, Role::Reader) | (Role::Admin, _))
+    }
 }
 
 /// The server's credential table.
@@ -127,6 +132,11 @@ impl Role {
 pub struct AuthConfig {
     admin_token: Option<String>,
     reader_token: Option<String>,
+    /// Per-collection role floors: a collection mapped to [`Role::Admin`]
+    /// refuses every request from a reader connection — reads included,
+    /// which is what makes this more than the role model already says.
+    /// Collections absent from the map follow the connection's role alone.
+    floors: std::collections::HashMap<String, Role>,
 }
 
 impl AuthConfig {
@@ -236,6 +246,21 @@ impl Server {
     /// be a lock on a door that is already standing open.
     pub fn with_read_token(mut self, token: impl Into<String>) -> Self {
         self.auth.reader_token = Some(token.into());
+        self
+    }
+
+    /// Require at least `floor` to touch `collection` — every request kind
+    /// that names it, reads included.
+    ///
+    /// This is the per-collection grant, one rule per collection: a floor of
+    /// [`Role::Admin`] walls a collection off from reader connections (a
+    /// secrets table beside a public dashboard in one database), while an
+    /// unmapped collection keeps following the connection's role. Floors are
+    /// checked after authentication and role authorization — a reader gets
+    /// `Forbidden`, not `Unauthorized`, because who they are is known; this
+    /// collection is simply not for them.
+    pub fn with_collection_floor(mut self, collection: impl Into<String>, floor: Role) -> Self {
+        self.auth.floors.insert(collection.into(), floor);
         self
     }
 
@@ -472,9 +497,43 @@ fn respond(frame: &Frame, db: &Shared, auth: &AuthConfig, role: &mut Option<Role
             "this connection's role does not permit that request",
         );
     }
+    // Per-collection floors, checked after role authorization and before the
+    // engine is touched. The collection name is parsed leniently here — a
+    // body too corrupt to name one fails in `dispatch` with `BadRequest`,
+    // which is the honest verdict for it.
+    if let Some(collection) = collection_of(kind, &frame.body) {
+        if let Some(floor) = auth.floors.get(&collection) {
+            if !known.at_least(*floor) {
+                return error_frame(
+                    id,
+                    StatusCode::Forbidden,
+                    "this collection requires a higher-role credential",
+                );
+            }
+        }
+    }
     match dispatch(kind, &frame.body, db) {
         Ok(body) => Frame::new(StatusCode::Ok.code(), id, body),
         Err(e) => error_frame(id, StatusCode::of(&e), &e.to_string()),
+    }
+}
+
+/// The collection a request names, if its kind carries one.
+///
+/// Every such frame — Get, Insert, Update, Delete, Count, Query, Explain —
+/// begins with a length-prefixed string, so one read answers for all of
+/// them. Lenient by design: a body that will not parse as even that string
+/// yields `None`, and `dispatch` gives it the `BadRequest` it deserves.
+fn collection_of(kind: RequestKind, body: &[u8]) -> Option<String> {
+    match kind {
+        RequestKind::Get
+        | RequestKind::Insert
+        | RequestKind::Update
+        | RequestKind::Delete
+        | RequestKind::Count
+        | RequestKind::Query
+        | RequestKind::Explain => Reader::new(body).str("collection").ok(),
+        _ => None,
     }
 }
 
