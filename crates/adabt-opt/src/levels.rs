@@ -85,6 +85,7 @@ pub fn level_preset(level: u8) -> Vec<LevelEntry> {
     }
     if level >= 4 {
         out.push(entry("column_store", &[]));
+        out.push(entry("delta_encoding", &[]));
         out.push(entry("materialized_view", &[]));
     }
     if level >= 5 {
@@ -100,11 +101,15 @@ pub fn level_preset(level: u8) -> Vec<LevelEntry> {
         // not schema. Registered separately from `auto_index` because it
         // costs more per write and answers a narrower question.
         out.push(entry("auto_covering_index", &[]));
+        out.push(entry("clustered_sort", &[]));
     }
     if level >= 8 {
         // Freezing is what makes direct addressing legal for a collection that
         // did not start out fixed, which is why it sits below it.
         out.push(entry("freeze_schema", &[]));
+    }
+    if level >= 9 {
+        out.push(entry("thread_per_core", &[]));
     }
     if level >= 10 {
         out.push(entry("direct_lookup", &[]));

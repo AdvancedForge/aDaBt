@@ -46,7 +46,26 @@ pub enum Action {
     /// The only action that takes something away from the user: a frozen
     /// collection rejects records the loose one accepted. Its `freedom` cost is
     /// real, not notional.
-    FreezeSchema { collection: String },
+    FreezeSchema {
+        collection: String,
+    },
+    /// Place records with nearby clustering keys on same pages.
+    ///
+    /// Subsequent inserts with integer keys near each other land on the same
+    /// pages, so a range scan over the clustering field touches pages in
+    /// proportion to the range, not the collection. Placement, not content —
+    /// answers never change.
+    SetClusterField {
+        collection: String,
+        field: String,
+    },
+    ClearClusterField {
+        collection: String,
+    },
+    /// Enable delta-varint encoding for sorted integer columns.
+    SetDeltaEncoding(bool),
+    /// Enable per-core sharding of execution (thread-per-core).
+    SetThreadPerCore(bool),
 }
 
 impl Action {
@@ -72,6 +91,8 @@ impl Action {
                 | Action::SetColumnStore(true)
                 | Action::SetDirectLookup(true)
                 | Action::SetMaterializedViews(true)
+                | Action::SetClusterField { .. }
+                | Action::SetDeltaEncoding(true)
         )
     }
 
@@ -100,6 +121,12 @@ impl Action {
             Action::FreezeSchema { collection } => {
                 format!("freeze the schema of {collection}")
             }
+            Action::SetClusterField { collection, field } => {
+                format!("cluster {collection} by {field}")
+            }
+            Action::ClearClusterField { collection } => format!("clear clustering of {collection}"),
+            Action::SetDeltaEncoding(on) => format!("delta encoding {}", on_off(*on)),
+            Action::SetThreadPerCore(on) => format!("thread-per-core {}", on_off(*on)),
         }
     }
 }

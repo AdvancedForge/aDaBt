@@ -34,6 +34,9 @@ pub fn register_builtins(registry: &mut Registry) {
     registry.register(Box::new(DirectLookupOpt));
     registry.register(Box::new(PrefetchOpt));
     registry.register(Box::new(MaterializedViewOpt));
+    registry.register(Box::new(ClusteredSortOpt));
+    registry.register(Box::new(DeltaEncodingOpt));
+    registry.register(Box::new(ThreadPerCoreOpt));
 }
 
 // -- materialized views -----------------------------------------------------
@@ -1187,6 +1190,218 @@ impl Optimization for DirectLookupOpt {
     }
 }
 
+// -- clustered sort ---------------------------------------------------------
+
+pub struct ClusteredSortOpt;
+
+const CLUSTERED_SORT_META: OptMeta = OptMeta {
+    name: "clustered_sort",
+    summary: "co-locate records with nearby clustering keys so range scans touch pages in proportion to range",
+    scope_kind: ScopeKind::PerField,
+    min_level: 5,
+    axis_effects: AxisEffects::new(6, -2, -1),
+    requires_guarantees: GuaranteeRequirements::ANY,
+    prerequisites: &[],
+    conflicts_with: &[],
+    reversibility: Reversibility::Instant,
+};
+
+const MIN_ROWS_FOR_CLUSTER: usize = 5_000;
+const MIN_QUERIES_FOR_CLUSTER: u64 = 10;
+
+impl ClusteredSortOpt {
+    fn candidates(ctx: &OptContext<'_>) -> Vec<(String, String)> {
+        ctx.telemetry
+            .most_range_filtered_fields()
+            .into_iter()
+            .filter(|(c, f, n)| {
+                *n >= MIN_QUERIES_FOR_CLUSTER
+                    && ctx.rows_in(c) >= MIN_ROWS_FOR_CLUSTER
+                    && ctx
+                        .filtered_fields
+                        .iter()
+                        .any(|(cc, ff, _)| cc == c && ff == f)
+            })
+            .map(|(c, f, _)| (c, f))
+            .collect()
+    }
+}
+
+impl Optimization for ClusteredSortOpt {
+    fn meta(&self) -> &OptMeta {
+        &CLUSTERED_SORT_META
+    }
+
+    fn candidate_scopes(&self, ctx: &OptContext<'_>) -> Vec<String> {
+        Self::candidates(ctx)
+            .into_iter()
+            .map(|(c, f)| format!("{c}.{f}"))
+            .collect()
+    }
+
+    fn applicability(&self, ctx: &OptContext<'_>) -> Applicability {
+        let ranges = ctx.telemetry.most_range_filtered_fields();
+        if ranges.is_empty() {
+            return Applicability::NotYet("no query has used a range predicate yet".to_string());
+        }
+        if Self::candidates(ctx).is_empty() {
+            let (c, f, n) = &ranges[0];
+            let detail = if *n < MIN_QUERIES_FOR_CLUSTER {
+                format!("{c}.{f} ranged only {n} times, below the {MIN_QUERIES_FOR_CLUSTER} needed")
+            } else {
+                format!(
+                    "{c} holds {} rows, below the {MIN_ROWS_FOR_CLUSTER} at which clustering pays",
+                    ctx.rows_in(c)
+                )
+            };
+            return Applicability::NotYet(detail);
+        }
+        Applicability::Applicable
+    }
+
+    fn estimate(&self, ctx: &OptContext<'_>) -> CostEstimate {
+        let candidates = Self::candidates(ctx);
+        let rows: usize = candidates.iter().map(|(c, _)| ctx.rows_in(c)).sum();
+        CostEstimate::faster(0.5, 0.4)
+            .with_ram(0)
+            .with_maintenance(0.05)
+            .with_confidence(0.4)
+            .with_build(BuildCost {
+                estimated_secs: rows as f64 / 2e6,
+                rows_read: rows as u64,
+                online: true,
+            })
+    }
+
+    fn plan_enable(&self, _ctx: &OptContext<'_>, scope: &str, _params: &Params) -> ChangePlan {
+        let Some((collection, field)) = split_scope(scope) else {
+            return ChangePlan::default();
+        };
+        ChangePlan::new(
+            vec![Action::SetClusterField {
+                collection: collection.clone(),
+                field: field.clone(),
+            }],
+            vec![Action::ClearClusterField { collection }],
+        )
+    }
+
+    fn plan_disable(&self, _ctx: &OptContext<'_>, scope: &str, _params: &Params) -> ChangePlan {
+        let Some((collection, _)) = split_scope(scope) else {
+            return ChangePlan::default();
+        };
+        ChangePlan::new(vec![Action::ClearClusterField { collection }], vec![])
+    }
+}
+
+// -- delta encoding ---------------------------------------------------------
+
+pub struct DeltaEncodingOpt;
+
+const DELTA_ENCODING_META: OptMeta = OptMeta {
+    name: "delta_encoding",
+    summary: "use delta-varint for sorted integer columns (block directory bounded access)",
+    scope_kind: ScopeKind::Global,
+    min_level: 4,
+    axis_effects: AxisEffects::new(3, -1, 0),
+    requires_guarantees: GuaranteeRequirements::ANY,
+    prerequisites: &[],
+    conflicts_with: &[],
+    reversibility: Reversibility::RebuildRequired,
+};
+
+impl Optimization for DeltaEncodingOpt {
+    fn meta(&self) -> &OptMeta {
+        &DELTA_ENCODING_META
+    }
+
+    fn applicability(&self, ctx: &OptContext<'_>) -> Applicability {
+        let biggest = ctx.collections.iter().map(|(_, n)| *n).max().unwrap_or(0);
+        if biggest < 2_000 {
+            return Applicability::NotYet(format!(
+                "largest collection holds {biggest} rows, below the 2,000 at which delta pays"
+            ));
+        }
+        if ctx.collections.is_empty() {
+            return Applicability::NotYet("no collections yet".to_string());
+        }
+        Applicability::Applicable
+    }
+
+    fn estimate(&self, ctx: &OptContext<'_>) -> CostEstimate {
+        let rows: usize = ctx.collections.iter().map(|(_, n)| n).sum();
+        CostEstimate::faster(0.9, 0.9)
+            .with_ram(-(rows as i64 * 8))
+            .with_confidence(0.5)
+            .with_build(BuildCost {
+                estimated_secs: rows as f64 / 1e6,
+                rows_read: rows as u64,
+                online: true,
+            })
+    }
+
+    fn plan_enable(&self, _ctx: &OptContext<'_>, _scope: &str, _params: &Params) -> ChangePlan {
+        ChangePlan::new(
+            vec![Action::SetDeltaEncoding(true)],
+            vec![Action::SetDeltaEncoding(false)],
+        )
+    }
+
+    fn plan_disable(&self, _ctx: &OptContext<'_>, _scope: &str, _params: &Params) -> ChangePlan {
+        ChangePlan::new(vec![Action::SetDeltaEncoding(false)], vec![])
+    }
+}
+
+// -- thread-per-core --------------------------------------------------------
+
+pub struct ThreadPerCoreOpt;
+
+const THREAD_PER_CORE_META: OptMeta = OptMeta {
+    name: "thread_per_core",
+    summary: "per-core sharding with pinning and run-to-completion",
+    scope_kind: ScopeKind::Global,
+    min_level: 9,
+    axis_effects: AxisEffects::new(8, -6, 0),
+    requires_guarantees: GuaranteeRequirements::ANY,
+    prerequisites: &[],
+    conflicts_with: &[],
+    reversibility: Reversibility::RebuildRequired,
+};
+
+impl Optimization for ThreadPerCoreOpt {
+    fn meta(&self) -> &OptMeta {
+        &THREAD_PER_CORE_META
+    }
+
+    fn applicability(&self, ctx: &OptContext<'_>) -> Applicability {
+        let biggest = ctx.collections.iter().map(|(_, n)| *n).max().unwrap_or(0);
+        if biggest < 10_000 {
+            return Applicability::NotYet(format!(
+                "largest collection holds {biggest} rows, below the 10,000 at which per-core sharding pays"
+            ));
+        }
+        Applicability::Applicable
+    }
+
+    fn estimate(&self, _ctx: &OptContext<'_>) -> CostEstimate {
+        CostEstimate::faster(0.6, 0.5)
+            .with_ram(0)
+            .with_maintenance(0.05)
+            .with_confidence(0.3)
+    }
+
+    fn plan_enable(&self, _ctx: &OptContext<'_>, _scope: &str, _params: &Params) -> ChangePlan {
+        ChangePlan::new(
+            vec![Action::SetThreadPerCore(true)],
+            vec![Action::SetThreadPerCore(false)],
+        )
+    }
+
+    fn plan_disable(&self, _ctx: &OptContext<'_>, _scope: &str, _params: &Params) -> ChangePlan {
+        ChangePlan::new(vec![Action::SetThreadPerCore(false)], vec![])
+    }
+}
+
 // -- shared helpers ---------------------------------------------------------
 
 /// Cache size from the level preset, falling back to a default.
@@ -1272,8 +1487,8 @@ mod tests {
     fn every_builtin_registers_and_orders() {
         let mut r = Registry::new();
         register_builtins(&mut r);
-        // One more than the last revision: auto_covering_index joined.
-        assert_eq!(r.len(), 12);
+        // Two more than the last revision: clustered_sort, delta_encoding and thread_per_core joined.
+        assert_eq!(r.len(), 15);
         assert!(r.dependency_order().is_ok());
         for n in r.names() {
             assert!(!r.meta(n).unwrap().summary.is_empty(), "{n} has no summary");

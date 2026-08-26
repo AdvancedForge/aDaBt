@@ -3038,6 +3038,27 @@ impl ActionSink for Database {
                 }
             }
             Action::FreezeSchema { collection } => self.freeze_schema(collection).map(|_| ()),
+            Action::SetClusterField { collection, field } => {
+                self.declare_cluster_field(collection, field)
+            }
+            Action::ClearClusterField { collection } => self.clear_cluster_field(collection),
+            Action::SetDeltaEncoding(on) => {
+                // Delta varint is currently automatic at checkpoints
+                // (Column::Delta, power-of-two lengths, block directory).
+                // The optimizer proposal now exists and is measured; wiring
+                // it to a per-collection flag is the next storage step.
+                let _ = on;
+                Ok(())
+            }
+            Action::SetThreadPerCore(on) => {
+                // Shared-nothing sharding already partitions by RecordId % shards
+                // with per-shard Mutex. Full thread-per-core (pinning,
+                // per-core memory, run-to-completion) is M28, soak-gated;
+                // this action exists so the optimizer can propose it and it is
+                // visible in the level table rather than silent.
+                let _ = on;
+                Ok(())
+            }
             Action::SetColumnStore(on) => {
                 if *on {
                     self.enable_column_store()

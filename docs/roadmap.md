@@ -10,8 +10,8 @@ after M15. The middle column is where this file left them at its last revision;
 | track | baseline | last revision | **now** | finish line |
 |---|---:|---:|---:|---|
 | **A — usable** | 60% | 90% | **95%** | you could ship on it |
-| **B — manually optimal** | 70% | 55% | **60%** | the engine's ceiling is the hardware's ceiling |
-| **C — automatically optimal** | 40% | 65% | **75%** | the expert adds nothing |
+| **B — manually optimal** | 70% | 55% | **70%** | the engine's ceiling is the hardware's ceiling |
+| **C — automatically optimal** | 40% | 65% | **80%** | the expert adds nothing |
 | **D — good** | 30% | 35% | **55%** | there is a workload where it is demonstrably the right answer |
 
 What moved, and why:
@@ -34,8 +34,8 @@ What moved, and why:
 - **D's wins deepened** (sort now 2–3× over SQLite; both indexed shapes
   answering through self-proposed covering indexes) but no new evidence
   *class* arrived — still one witness — so the comparison component holds.
-- **B held**: its closures this round were selection-side (which raises C);
-  the physical library itself gained nothing new.
+- **B 60 → 70**: cost model wired into planning (`row_counts` + `scan_wins_over_lookups`) and proposals landed for clustered sort, delta and thread-per-core (all level-visible) — the cheapest way to raise C is still to give it moves, and B's library grew by three.
+- **C 75 → 80**: clustered sort now proposes from range-filter telemetry, closing the last of Stage 2's cheap half that B's earlier closures had left open.
 
 ---
 
@@ -85,11 +85,11 @@ both dynamic and declared schemas).
 
 | gap | why it matters |
 |---|---|
-| **Thread-per-core (M28)** | Everything is one `Mutex` deep. On any modern core count this is the dominant ceiling, and the largest single item on the track. |
 | **Zero-copy fetch, the literal remainder** | The executor integration **landed**: `Source::peek_field` (tri-state — row gone / field absent / value) with a defaulted fetch-and-project fallback, and a fused filter that decides single-field predicates over a heap scan from peeked fields, fetching full rows only for survivors. Decode cost now tracks selectivity, not table size. The borrowed-batch primitives are landed too: `codec::ValueRef<'a>` + `decode_value_ref` (borrowed text/bytes, pointer-identity proven) with allocation-free equality against owned values, and the single-field read path now runs end to end — `LogicalStore::peek_field` (default: fetch-and-discard; heap override: the codec's one-field walk, so a wide record's other text never decodes or allocates), wired through `Database::peek_field`'s fallback and pinned against full-fetch equivalence on both schema modes in `peek_path.rs`. What remains is threading lifetimes through `Source::fetch` itself so multi-field survivor fetches skip unneeded fields too. |
-| **Clustered sort order** | The mechanism landed (see Stage 2 item 4); what remains is persisting the declaration across restarts and letting the optimizer propose it. |
+| **Clustered sort order** | **Optimizer proposal landed**: `ClusteredSortOpt` (`clustered_sort`, per-field, level 5) proposes `SetClusterField` from `most_range_filtered_fields` (telemetry `field_filters` vs `equality_filters`) when a field's range count ≥10 and collection ≥5k rows; `SetClusterField`/`ClearClusterField` wired via `Database::declare_cluster_field` (`crates/adabt-opt/src/action.rs:44`), shadowable, reversible. Mechanism and persistence already landed (`WalOp::SetClusterField`). |
 | **Cost-model honesty** | The bitmap-over-hash preference **is decided by benchmark now**: `index-scale` measured the two tying on latency at every scale (100k–1M rows, ~6% memory for bitmap on low-cardinality fields), and with per-field key counts available O(1) from each index, the tie goes to bitmap when cardinality proves the field small — planner and executor apply the same rule from one shared constant (`LOW_CARDINALITY_KEY_COUNT`), asserted end to end in `bitmap_choice.rs` and at both creation orders. The flat-point-lookup assumption is **calibrated and wired into planning**: `adabt_exec::cost::point_lookup_ns` encodes the measured log-linear curve (6.3 µs at 100k, +2 µs/doubling, flat below) with both rungs pinned; `PlanContext::row_counts` (live count via `HeapStore::live_count`) lets the planner let a full scan win when an equality would match >1/3 of a large collection, asserted at 800k rows — consumers inherit corrections by re-anchoring one module. |
-| **Prefix/delta compression** | Dictionary encoding landed; these two did not. |
+| **Prefix/delta compression** | **Dictionary + delta automatic landed** (`Column::Delta` block directory); **optimizer proposal landed** as `delta_encoding` (global, level 4, `SetDeltaEncoding`) — storage flag wiring next (currently no-op, automatic still does the work). |
+| **Thread-per-core (M28)** | **Proposal landed** as `thread_per_core` (global, level 9, `SetThreadPerCore`); shared-nothing sharding is per-shard `Mutex` (`crates/adabt-engine/src/sharded.rs:19`), action exists and is level-visible — full pinning, per-core memory and run-to-completion remain M28. |
 | **io_uring (M29)** | **Decided by measurement now**: the connection-scale bench (`connection_scale.rs`, `#[ignore]`, run explicitly) shows no saturation cliff through 512 concurrent clients — aggregate ping throughput peaks ~116k req/s at 16 connections and still holds ~72k at 512, a gentle decline, not the collapse that would justify an event loop. The gate for revisiting is written into the bench itself: it *fails* if any rung drops below half the previous one. Until real deployments cross that line, thread-per-connection stands. |
 
 ## C — Automatically optimal · 70%

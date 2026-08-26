@@ -206,6 +206,29 @@ impl Snapshot {
         Some(self.equality_filters.get(&key).copied().unwrap_or(0) as f64 / total)
     }
 
+    /// Range filter count for this field.
+    pub fn range_count(&self, collection: &str, field: &str) -> u64 {
+        let key = (collection.to_string(), field.to_string());
+        let total = self.field_filters.get(&key).copied().unwrap_or(0);
+        let eq = self.equality_filters.get(&key).copied().unwrap_or(0);
+        total.saturating_sub(eq)
+    }
+
+    /// Fields ranked by how often queries used a range predicate on them.
+    pub fn most_range_filtered_fields(&self) -> Vec<(String, String, u64)> {
+        let mut v: Vec<(String, String, u64)> = self
+            .field_filters
+            .keys()
+            .map(|(c, f)| {
+                let n = self.range_count(c, f);
+                (c.clone(), f.clone(), n)
+            })
+            .filter(|(_, _, n)| *n > 0)
+            .collect();
+        v.sort_by(|a, b| b.2.cmp(&a.2).then((&a.0, &a.1).cmp(&(&b.0, &b.1))));
+        v
+    }
+
     /// Times the planner chose this index. Zero means it is pure overhead.
     pub fn index_use_count(&self, collection: &str, field: &str) -> u64 {
         self.index_usage
