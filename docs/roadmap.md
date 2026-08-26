@@ -258,9 +258,17 @@ In order:
    restarts (catalog + `WalOp::SetClusterField`, tested end to end, clear
    persists too); placement ranges re-derive from new keyed inserts. *Still
    open:* optimizer proposals, reclustering existing data.
-5. **Prefix/delta compression** alongside dictionary encoding. *Finish test:*
-   stored bytes on sorted-key collections fall measurably further, decode cost
-   within a stated bound of today's.
+5. **Prefix/delta compression** — **landed**: integer columns whose values
+   arrive non-decreasing convert to delta-zigzag-varint encoding at
+   power-of-two length checkpoints (`Column::Delta`, geometrically spaced so
+   oscillating streams pay one failed attempt per doubling; a descending
+   value demotes back to plain losslessly). Sorted 8k-row column: ~3× less
+   memory than the plain form; random data never converts. Random access is
+   bounded: a block-level byte directory means any row decodes in at most
+   `DELTA_BLOCK_ROWS` varint reads. Answers identical to the plain form,
+   asserted row-by-row including nulls and demotion. *Still open:* exposing
+   the conversion to the optimizer as a proposal rather than an automatic
+   policy.
 
 *Why here:* small relative to Stage 4, directly exploits Stage 1's evidence,
 and each closure widens C's move set — the cheapest way to raise Track C is to

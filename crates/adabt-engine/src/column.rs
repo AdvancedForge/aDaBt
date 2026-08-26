@@ -100,9 +100,84 @@ enum Column {
         dict: Vec<String>,
         codes: Vec<Option<u32>>,
     },
+    /// Delta-varint integers — the prefix/delta answer to sorted keys.
+    ///
+    /// A column whose values arrive non-decreasing (a clustered key, an
+    /// auto-increment id, timestamps) does not need eight bytes a row to say
+    /// what the previous row already implied: each row stores a zigzag-varint
+    /// offset from the *first* value, typically one or two bytes, plus a
+    /// block-level byte directory so random access decodes at most one
+    /// block's worth of rows. Nulls encode as a single zero byte; value
+    /// encodings are shifted by one so they can never begin with it.
+    ///
+    /// Conversion is deliberate and geometrically spaced — attempted when a
+    /// plain column's length crosses a power of two, undone the moment a
+    /// descending value arrives — so a stream that oscillates pays one failed
+    /// attempt per doubling, never a per-row tax.
+    Delta {
+        first: i64,
+        last: i64,
+        rows: usize,
+        /// Byte offset just past the last row of each completed block of
+        /// [`DELTA_BLOCK_ROWS`] rows. Row lookup starts from its block's
+        /// beginning and walks at most that many encodings.
+        block_ends: Vec<u32>,
+        bytes: Vec<u8>,
+        /// Whether to hand values back as `U64` (an `U64` column whose values
+        /// all fit `i64`).
+        as_u64: bool,
+    },
     /// Anything that does not fit a typed column.
     Other(Vec<Option<Value>>),
 }
+
+impl Default for Column {
+    fn default() -> Self {
+        Column::Other(Vec::new())
+    }
+}
+
+fn zigzag(n: i64) -> u64 {
+    ((n << 1) ^ (n >> 63)) as u64
+}
+
+fn unzigzag(v: u64) -> i64 {
+    ((v >> 1) as i64) ^ -((v & 1) as i64)
+}
+
+fn write_varint(mut v: u64, out: &mut Vec<u8>) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            break;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn read_varint(buf: &[u8]) -> (u64, usize) {
+    let mut v = 0u64;
+    let mut shift = 0;
+    for (i, &b) in buf.iter().enumerate() {
+        v |= ((b & 0x7f) as u64) << shift;
+        if b & 0x80 == 0 {
+            return (v, i + 1);
+        }
+        shift += 7;
+    }
+    (v, buf.len())
+}
+
+/// The length at which a plain integer column first becomes eligible for
+/// delta conversion, and again at each doubling.
+const DELTA_MIN_ROWS: usize = 128;
+
+/// Rows per byte-directory entry. Random access walks at most this many
+/// varints — a bounded, tiny decode cost, traded for not paying four bytes
+/// of directory per row.
+const DELTA_BLOCK_ROWS: usize = 32;
 
 impl Column {
     fn len(&self) -> usize {
@@ -112,8 +187,130 @@ impl Column {
             Column::U64(v) => v.len(),
             Column::F64(v) => v.len(),
             Column::Dict { codes, .. } => codes.len(),
+            Column::Delta { rows, .. } => *rows,
             Column::Other(v) => v.len(),
         }
+    }
+
+    /// Reconstruct every row as an owned optional integer, in the column's
+    /// declared width. What expanding a delta column back to plain costs —
+    /// paid once, the moment a value arrives out of order.
+    fn delta_rows(&self) -> Option<(Vec<Option<i64>>, bool)> {
+        match self {
+            Column::Delta {
+                first, rows, bytes, ..
+            } => {
+                let mut out = Vec::with_capacity(*rows);
+                let mut pos = 0usize;
+                for _ in 0..*rows {
+                    let (z, used) = read_varint(&bytes[pos..]);
+                    out.push(if z == 0 {
+                        None
+                    } else {
+                        Some(first + unzigzag(z - 1))
+                    });
+                    pos += used;
+                }
+                let as_u64 = matches!(self, Column::Delta { as_u64: true, .. });
+                Some((out, as_u64))
+            }
+            _ => None,
+        }
+    }
+
+    /// The byte span of one row's encoding: from its block's start offset,
+    /// walking at most [`DELTA_BLOCK_ROWS`] varints forward.
+    fn delta_row_span(&self, row: usize) -> Option<(usize, usize)> {
+        let Column::Delta {
+            rows,
+            block_ends,
+            bytes,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        if row >= *rows {
+            return None;
+        }
+        let bi = row / DELTA_BLOCK_ROWS;
+        let lo = if bi == 0 {
+            0
+        } else {
+            block_ends.get(bi - 1).copied().unwrap_or(0) as usize
+        };
+        let hi = if (bi + 1) * DELTA_BLOCK_ROWS <= *rows && bi < block_ends.len() {
+            block_ends[bi] as usize
+        } else {
+            bytes.len()
+        };
+        let mut pos = lo;
+        let mut idx = bi * DELTA_BLOCK_ROWS;
+        while idx < row && pos < hi {
+            let (_, used) = read_varint(&bytes[pos..]);
+            pos += used;
+            idx += 1;
+        }
+        Some((pos, hi.min(pos + 16)))
+    }
+
+    /// Attempt delta conversion at a checkpoint length. Succeeds only when
+    /// every present value is non-decreasing (and an `U64` column's values
+    /// fit `i64`), which is checked in one pass; anything else keeps the
+    /// plain form and tries again at the next doubling.
+    fn maybe_compress(col: &mut Column) {
+        let taken = std::mem::take(col);
+        let (plain, as_u64): (Vec<Option<i64>>, bool) = match taken {
+            Column::I64(v) => (v, false),
+            Column::U64(v) => (v.into_iter().map(|s| s.map(|x| x as i64)).collect(), true),
+            other => {
+                *col = other;
+                return;
+            }
+        };
+        let n = plain.len();
+        // Eligibility in one pass: every present value non-decreasing.
+        let mut prev: Option<i64> = None;
+        let sorted = plain.iter().all(|s| match *s {
+            None => true,
+            Some(v) => {
+                let ok = prev.is_none_or(|p| v >= p);
+                prev = Some(v);
+                ok
+            }
+        });
+        if !n.is_power_of_two() || n < DELTA_MIN_ROWS || !sorted {
+            *col = if as_u64 {
+                Column::U64(plain.into_iter().map(|s| s.map(|x| x as u64)).collect())
+            } else {
+                Column::I64(plain)
+            };
+            return;
+        }
+        let first = plain.iter().find_map(|s| *s).unwrap_or(0);
+        let mut bytes = Vec::new();
+        let mut last = first;
+        let mut block_ends: Vec<u32> = Vec::new();
+        for (i, s) in plain.iter().enumerate() {
+            match *s {
+                None => bytes.push(0),
+                Some(v) => {
+                    write_varint(zigzag(v - first) + 1, &mut bytes);
+                    last = v;
+                }
+            }
+            if (i + 1) % DELTA_BLOCK_ROWS == 0 {
+                block_ends.push(bytes.len() as u32);
+            }
+        }
+        *col = Column::Delta {
+            first,
+            last,
+            rows: n,
+            block_ends,
+            bytes,
+            as_u64,
+        };
     }
 
     fn get(&self, row: usize) -> Option<Value> {
@@ -128,16 +325,111 @@ impl Column {
                 .flatten()
                 .and_then(|c| dict.get(c as usize))
                 .map(|s| Value::Str(s.clone())),
+            Column::Delta { first, as_u64, .. } => {
+                let (lo, hi) = self.delta_row_span(row)?;
+                if lo >= hi {
+                    return None;
+                }
+                let Column::Delta { bytes, .. } = self else {
+                    unreachable!("matched above")
+                };
+                let row_bytes = &bytes[lo..hi];
+                if row_bytes[0] == 0 {
+                    return None;
+                }
+                let (z, _) = read_varint(row_bytes);
+                let v = first + unzigzag(z - 1);
+                Some(if *as_u64 {
+                    Value::U64(v as u64)
+                } else {
+                    Value::I64(v)
+                })
+            }
             Column::Other(v) => v.get(row).cloned().flatten(),
         }
     }
 
     fn push(&mut self, v: Option<&Value>) {
+        match v {
+            Some(Value::I64(n)) => self.push_int(*n, false),
+            Some(Value::U64(n)) => self.push_int(*n as i64, true),
+            other => self.push_non_integer(other.cloned().as_ref()),
+        }
+    }
+
+    /// Integers are the one type with two physical forms — plain and delta —
+    /// so their arrival may upgrade a plain column that has gone sorted, or
+    /// demote a delta column that has stopped being so.
+    fn push_int(&mut self, n: i64, src_u64: bool) {
+        if matches!(self, Column::Delta { .. }) {
+            return self.delta_push_int(n, src_u64);
+        }
+        let matched = match self {
+            Column::I64(c) => {
+                c.push(Some(n));
+                true
+            }
+            Column::U64(c) if src_u64 => {
+                c.push(Some(n as u64));
+                true
+            }
+            // A value that does not match its column's type: record the
+            // absence rather than guessing. The heap remains authoritative,
+            // so a query needing exactness can always fall back to it.
+            _ => false,
+        };
+        if matched {
+            Column::maybe_compress(self);
+        } else {
+            self.push_null();
+        }
+    }
+
+    fn delta_push_int(&mut self, n: i64, src_u64: bool) {
+        let in_order = match self {
+            Column::Delta { last, .. } => n >= *last,
+            _ => unreachable!("checked by caller"),
+        };
+        if in_order {
+            if let Column::Delta {
+                first,
+                last,
+                rows,
+                block_ends,
+                bytes,
+                ..
+            } = self
+            {
+                write_varint(zigzag(n - *first) + 1, bytes);
+                *rows += 1;
+                // This row just completed a block; record where it ends.
+                if *rows % DELTA_BLOCK_ROWS == 0 {
+                    block_ends.push(bytes.len() as u32);
+                }
+                *last = n;
+            }
+            return;
+        }
+        // Out of order: pay the expansion once and continue plain.
+        let (rows, was_u64) = std::mem::take(self).delta_rows().expect("is Delta");
+        *self = if was_u64 {
+            Column::U64(rows.into_iter().map(|r| r.map(|x| x as u64)).collect())
+        } else {
+            Column::I64(rows)
+        };
+        self.push(
+            Some(if src_u64 {
+                Value::U64(n as u64)
+            } else {
+                Value::I64(n)
+            })
+            .as_ref(),
+        );
+    }
+
+    fn push_non_integer(&mut self, v: Option<&Value>) {
         match (self, v) {
             (Column::Bool(c), Some(Value::Bool(b))) => c.push(Some(*b)),
-            (Column::I64(c), Some(Value::I64(n))) => c.push(Some(*n)),
-            (Column::I64(c), Some(Value::U64(n))) => c.push(Some(*n as i64)),
-            (Column::U64(c), Some(Value::U64(n))) => c.push(Some(*n)),
             (Column::F64(c), Some(Value::F64(f))) => c.push(Some(*f)),
             (Column::Dict { dict, codes }, Some(Value::Str(s))) => {
                 let code = match dict.iter().position(|d| d == s) {
@@ -150,9 +442,8 @@ impl Column {
                 codes.push(Some(code));
             }
             (Column::Other(c), v) => c.push(v.cloned()),
-            // A value that does not match its column's type: record the absence
-            // rather than guessing. The heap remains authoritative, so a query
-            // needing exactness can always fall back to it.
+            // A delta column is integers-only; anything else (including a
+            // null backfill) records the absence in its own encoding.
             (col, _) => col.push_null(),
         }
     }
@@ -164,6 +455,19 @@ impl Column {
             Column::U64(v) => v.push(None),
             Column::F64(v) => v.push(None),
             Column::Dict { codes, .. } => codes.push(None),
+            Column::Delta {
+                rows,
+                bytes,
+                block_ends,
+                ..
+            } => {
+                // A null is one byte, never a legal varint start.
+                bytes.push(0);
+                *rows += 1;
+                if *rows % DELTA_BLOCK_ROWS == 0 {
+                    block_ends.push(bytes.len() as u32);
+                }
+            }
             Column::Other(v) => v.push(None),
         }
     }
@@ -192,6 +496,11 @@ impl Column {
             Column::Dict { dict, codes } => {
                 codes.len() * 5 + dict.iter().map(|s| s.len() + 24).sum::<usize>()
             }
+            // The delta win: one or two bytes of offset per row plus a tiny
+            // block directory, against nine bytes for the plain form.
+            Column::Delta {
+                bytes, block_ends, ..
+            } => bytes.len() + block_ends.len() * 4 + 48,
             Column::Other(v) => v.len() * 48,
         }
     }
@@ -455,6 +764,87 @@ impl ColumnStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sorted_integers_go_delta_and_read_back_identically() {
+        let mut col = Column::for_value(&Value::I64(0));
+        // Sequential with nulls interleaved — the clustered-key shape.
+        for i in 0..2_000i64 {
+            if i % 97 == 0 {
+                col.push(None);
+            } else {
+                col.push(Some(&Value::I64(1_000_000 + i * 3)));
+            }
+        }
+        assert!(
+            matches!(col, Column::Delta { .. }),
+            "a sorted column should be delta-encoded by now"
+        );
+        let mut expect_row = 0i64;
+        for i in 0..2_000i64 {
+            let want = if i % 97 == 0 {
+                None
+            } else {
+                expect_row += 1;
+                Some(Value::I64(1_000_000 + i * 3))
+            };
+            assert_eq!(col.get(i as usize), want, "row {i}");
+        }
+        let _ = expect_row;
+    }
+
+    #[test]
+    fn unsorted_integers_stay_plain() {
+        let mut col = Column::for_value(&Value::I64(0));
+        for i in 0..4_000i64 {
+            // Deterministic scatter: alternating up and down.
+            let v = if i % 2 == 0 { i } else { 3_000 - i };
+            col.push(Some(&Value::I64(v)));
+        }
+        assert!(
+            !matches!(col, Column::Delta { .. }),
+            "a scattered column has no delta win to take"
+        );
+        for i in 0..4_000i64 {
+            let v = if i % 2 == 0 { i } else { 3_000 - i };
+            assert_eq!(col.get(i as usize), Some(Value::I64(v)));
+        }
+    }
+
+    #[test]
+    fn a_descending_value_demotes_delta_back_to_plain_without_loss() {
+        let mut col = Column::for_value(&Value::I64(0));
+        for i in 0..300i64 {
+            col.push(Some(&Value::I64(i)));
+        }
+        assert!(matches!(col, Column::Delta { .. }));
+        col.push(Some(&Value::I64(-5)));
+        assert!(!matches!(col, Column::Delta { .. }), "should have expanded");
+        for i in 0..300i64 {
+            assert_eq!(col.get(i as usize), Some(Value::I64(i)));
+        }
+        assert_eq!(col.get(300), Some(Value::I64(-5)));
+    }
+
+    #[test]
+    fn delta_encoding_costs_sorted_columns_far_less_memory() {
+        let sorted_build = || {
+            let mut col = Column::for_value(&Value::I64(0));
+            for i in 0..8_192i64 {
+                col.push(Some(&Value::I64(i)));
+            }
+            col
+        };
+        let plain = Column::I64((0..8_192).map(Some).collect());
+        let delta = sorted_build();
+        assert!(matches!(delta, Column::Delta { .. }));
+        assert!(
+            delta.memory_bytes() * 2 <= plain.memory_bytes(),
+            "sorted {} vs plain {}",
+            delta.memory_bytes(),
+            plain.memory_bytes()
+        );
+    }
 
     fn rows(n: u64) -> Vec<(RecordId, Record)> {
         const COUNTRIES: [&str; 4] = ["NO", "SE", "DK", "FI"];
