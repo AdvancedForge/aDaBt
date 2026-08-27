@@ -106,6 +106,10 @@ fn main() {
             },
             "--tls-cert" => tls_cert = args.next().map(PathBuf::from),
             "--tls-key" => tls_key = args.next().map(PathBuf::from),
+            "--version" => {
+                println!("adabt-server 0.1.0-alpha.1");
+                return;
+            }
             "-h" | "--help" => {
                 print!("{USAGE}");
                 return;

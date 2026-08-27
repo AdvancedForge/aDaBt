@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.1.0-alpha.1-alpha.1 — 2026-08-26
+## 0.1.0-alpha.1 — 2026-08-26
 
-Private pre-release, closed distribution. All four tracks `docs/roadmap.md:10` scored **100%** per defined finish lines (`replication` permanently out-of-scope `docs/replication-decision.md`).
+Initial public alpha release. Experimental, RAM-resident, single-node Rust database with adaptive physical optimization (`docs/getting-started.md`). Not production-ready (`docs/limitations.md`).
 
 **Workspace version `0.1.0-alpha.1`**, `catalog` v4 (`delta_encoding`/`thread_per_core` persisted, v3 forward-compatible), `superblock` gate `FORMAT_VERSION` unchanged.
 

@@ -15,6 +15,7 @@ Status: `0.1.0-alpha.1` — experimental, not production-ready.
 - Full serializable isolation — `Strict` validates point reads; predicate phantoms remain possible
 - Persistent thread-per-core workers — burst pinning only (`core_affinity` per query)
 - Atomic cross-shard visibility — coordinator-decides durability (`XSH1`), not 2PC
+- `loom` test feature: `adabt-storage` verified; `adabt-engine` feature-gated but cross-crate `Arc`/`Mutex` substitution requires broader design work before full `--all-features` verification
 
 ## Current guarantees
 - Catalog v4 (`FORMAT_VERSION`): forward-compatible, backward-compatible with v3

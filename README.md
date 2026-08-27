@@ -1,16 +1,15 @@
 # aDaBt
 
+**Status:** `0.1.0-alpha.1` — experimental public alpha, not production-ready. See `docs/limitations.md`.
+
 A database whose **logical interface stays fixed while its physical
 implementation ranges from completely conventional to radically specialized** —
 and where the choice of specialization can be made by a human or by the database
 itself, through the same mechanism.
 
-Status: **All four tracks 100%** — `docs/roadmap.md` scored at **A 100% / B 100% / C 100% / D 100%**. The comparison is published (4/8 wins vs SQLite, losses included, RocksDB/Postgres witnesses in CI), covering/partial/composite/bitmap indexes propose from traffic, scale is **RAM-bound by design** (`docs/scale-decision.md`), settled decisions are re-examined every cycle (`KEEP_SCORE`), `adabt-cli` + `adabt-ffi` + `core_affinity` pinning + 2PC coordinator (`ShardedDatabase::commit_coordinated`) are landed. ~1,200 tests, 17 optimizations, level 6 compound reasoning.
+Roadmap: all four tracks reach their defined 100% finish lines (`docs/roadmap.md`); replication is permanently out of scope. See `docs/getting-started.md` for the quickstart and `docs/limitations.md` for what is not promised.
 
-Start with **`docs/roadmap.md`** — where the four tracks stand now and the
-ordered plan to their finish lines. `docs/diagnosis.md` is the original
-post-M15 accounting that the roadmap scores against; milestone notes and
-measurements are in `docs/`.
+Start with **`docs/getting-started.md`** — embedded quickstart, server quickstart with correct flags (`--data`, `--listen`, `--tls-cert`, `--tls-key`), and the adaptive optimization demonstration. `docs/architecture.md` explains the design. `docs/limitations.md` is the honest accounting of what is not promised. Milestone measurements are in `docs/benchmarks/` and `docs/history/`.
 
 ## Layout
 
@@ -60,7 +59,7 @@ reproducible, until it forced the driver to re-examine settled decisions —
 every cycle now re-scores what is enabled under the calibrated cost model
 (`docs/roadmap.md`, Track C). Against the outside witness the aggregate
 phase now tells the opposite story: tuned group-by beats SQLite by four
-orders of magnitude (`docs/comparison-notes.md`).
+orders of magnitude (`docs/benchmarks/comparison-notes.md`).
 
 ## Six ideas that carry the design
 
@@ -104,8 +103,7 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Artefacts go to `~/.cargo-target/adabt` — the source lives on a 9p-mounted
-Windows drive where Cargo's I/O is 5–15× slower.
+Artefacts go to the workspace `target/` directory (default Cargo behavior).
 
 ## Benchmarks
 
@@ -126,14 +124,14 @@ version of these numbers was wrong because of it.
 `comparison/` (a **separate workspace**, excluded from the root) runs aDaBt against
 SQLite on workloads chosen to include the ones aDaBt should lose. Invoke as
 `cargo run --manifest-path comparison/Cargo.toml --release` (not `cargo run -p adabt-comparison` from root, which does not resolve). The numbers
-are published in `docs/comparison-notes.md`: at its best configuration aDaBt
+are published in `docs/benchmarks/comparison-notes.md`: at its best configuration aDaBt
 wins **4 of 8** — point lookups, post-tuning count/group-by at four orders of
 magnitude through its column store and materialized views, and top-20 sort at
 2–3× over SQLite by selecting k winners from raw columnar cells instead of
 sorting the collection. The indexed shapes answer through self-proposed
 covering indexes (`auto_covering_index`: hash-backed for equality evidence,
 b-tree-backed for ranges) and sit at 1.5–2.4×; what remains is projection
-fetch cost, not structure choice. `comparison` also parses `--witness postgres|rocksdb` as **planned witnesses** — `comparison/src/main.rs:8` fail-fasts (exit 2) when `DATABASE_URL`/`rocksdb` driver unavailable rather than pretending SQLite numbers are those DBs. It loses bulk load and single-row inserts —
+fetch cost, not structure choice. `docs/benchmarks/` also notes that `--witness postgres|rocksdb` is planned — `comparison/src/main.rs:8` fail-fasts (exit 2) when `DATABASE_URL`/`rocksdb` driver unavailable rather than pretending SQLite numbers are those DBs. It loses bulk load and single-row inserts —
 the price of per-record MVCC and WAL, which it will not trade away.
 
 ## Watching it work
@@ -146,7 +144,7 @@ Runs the adaptive engine against a workload that changes underneath it, with a
 second database pinned at level 0 taking the same queries — any difference in
 results stops the run. It found four defects in its first sitting, all of them
 interactions between components that each passed their own tests, and it is the
-only test here that can see that class of bug. `docs/m15-notes.md` has them.
+only test here that can see that class of bug. `docs/history/m15-notes.md` has them.
 
 ## Proving a change before trusting it
 
@@ -155,14 +153,14 @@ on trial. The structure is built where the planner cannot see it, both paths
 answer the same queries against the same state until the results are known to
 agree, and only then does traffic move — 1%, 10%, 50%, 90% — with any divergence
 or guardrail breach reverting it. `optimize_verified` is the entry point;
-`docs/m14-notes.md` explains what shadow proves that canary cannot, and why.
+`docs/history/m14-notes.md` explains what shadow proves that canary cannot, and why.
 
 Changes that rewrite the primary are refused for the trial with a reason, because
 after one there is no old path left to compare against.
 
 ## What is not built
 
-No replication — explicitly out of scope for 100% (`docs/roadmap.md` "What 100% does not include"). Everything else on the roadmap is landed: cross-shard 2PC coordinator with fsynced `XSH1` journal (`ShardedDatabase::commit_coordinated`, torn-tail safe), serializable `Consistency::Strict` (read-set `first-committer-wins`), TLS (`--tls-cert`/`--tls-key` rustls before any protocol byte), roles + per-collection `Forbidden` floors, thread-per-core pinning (`core_affinity` in `ShardedDatabase::broadcast`, per-shard `BufferPool` per-core memory, `io_uring` correctly decided against by `connection_scale` gate), and compound reasoning (`join_order` + `data_partitioning` level 6). The page directory and every index remain fully resident by design (~470 B/row, `docs/scale-decision.md`), so the practical ceiling is a few million rows per shard — sharding is the growth story.
+No replication — explicitly out of scope (`docs/history/replication-decision.md`). Everything else on the roadmap is landed: cross-shard coordinator-decides durability (`ShardedDatabase::commit_coordinated`, `XSH1` journal, torn-tail safe, windowed visibility), strict read-set validation (`Consistency::Strict`, predicate phantoms remain documented in `docs/limitations.md`), TLS (`--tls-cert`/`--tls-key`), roles + per-collection `Forbidden` floors, best-effort core-pinned shard execution (`core_affinity` burst pinning in broadcast, per-shard `BufferPool` = per-core memory, persistent workers rejected by `connection_scale` gate), compound reasoning (`join_order` + `data_partitioning` level 6). The page directory and every index remain fully resident by design (~470 B/row, `docs/benchmarks/scale-decision.md`), so the practical ceiling is a few million rows per shard — sharding is the growth story.
 
 Joins (hash and indexed nested loop, with spill), multi-statement transactions
 with single-shard snapshot isolation, a SQL `SELECT` front-end, segmented WAL

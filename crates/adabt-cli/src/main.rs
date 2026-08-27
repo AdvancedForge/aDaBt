@@ -34,6 +34,10 @@ fn main() {
             "--level" => {
                 level = args.next().and_then(|v| v.parse().ok()).unwrap_or(4);
             }
+            "--version" => {
+                println!("adabt-cli 0.1.0-alpha.1");
+                std::process::exit(0);
+            }
             "--strict" => strict = true,
             other => {
                 eprintln!("unknown argument {other}");
