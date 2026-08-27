@@ -33,12 +33,12 @@ use adabt_opt::{OptimizationConfig, OptimizationController, Registry};
 use adabt_storage::heap::HeapStore;
 use adabt_telemetry::event::{Event, OpKind};
 use adabt_telemetry::{CollectingProbe, Probe, Snapshot};
+#[cfg(feature = "loom")]
+use loom::sync::Arc;
 use std::collections::HashMap;
 use std::ops::Bound;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
-#[cfg(feature = "loom")]
-use loom::sync::Arc;
 #[cfg(not(feature = "loom"))]
 use std::sync::Arc;
 use std::time::{Duration, Instant};

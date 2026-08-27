@@ -60,11 +60,11 @@ use adabt_core::schema::Schema;
 use adabt_core::store::LogicalStore;
 use adabt_exec::exec::{execute_with_budget, ExecBudget, ExecStats, Source};
 use adabt_ir::plan::{LogicalOp, LogicalPlan};
+#[cfg(feature = "loom")]
+use loom::sync::{Arc, Mutex, MutexGuard};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-#[cfg(feature = "loom")]
-use loom::sync::{Arc, Mutex, MutexGuard};
 #[cfg(not(feature = "loom"))]
 use std::sync::{Arc, Mutex, MutexGuard};
 

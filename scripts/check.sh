@@ -21,7 +21,7 @@ echo "== loom subset (verified: storage only; engine feature-gated but cross-cra
 cargo test -p adabt-storage --features loom -- --nocapture 2>&1 | tail -n 5
 
 echo "== comparison harness sanity (separate workspace) =="
-cargo run --manifest-path comparison/Cargo.toml -- --help >/dev/null 2>&1
+cargo build --manifest-path comparison/Cargo.toml --release 2>&1 | tail -n 1
 
 echo "== critical release tests =="
 cargo test -p adabt-engine --test cross_shard_concurrent -- --nocapture 2>&1 | tail -n 3

@@ -18,13 +18,13 @@
 use adabt_core::ids::RecordId;
 use adabt_core::record::Record;
 use adabt_core::value::Value;
-use std::collections::BinaryHeap;
-use std::collections::HashMap;
 #[cfg(feature = "loom")]
 use loom::sync::Arc;
-#[cfg(not(feature = "loom"))]
-use Arc;
+use std::collections::BinaryHeap;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(feature = "loom"))]
+use std::sync::Arc;
 
 static DELTA_ENABLED: AtomicBool = AtomicBool::new(true);
 
