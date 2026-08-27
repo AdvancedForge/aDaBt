@@ -14,6 +14,10 @@ adabt-storage.workspace = true
 adabt-telemetry.workspace = true
 adabt-opt.workspace = true
 core_affinity = "0.8"
+loom = { version = "0.7", optional = true }
+
+[features]
+loom = ["dep:loom", "adabt-storage/loom"]
 
 [dev-dependencies]
 adabt-testkit.workspace = true

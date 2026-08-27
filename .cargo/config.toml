@@ -1,5 +1,0 @@
-# The workspace lives on a 9p-mounted Windows drive where Cargo's build I/O is
-# 5-15x slower than native. Source stays here (visible to Windows tooling); all
-# build artefacts go to the ext4 filesystem instead.
-[build]
-target-dir = "/home/tungsahur/.cargo-target/adabt"

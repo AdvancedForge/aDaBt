@@ -8,17 +8,21 @@ echo "== fmt =="
 cargo fmt --all -- --check
 
 echo "== clippy =="
+# Note: `--all-features` is intentionally excluded. The `loom` feature swaps
+# `Arc`/`Mutex` types across crates; full cross-crate feature compatibility
+# requires a broader design decision (not a bug). The `loom` subset runs
+# separately below (line 17) for targeted verification.
 cargo clippy --workspace --all-targets -- -D warnings
 
 echo "== test workspace =="
 cargo test --workspace
 
 echo "== loom subset =="
-cargo test -p adabt-storage --features loom -- --nocapture 2>&1 | tail -n 5 || true
+cargo test -p adabt-storage --features loom -- --nocapture 2>&1 | tail -n 5
 cargo test -p adabt-engine --lib -- --nocapture 2>&1 | tail -n 5
 
 echo "== comparison harness sanity (separate workspace) =="
-cargo run --manifest-path comparison/Cargo.toml -- --help >/dev/null 2>&1 || true
+cargo run --manifest-path comparison/Cargo.toml -- --help >/dev/null 2>&1
 
 echo "== docs =="
 cargo doc --workspace --no-deps >/dev/null

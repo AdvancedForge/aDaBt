@@ -20,6 +20,10 @@ use adabt_core::record::Record;
 use adabt_core::value::Value;
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
+#[cfg(feature = "loom")]
+use loom::sync::Arc;
+#[cfg(not(feature = "loom"))]
+use Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static DELTA_ENABLED: AtomicBool = AtomicBool::new(true);
@@ -548,7 +552,7 @@ pub struct ColumnStore {
     /// `String` per field per row and then another allocation to turn it
     /// into an `Arc`. On a scan that is the difference between one
     /// allocation per row and one per cell.
-    arcs: HashMap<String, std::sync::Arc<str>>,
+    arcs: HashMap<String, Arc<str>>,
     /// Rows whose id has been deleted. Skipped on read; reclaimed by a rebuild.
     dead: Vec<bool>,
     dead_count: usize,
@@ -621,7 +625,7 @@ impl ColumnStore {
             // the store, however many rows reference it afterwards.
             self.arcs
                 .entry(name.to_string())
-                .or_insert_with(|| std::sync::Arc::from(name));
+                .or_insert_with(|| Arc::from(name));
         }
         // Fields absent from this record still need a slot.
         for col in self.columns.values_mut() {
@@ -715,7 +719,7 @@ impl ColumnStore {
                             // Interned name, refcount bump — see `arcs`.
                             match self.arcs.get(*f) {
                                 Some(arc) => {
-                                    rec.set_shared(std::sync::Arc::clone(arc), v);
+                                    rec.set_shared(Arc::clone(arc), v);
                                 }
                                 None => {
                                     rec.set((*f).to_string(), v);

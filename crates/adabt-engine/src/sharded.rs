@@ -63,7 +63,10 @@ use adabt_ir::plan::{LogicalOp, LogicalPlan};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+#[cfg(feature = "loom")]
+use loom::sync::{Arc, Mutex, MutexGuard};
+#[cfg(not(feature = "loom"))]
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::Database;
 
@@ -603,7 +606,7 @@ impl ShardedDatabase {
 /// carrying on. Poisoning is ignored for the coordinator lock for the same
 /// reason: a prior coordinator panic left a journal that `recover_coordinated`
 /// must still be able to re-drive.
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     match m.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),

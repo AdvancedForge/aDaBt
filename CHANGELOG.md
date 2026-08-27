@@ -1,10 +1,10 @@
 # Changelog
 
-## 0.1.0-closed — 2026-08-26
+## 0.1.0-alpha.1-alpha.1 — 2026-08-26
 
 Private pre-release, closed distribution. All four tracks `docs/roadmap.md:10` scored **100%** per defined finish lines (`replication` permanently out-of-scope `docs/replication-decision.md`).
 
-**Workspace version `0.1.0`**, `catalog` v4 (`delta_encoding`/`thread_per_core` persisted, v3 forward-compatible), `superblock` gate `FORMAT_VERSION` unchanged.
+**Workspace version `0.1.0-alpha.1`**, `catalog` v4 (`delta_encoding`/`thread_per_core` persisted, v3 forward-compatible), `superblock` gate `FORMAT_VERSION` unchanged.
 
 **Engine `crates/adabt-engine/src/database.rs:135` / `crates/adabt-storage/src/heap.rs:70`:**
 - `LogicalStore::get_projected` / `Source::fetch_projected` (`RecordCodec::peek_fields` `codec.rs:1067`, `HeapStore::get_projected` `heap.rs:2023`, `Database::fetch_projected` `database.rs:3126` with `DirectArray` per-field O(1)), `filter_by_peek_fields` 1–4 fields `exec.rs:294`, `fetch_projected_batches` primitive.

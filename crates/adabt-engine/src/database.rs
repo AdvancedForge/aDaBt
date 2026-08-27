@@ -37,6 +37,9 @@ use std::collections::HashMap;
 use std::ops::Bound;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
+#[cfg(feature = "loom")]
+use loom::sync::Arc;
+#[cfg(not(feature = "loom"))]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -345,7 +348,7 @@ impl Database {
         Self::open_shared(
             dir,
             policy,
-            std::sync::Arc::new(adabt_storage::version::VersionTracker::new()),
+            Arc::new(adabt_storage::version::VersionTracker::new()),
         )
     }
 
@@ -355,7 +358,7 @@ impl Database {
     pub fn open_shared(
         dir: &Path,
         policy: Policy,
-        versions: std::sync::Arc<adabt_storage::version::VersionTracker>,
+        versions: Arc<adabt_storage::version::VersionTracker>,
     ) -> Result<Self> {
         let store = HeapStore::open_shared(dir, policy.guarantees.durability, 1024, versions)?;
         Self::open_with_store(store, policy)
@@ -380,7 +383,7 @@ impl Database {
             dir,
             policy.guarantees.durability,
             1024,
-            std::sync::Arc::new(adabt_storage::version::VersionTracker::new()),
+            Arc::new(adabt_storage::version::VersionTracker::new()),
             target,
         )?;
         Self::open_with_store(store, policy)
