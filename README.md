@@ -120,7 +120,7 @@ ahead on a fifth, and loses 3:
 |---|---|---|
 | point lookup by id: **1.9×** | indexed range, tuned: **1.0–1.3×** (noisy) | bulk load: **~11× slower** (per-record MVCC + WAL) |
 | full-scan count, tuned: **~10⁴×** | | single-row inserts |
-| group-by count, tuned: **~10⁴×** | | indexed equality: **~1.6× slower** |
+| group-by count, tuned: **~10⁴×** | | indexed equality: **~1.4–1.5× slower** |
 | top-20 sort, tuned: **2.8×** | | |
 
 Full numbers and caveats are in
