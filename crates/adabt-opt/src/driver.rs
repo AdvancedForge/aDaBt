@@ -6,9 +6,10 @@
 //! something a human could not have asked for by hand, and nothing a human can
 //! ask for bypasses the machinery the optimizer uses.
 //!
-//! `AdaptiveDriver` is a stub returning no decisions. It exists now so the
-//! symmetry is structurally enforced rather than merely intended — the seam is
-//! load-bearing from the first day, not retrofitted in Phase 5.
+//! `ManualDriver` (here) turns a level preset into decisions;
+//! `AdaptiveDriver` (`adaptive.rs`) derives them from telemetry. The seam came
+//! first, while the adaptive side was still a stub, so the symmetry was
+//! enforced by structure from the start rather than retrofitted.
 
 use adabt_core::policy::{Mode, Policy};
 use adabt_telemetry::Snapshot;

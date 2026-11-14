@@ -1,14 +1,15 @@
-//! Rule-based planning.
+//! Planning: a logical plan in, a physical plan out.
 //!
-//! Turns a logical plan into a physical one using whatever indexes exist. The
-//! rules are deliberately simple and deterministic at this milestone — a
-//! cost-based planner arrives with the cost model in Phase 6, and until there
-//! are real measurements to calibrate against, a cost model would be invented
-//! numbers dressed up as rigour.
+//! The rules are deterministic and prefer whatever structure exists (covering,
+//! composite and single-field indexes, column stores). Where evidence is
+//! available they are corrected by measurement rather than guessed: per-field
+//! cardinality picks the most selective index, and the calibrated cost curve
+//! (`crate::cost`) lets a full scan win when an index would match too much of
+//! a large collection.
 //!
-//! What matters now is the *seam*: `plan()` is the single place an access path
-//! is chosen, and it records why. When the optimizer starts making that choice,
-//! it replaces this function rather than being threaded through the executor.
+//! `plan()` is the single place an access path is chosen, and it records why,
+//! so the optimizer changes plans by changing what exists, never by reaching
+//! into the executor.
 
 use adabt_index::{Index, IndexKind};
 use adabt_ir::plan::LogicalOp;

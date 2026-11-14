@@ -2,7 +2,7 @@
 //!
 //! Produces the level x workload matrix that is simultaneously the project's
 //! proof of life, its performance regression suite, and the seed data the
-//! Phase 6 cost model will be calibrated from. Because of that third use, the
+//! cost model is calibrated from. Because of that third use, the
 //! report records resource consumption alongside latency: a cost model trained
 //! only on speed cannot represent the resource axis at all.
 

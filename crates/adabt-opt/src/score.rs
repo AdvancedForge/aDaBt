@@ -118,7 +118,7 @@ pub fn score_against(
 
     // Low confidence shrinks the magnitude of the claim rather than its sign:
     // an uncertain candidate becomes a weaker suggestion, not a rejected one.
-    // Phase 7 exists to resolve exactly these by measurement.
+    // Shadow trials resolve exactly these by measurement.
     let raw = speed_term + resource_term + freedom_term - build_penalty;
     Score {
         total: raw * est.confidence,
