@@ -127,7 +127,7 @@ protocol byte, `tls.rs` handshake-first), per-collection `Forbidden` floors
 `adversarial.rs` 8 tests (`send_raw`/`next_reply`).
 
 **Open beyond the finish line:** the PostgreSQL/RocksDB witnesses are planned,
-not built; the gate is local (`scripts/check.sh`), not hosted CI; `loom` covers
+not built; `loom` covers
 `adabt-storage` only. See What's next.
 
 ---
@@ -342,7 +342,7 @@ time — a lost trial loses only the trial.
 mid-application / torn-tail) — continuation of same truncation-at-offsets
 discipline.
 
-*Finish tests:* `bash scripts/check.sh` (`fmt --check` + `clippy -D warnings` + `test --workspace` + loom model checks + `comparison` build + `doc`) enforced locally, `git config core.hooksPath .githooks` runs it on pre-push (no hosted CI); checker detects every seeded divergence; no time-assertions in default suite.
+*Finish tests:* `bash scripts/check.sh` (`fmt --check` + `clippy -D warnings` + `test --workspace` + loom model checks + `comparison` build + `doc`) run by CI and, with `git config core.hooksPath .githooks`, on pre-push; checker detects every seeded divergence; no time-assertions in default suite.
 
 ### Stage 8 — Surface and ecosystem *(finishes D)*
 
@@ -452,8 +452,6 @@ evidence first, then what it unblocks.
 - Wider C ABI beyond i64 put/get.
 
 ### 5. Toward beta
-- Hosted CI running `scripts/check.sh`, so the gate does not depend on a
-  local hook.
 - Freeze `LogicalStore` and the wire protocol, and turn `docs/semver.md` into
   a promise covering the API as well as the disk format.
 

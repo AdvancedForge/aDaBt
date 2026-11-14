@@ -2,7 +2,7 @@
 
 ## Build & verify
 
-There is no hosted CI; `scripts/check.sh` is the gate:
+`scripts/check.sh` is the gate, run identically by CI (`.github/workflows/ci.yml`) and locally:
 
 ```sh
 bash scripts/check.sh          # fmt --check + clippy -D warnings + test --workspace + loom subset + comparison sanity + doc

@@ -28,7 +28,6 @@ file wins.
 - **Comparison witnesses** — SQLite only; the PostgreSQL and RocksDB witnesses are planned and the harness exits 2 rather than fake them
 - **`loom` coverage** — `adabt-storage`'s transaction-id allocator is model-checked; `adabt-engine` does not yet compile with `--features loom` (loom's `Arc` meets std's at crate boundaries), so the engine has no model checks
 - **C ABI** — open/close, create-collection, i64 field put/get, count; nothing more
-- **CI** — no hosted CI; the gate is `scripts/check.sh`, optionally run by the pre-push hook
 
 ## Current guarantees
 - Catalog v4 (`FORMAT_VERSION`): reads v3; an unreadable catalog rebuilds from a complete WAL
