@@ -3,7 +3,8 @@
 
 use crate::harness::{self, format_per_op, format_table, RunConfig, RunReport};
 use crate::workload::WorkloadKind;
-use crate::{arg, flag, parsed, parsed_list, queries, scale as scale_bench, soak as soak_bench};
+use crate::{arg, expert, flag, parsed, parsed_list, queries};
+use crate::{scale as scale_bench, soak as soak_bench};
 use crate::{usage, Options};
 use adabt_core::policy::{Durability, Mode, Override, Policy, Priorities};
 use adabt_core::store::LogicalStore as _;
@@ -52,6 +53,36 @@ fn soak_config(opts: &Options, args: &[String]) -> soak_bench::SoakConfig {
             resources: parsed(args, "--resources", 3),
             freedom: parsed(args, "--freedom", 5),
         },
+    }
+}
+
+/// The adaptive engine against the best manual configuration for each soak
+/// phase, with level 0 as the floor.
+pub(crate) fn expert_vs_adaptive(opts: &Options, args: &[String]) {
+    let cfg = expert::ExpertConfig {
+        soak: soak_config(opts, args),
+        repeats: parsed(args, "--repeats", 3usize).max(1),
+        levels: parsed_list(args, "--levels", (0..=adabt_opt::MAX_LEVEL).collect()),
+    };
+    let r = match expert::run(&opts.data_dir.join("expert-vs-adaptive"), &cfg) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("expert-vs-adaptive failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    let text = format!(
+        "{}{}",
+        expert::format_summary(&r),
+        expert::format_detail(&r)
+    );
+    print!("{text}");
+    if let Some(out) = arg(args, "--out") {
+        if let Err(e) = std::fs::write(&out, &text) {
+            eprintln!("could not write {out}: {e}");
+            std::process::exit(1);
+        }
+        eprintln!("wrote {out}");
     }
 }
 

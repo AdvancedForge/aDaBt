@@ -157,7 +157,30 @@ pub struct SoakReport {
     pub elapsed_secs: f64,
 }
 
-fn percentile(samples: &mut [u64], p: f64) -> u64 {
+/// One step of a phase's traffic: a write or a query.
+pub enum Op {
+    Write(RecordId, Record),
+    Query(LogicalPlan),
+}
+
+/// The next operation of `phase`'s traffic, advancing `next_write_id` on a
+/// write.
+///
+/// Shared with the expert comparison so that a manual configuration and the
+/// adaptive engine are measured on the same kind of traffic, trickle included.
+pub fn next_op(phase: &Phase, rng: &mut Rng, next_write_id: &mut u64) -> Op {
+    // A trickle of writes, so nothing can be answered purely from a cache and
+    // every derived structure has to be maintained.
+    if phase.writes_per_thousand > 0 && rng.below(1000) < phase.writes_per_thousand as u64 {
+        let id = RecordId(*next_write_id);
+        *next_write_id += 1;
+        return Op::Write(id, crate::queries::record(id.0));
+    }
+    Op::Query(phase.mix.next_plan(rng, *next_write_id))
+}
+
+/// The `p`th percentile of `samples`, sorting them in place; 0 when empty.
+pub fn percentile(samples: &mut [u64], p: f64) -> u64 {
     if samples.is_empty() {
         return 0;
     }
@@ -166,7 +189,8 @@ fn percentile(samples: &mut [u64], p: f64) -> u64 {
     samples[i.min(samples.len() - 1)]
 }
 
-fn enabled_names(db: &Database) -> Vec<String> {
+/// What `db` has switched on, as sorted `name` or `name[scope]` strings.
+pub fn enabled_names(db: &Database) -> Vec<String> {
     let mut v: Vec<String> = db
         .config()
         .entries()
@@ -184,7 +208,7 @@ fn enabled_names(db: &Database) -> Vec<String> {
 }
 
 /// Load both databases with the same rows.
-fn preload(db: &mut Database, size: u64) -> adabt_core::error::Result<()> {
+pub fn preload(db: &mut Database, size: u64) -> adabt_core::error::Result<()> {
     db.create_collection("users", crate::queries::schema())?;
     for i in 0..size {
         db.insert("users", RecordId(i), crate::queries::record(i))?;
@@ -249,20 +273,16 @@ pub fn run_soak(dir: &Path, cfg: &SoakConfig) -> adabt_core::error::Result<SoakR
         let mut last: Vec<u64> = Vec::new();
 
         for op in 0..cfg.ops_per_phase {
-            // A trickle of writes, so nothing can be answered purely from a
-            // cache and every derived structure has to be maintained.
-            if phase.writes_per_thousand > 0 && rng.below(1000) < phase.writes_per_thousand as u64 {
-                let id = RecordId(next_write_id);
-                next_write_id += 1;
-                let rec: Record = crate::queries::record(id.0);
-                db.insert("users", id, rec.clone())?;
-                if let Some(r) = reference.as_mut() {
-                    r.insert("users", id, rec)?;
+            let plan = match next_op(phase, &mut rng, &mut next_write_id) {
+                Op::Write(id, rec) => {
+                    db.insert("users", id, rec.clone())?;
+                    if let Some(r) = reference.as_mut() {
+                        r.insert("users", id, rec)?;
+                    }
+                    continue;
                 }
-                continue;
-            }
-
-            let plan: LogicalPlan = phase.mix.next_plan(&mut rng, next_write_id);
+                Op::Query(plan) => plan,
+            };
             let t = Instant::now();
             let got = db.query(&plan)?;
             let nanos = t.elapsed().as_nanos() as u64;

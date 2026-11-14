@@ -7,6 +7,7 @@
 //! not losing data when the power fails.
 
 mod commands;
+mod expert;
 mod harness;
 mod queries;
 mod resources;
@@ -32,6 +33,9 @@ fn usage() -> ! {
   adabt-bench soak   [--size N] [--ops-per-phase N] [--seed N] [--data-dir PATH]
                      [--cycle-every N] [--verify-every N] [--no-verify] [--log] [--out FILE]
                      [--speed N] [--resources N] [--freedom N]
+  adabt-bench expert-vs-adaptive [--size N] [--ops-per-phase N] [--repeats N]
+                     [--levels 0,1,..,11] [--seed N] [--data-dir PATH] [--verify-every N]
+                     [--cycle-every N] [--speed N] [--resources N] [--freedom N] [--out FILE]
   adabt-bench list
 
 engines:      reference, heap, engine
@@ -166,12 +170,13 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("");
     let opts = Options::parse(&args);
-    if opts.engine == "heap" || cmd == "query-matrix" {
+    if opts.engine == "heap" || cmd == "query-matrix" || cmd == "expert-vs-adaptive" {
         prepare_data_dir(&opts.data_dir);
     }
 
     match cmd {
         "soak" => commands::soak(&opts, &args),
+        "expert-vs-adaptive" => commands::expert_vs_adaptive(&opts, &args),
         "list" => commands::list(),
         "run" => commands::run(&opts, &args),
         "matrix" => commands::matrix(&opts, &args),
