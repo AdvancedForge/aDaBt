@@ -5,6 +5,18 @@
 A correctness and code-quality pass. No on-disk format change.
 
 ### Fixed
+- **Transaction commits and `insert_batch` are crash-atomic.** The write-set
+  is logged as frames tagged with a transaction id plus one `Commit` record,
+  made durable once, and applied to pages only after; recovery applies a
+  transaction only if its `Commit` is in the log. A crash mid-commit used to
+  leave a prefix of the write-set, and a torn batch a prefix of its rows. A
+  100-write commit under `Strict` now costs 1 fsync instead of 100. No format
+  change: both fields already existed, and logs without them replay as before.
+  Alongside: a transaction whose writes collide on a unique value with each
+  other is refused before anything is written (it used to apply a prefix and
+  then fail), one that moves a unique value between records commits, and a
+  record too large for a page is refused before it is logged rather than
+  logged and then refused, which made every later open fail.
 - **Two optimizations that did nothing were removed.** `join_order` and
   `data_partitioning` were registered, enabled at level 6 and reported as
   applied, but only set flags nothing read. 17 optimizations are now 15; real

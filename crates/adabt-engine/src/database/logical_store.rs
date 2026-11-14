@@ -75,58 +75,20 @@ impl LogicalStore for Database {
 
     fn update(&mut self, collection: &str, id: RecordId, rec: Record) -> Result<bool> {
         let t = Instant::now();
-        // The old record is needed to un-index it. This read is the standing
-        // cost of maintaining any index, and it is why an index nobody queries
-        // is a pure loss rather than merely a neutral one.
-        let old = if self.derived.needs_old_record(collection) {
-            self.store.get(collection, id)?
-        } else {
-            None
-        };
+        let old = self.old_record_for_derived(collection, id)?;
         let mut stored = rec.clone();
         adabt_core::store::normalize_for_storage(&mut stored);
         self.check_unique_constraints(collection, Some(id), &stored)?;
         let existed = self.store.update(collection, id, rec)?;
-        if let Some(old) = old {
-            self.derived
-                .on_remove(collection, id, &old, &self.telemetry.probe);
-        }
-        self.derived
-            .on_insert(collection, id, &stored, &self.telemetry.probe);
-        self.caches.bump_epoch(collection);
-        self.telemetry
-            .observe(collection, OpKind::Update, t, existed as u64);
+        self.reflect_put(collection, id, old, &stored, t, existed);
         Ok(existed)
     }
 
     fn delete(&mut self, collection: &str, id: RecordId) -> Result<bool> {
         let t = Instant::now();
-        let old = if self.derived.needs_old_record(collection) {
-            self.store.get(collection, id)?
-        } else {
-            None
-        };
+        let old = self.old_record_for_derived(collection, id)?;
         let existed = self.store.delete(collection, id)?;
-        match old {
-            Some(old) => self
-                .derived
-                .on_remove(collection, id, &old, &self.telemetry.probe),
-            // Not every derived structure needs to be told *what* was removed.
-            // A direct array and a column store are keyed by identity alone, so
-            // an id is enough — and they must still be told, or a database with
-            // a column store and no index goes on counting rows that are gone.
-            None => {
-                if let Some(d) = self.derived.direct.get_mut(collection) {
-                    d.remove(id);
-                }
-                if let Some(c) = self.derived.columns.get_mut(collection) {
-                    c.mark_dead(id);
-                }
-            }
-        }
-        self.caches.bump_epoch(collection);
-        self.telemetry
-            .observe(collection, OpKind::Delete, t, existed as u64);
+        self.reflect_delete(collection, id, old, t, existed);
         Ok(existed)
     }
 
@@ -153,5 +115,80 @@ impl LogicalStore for Database {
     /// exists to remove, reintroduced one layer up.
     fn ids(&mut self, collection: &str) -> Result<Vec<RecordId>> {
         self.store.ids(collection)
+    }
+}
+
+/// Keeping derived structures in step with a write the store has already
+/// made. Shared by the standalone write paths above and by
+/// [`Database::commit`], so a record written inside a transaction is indexed,
+/// counted and invalidated exactly as one written on its own.
+impl Database {
+    /// The record about to be overwritten or removed, if any derived structure
+    /// needs to see it to un-index it. Must be read before the store changes.
+    pub(super) fn old_record_for_derived(
+        &mut self,
+        collection: &str,
+        id: RecordId,
+    ) -> Result<Option<Record>> {
+        // This read is the standing cost of maintaining any index, and it is
+        // why an index nobody queries is a pure loss rather than merely a
+        // neutral one.
+        if self.derived.needs_old_record(collection) {
+            self.store.get(collection, id)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Reflect a stored put of `stored` (already normalised) over `old`.
+    pub(super) fn reflect_put(
+        &mut self,
+        collection: &str,
+        id: RecordId,
+        old: Option<Record>,
+        stored: &Record,
+        started: Instant,
+        existed: bool,
+    ) {
+        if let Some(old) = old {
+            self.derived
+                .on_remove(collection, id, &old, &self.telemetry.probe);
+        }
+        self.derived
+            .on_insert(collection, id, stored, &self.telemetry.probe);
+        self.caches.bump_epoch(collection);
+        self.telemetry
+            .observe(collection, OpKind::Update, started, existed as u64);
+    }
+
+    /// Reflect a stored delete of `id`, whose previous record was `old`.
+    pub(super) fn reflect_delete(
+        &mut self,
+        collection: &str,
+        id: RecordId,
+        old: Option<Record>,
+        started: Instant,
+        existed: bool,
+    ) {
+        match old {
+            Some(old) => self
+                .derived
+                .on_remove(collection, id, &old, &self.telemetry.probe),
+            // Not every derived structure needs to be told *what* was removed.
+            // A direct array and a column store are keyed by identity alone, so
+            // an id is enough — and they must still be told, or a database with
+            // a column store and no index goes on counting rows that are gone.
+            None => {
+                if let Some(d) = self.derived.direct.get_mut(collection) {
+                    d.remove(id);
+                }
+                if let Some(c) = self.derived.columns.get_mut(collection) {
+                    c.mark_dead(id);
+                }
+            }
+        }
+        self.caches.bump_epoch(collection);
+        self.telemetry
+            .observe(collection, OpKind::Delete, started, existed as u64);
     }
 }

@@ -6,7 +6,7 @@ use adabt_core::index_kind::IndexKind;
 use adabt_core::record::Record;
 use adabt_core::store::LogicalStore;
 use adabt_core::value::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::Database;
 
@@ -96,12 +96,7 @@ impl Database {
                 continue;
             };
             let conflict = self
-                .derived
-                .indexes
-                .get(collection)
-                .and_then(|list| list.iter().find(|i| i.field() == field))
-                .map(|idx| idx.lookup(value))
-                .unwrap_or_default()
+                .holders_of(collection, field, value)
                 .into_iter()
                 .any(|id| Some(id) != exclude);
             if conflict {
@@ -113,5 +108,71 @@ impl Database {
             }
         }
         Ok(())
+    }
+
+    /// Refuse a transaction's write-set if, once every write in it has been
+    /// applied, two records would share a value under a unique constraint.
+    ///
+    /// Judged against the state the commit produces, not one write at a time
+    /// against the state before it: a value the transaction moves from one
+    /// record to another is not a conflict, and two writes in the same
+    /// transaction claiming one value are, whichever order they would be
+    /// applied in. Checked before anything is written, because once the store
+    /// has logged the write-set there is no applying "some" of it.
+    ///
+    /// `writes` are `(collection, id, new record)`, `None` for a delete; puts
+    /// are already normalised.
+    pub(super) fn check_unique_constraints_for_write_set(
+        &self,
+        writes: &[(&str, RecordId, Option<&Record>)],
+    ) -> Result<()> {
+        if self.unique_constraints.is_empty() {
+            return Ok(());
+        }
+        // Every record the transaction writes gets a new value (or none), so
+        // whatever it held before can no longer collide with anything.
+        let rewritten: HashSet<(&str, RecordId)> =
+            writes.iter().map(|&(c, id, _)| (c, id)).collect();
+        let mut claimed: HashMap<(&str, &str, &Value), RecordId> = HashMap::new();
+        for &(collection, id, rec) in writes {
+            let Some(rec) = rec else { continue };
+            for field in self.unique_constraints.on(collection) {
+                let Some(value) = rec.get(field).filter(|v| !v.is_null()) else {
+                    continue;
+                };
+                if let Some(other) = claimed.insert((collection, field, value), id) {
+                    return Err(Error::UniqueViolation {
+                        collection: collection.to_string(),
+                        field: field.to_string(),
+                        value: format!(
+                            "{value:?} (written to both {other} and {id} by one transaction)"
+                        ),
+                    });
+                }
+                let kept_elsewhere = self
+                    .holders_of(collection, field, value)
+                    .into_iter()
+                    .any(|holder| holder != id && !rewritten.contains(&(collection, holder)));
+                if kept_elsewhere {
+                    return Err(Error::UniqueViolation {
+                        collection: collection.to_string(),
+                        field: field.to_string(),
+                        value: format!("{value:?}"),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The records currently holding `value` in `field`, found through the
+    /// hash index every unique constraint is backed by.
+    fn holders_of(&self, collection: &str, field: &str, value: &Value) -> Vec<RecordId> {
+        self.derived
+            .indexes
+            .get(collection)
+            .and_then(|list| list.iter().find(|i| i.field() == field))
+            .map(|idx| idx.lookup(value))
+            .unwrap_or_default()
     }
 }

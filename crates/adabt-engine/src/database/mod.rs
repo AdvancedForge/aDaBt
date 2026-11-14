@@ -16,6 +16,7 @@
 //! responsibility into the child modules below.
 
 mod action_sink;
+mod commit;
 mod constraints;
 mod derived;
 mod durability;

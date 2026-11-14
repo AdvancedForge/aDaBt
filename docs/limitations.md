@@ -22,8 +22,8 @@ file wins.
 - **Full SQL** — a `SELECT` subset only; writes and DDL go through the Rust API
 - **Full serializable isolation** — `Strict` validates point reads; predicate phantoms remain possible (`serializable.rs` documents this)
 - **Atomic cross-shard visibility** — coordinator-decides durability (`XSH1` journal), not 2PC: other connections can see shards disagree inside the commit window
-- **Transactions are not crash-atomic** — a commit is all-or-nothing against conflicts, but a crash during it leaves a prefix of the sorted write-set applied (there is no commit record)
 - **DDL is not transactional** — `CreateCollection`/`DropCollection`/schema changes commit on write
+- **Point-in-time restore over a newer heap file** — `open_at` replays the log up to the target over the heap file as it stands. The buffer pool writes dirty pages to that file on eviction, so a page carrying writes from after the target may already be there, and those writes show through (transactional or not). It is sound when no page written after the target has reached the heap file; restoring from a base image older than the target is not yet supported
 - **Persistent thread-per-core workers** — burst pinning only (`core_affinity` per query)
 - **Write throughput** — bulk load is ~11× slower than SQLite and single-row inserts also lose; per-record MVCC + WAL is the price (`docs/benchmarks/comparison-notes.md`)
 - **Comparison witnesses** — SQLite only; the PostgreSQL and RocksDB witnesses are planned and the harness exits 2 rather than fake them
@@ -34,6 +34,7 @@ file wins.
 - Catalog v4 (`FORMAT_VERSION`): reads v3; an unreadable catalog rebuilds from a complete WAL
 - Superblock version gate refuses a newer on-disk format
 - Crash recovery: WAL replay, torn-tail safe
+- Transactions and `insert_batch` are crash-atomic: the write-set is logged under one commit record, made durable once, and applied to pages only after; recovery applies it whole or not at all (`commit_window_chaos.rs`, `atomic_commit.rs`). Under `Strict` this holds through power loss; under `GroupCommit`/`Relaxed`, through a process crash
 - Cross-shard writes: crash-convergent (`commit_coordinated` holds a serialized lock; `open` re-drives pending writes)
 - Optimizations never change answers (differential runner + per-level query tests)
 

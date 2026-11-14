@@ -22,7 +22,7 @@ db.verify()? // forward (heap→index) + reverse (index→heap) + columnar id-se
 db.policy() -> &Policy; db.telemetry() -> Snapshot; db.last_exec_stats() -> ExecStats
 ```
 
-`Transaction` is a value buffering writes against a fixed `Snapshot`; `commit` validates first-committer-wins and then applies writes in sorted-key order. It is all-or-nothing against conflicts, but not against a crash: there is no commit record, so a crash mid-commit leaves a prefix of the sorted write-set (`commit_window_chaos.rs` pins this). `Strict` also validates point reads (write skew closed; predicate phantoms are not prevented — see `serializable.rs`).
+`Transaction` is a value buffering writes against a fixed `Snapshot`. `commit` first validates everything with nothing written — first-committer-wins over the write-set, the schema, and unique constraints judged against the state the whole write-set leaves (so a value may move between records in one transaction, and two writes claiming one value fail) — then logs the write-set under one commit record, makes it durable once (one fsync under `Strict`, however many writes), and only then applies it. A crash at any point recovers all of the transaction or none of it, and an `open_at` target inside a transaction exposes none of it (`commit_window_chaos.rs`). `insert_batch` is all-or-nothing the same way. `Strict` also validates point reads (write skew closed; predicate phantoms are not prevented — see `serializable.rs`).
 
 **DDL is not transactional** (see `WalOp` in `adabt-storage`): `CreateCollection`/`DropCollection`/`AlterSchemaInPlace`/`AdoptMigration` commit on write, not rolled back with a `Transaction`. Catalog v4 persists `delta_encoding`/`thread_per_core`.
 

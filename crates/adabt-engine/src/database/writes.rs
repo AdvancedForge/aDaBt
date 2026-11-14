@@ -1,5 +1,5 @@
-//! Transactions and record-id allocation: begin, commit, abort, and the
-//! batched and auto-id insert paths.
+//! Record-id allocation and the batched and auto-id insert paths.
+//! Transactions live in `commit`.
 
 use adabt_core::error::{Error, Result};
 use adabt_core::ids::RecordId;
@@ -13,113 +13,6 @@ use std::time::Instant;
 use super::Database;
 
 impl Database {
-    // -- transactions --------------------------------------------------------
-
-    /// Begin a multi-statement transaction. See `crate::transaction` for the
-    /// full account of what this guarantees and why.
-    pub fn begin(&mut self) -> crate::transaction::Transaction {
-        let id = adabt_core::ids::TransactionId(self.next_txn_id);
-        self.next_txn_id += 1;
-        crate::transaction::Transaction::new(id, self.store.snapshot())
-    }
-
-    /// Apply every buffered write, or none of them.
-    ///
-    /// Two passes, in this order and never interleaved. First, every key in the
-    /// write-set is checked — for a first-committer-wins conflict against
-    /// anything committed since the transaction's snapshot was taken, and, for
-    /// a value being written, against the schema and any unique constraint —
-    /// with nothing yet touched. Only once every key has cleared does the
-    /// second pass apply any of them, through the ordinary `update`/`delete`
-    /// paths so reindexing, epoch bumps and telemetry all happen exactly as
-    /// they would for a standalone write.
-    ///
-    /// "Or none" holds against every check above, not against a crash: each
-    /// write in the second pass is logged and made durable on its own, and
-    /// there is no commit record, so a process killed partway through leaves
-    /// a prefix of the sorted write-set behind (`tests/commit_window_chaos.rs`
-    /// pins exactly that).
-    ///
-    /// Keys are visited in sorted order, which has nothing to do with
-    /// correctness and everything to do with reproducibility: `HashMap`
-    /// iteration order is not something a test — or a person reading a
-    /// decision log — should have to tolerate as noise.
-    pub fn commit(&mut self, txn: crate::transaction::Transaction) -> Result<()> {
-        if txn.is_empty() {
-            return Ok(());
-        }
-        let snapshot_at = txn.snapshot().at();
-        let mut keys: Vec<(String, RecordId)> = txn.writes().keys().cloned().collect();
-        keys.sort();
-
-        for key in &keys {
-            let (collection, id) = key;
-            if let Some(ts) = self.store.latest_write_ts(collection, *id)? {
-                if ts.0 > snapshot_at.0 {
-                    return Err(Error::TransactionConflict {
-                        collection: collection.clone(),
-                        id: *id,
-                    });
-                }
-            }
-            if let crate::transaction::Write::Put(rec) = &txn.writes()[key] {
-                let mut normalized = rec.clone();
-                adabt_core::store::normalize_for_storage(&mut normalized);
-                self.store
-                    .schema_of(collection)?
-                    .validate_record(&normalized)?;
-                self.check_unique_constraints(collection, Some(*id), &normalized)?;
-            }
-        }
-
-        // Serializable posture (`Consistency::Strict`): the read set gets the
-        // same first-committer-wins check the write set already had. This is
-        // what closes write skew — a transaction whose *observations* went
-        // stale between its snapshot and its commit aborts instead of
-        // committing a result no serial execution would have produced. Under
-        // `Consistency::Snapshot` this pass does not run and the guarantee is
-        // snapshot isolation exactly as documented. (The enum's ordinal runs
-        // strongest-first, so an inequality here would silently include
-        // `Eventual`; the guarantee is named exactly or not at all.)
-        if self.policy.guarantees.consistency == adabt_core::policy::Consistency::Strict {
-            for (collection, id) in txn.reads() {
-                if !txn.writes().contains_key(&(collection.clone(), *id)) {
-                    if let Some(ts) = self.store.latest_write_ts(collection, *id)? {
-                        if ts.0 > snapshot_at.0 {
-                            return Err(Error::TransactionConflict {
-                                collection: collection.clone(),
-                                id: *id,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        // Every check above passed against state that cannot have changed in
-        // between — nothing else can touch `&mut self` while this call is on
-        // the stack — so nothing from here on can fail for a reason this
-        // transaction could have anticipated.
-        for key in keys {
-            match &txn.writes()[&key] {
-                crate::transaction::Write::Put(rec) => {
-                    self.update(&key.0, key.1, rec.clone())?;
-                }
-                crate::transaction::Write::Delete => {
-                    self.delete(&key.0, key.1)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Discard a transaction without applying it. Equivalent to letting it drop
-    /// — nothing was ever written anywhere — kept as an explicit method for
-    /// symmetry with `commit` and so the intent reads at the call site.
-    pub fn abort(&mut self, txn: crate::transaction::Transaction) {
-        drop(txn);
-    }
-
     // -- record id allocation ----------------------------------------------
 
     /// The id an auto-allocated insert into `collection` will use next.
@@ -137,7 +30,9 @@ impl Database {
     /// as ordinary inserts — the difference is entirely in how many times the
     /// log is made durable. See [`adabt_storage::heap::HeapStore::insert_batch`]
     /// for the all-or-nothing guarantee that makes it safe to skip the
-    /// per-record fsync: either every one of these lands, or none does.
+    /// per-record fsync: either every one of these lands, or none does — on
+    /// a refused record and across a crash alike, because the batch is logged
+    /// under one commit record exactly as a transaction is.
     pub fn insert_batch(
         &mut self,
         collection: &str,

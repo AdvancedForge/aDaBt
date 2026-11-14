@@ -20,8 +20,8 @@ each step, is in [`history/roadmap-stages.md`](history/roadmap-stages.md).
 
 - **Usable:** crash-safe storage (segmented WAL, torn-tail-safe recovery,
   checkpoints with log truncation), backup, restore and point-in-time recovery;
-  snapshot-isolated transactions with `Strict` read-set validation; crash-
-  convergent cross-shard commits; a format version gate with enumerated
+  snapshot-isolated, crash-atomic transactions with `Strict` read-set
+  validation; crash-convergent cross-shard commits; a format version gate with enumerated
   migrations; a TCP server with TLS, bearer tokens, roles and per-collection
   access floors; joins with spill; a `SELECT` front-end; per-query memory
   budgets and cancellation.
@@ -70,8 +70,8 @@ throughout: evidence first, then what it unblocks.
   `fetch_projected_batches`.
 
 ### 4. Correctness gaps a user will hit
-- Crash-atomic commits: a commit record, so a crash mid-commit applies all of
-  a transaction or none of it rather than a prefix.
+- Point-in-time restore from a base image: `open_at` over a heap file that
+  already holds pages written after the target can show those writes.
 - Predicate phantoms under `Strict` (needs predicate or range validation).
 - `loom` model checks for `adabt-engine`, which does not yet compile with the
   feature (loom's `Arc` meets std's at crate boundaries).

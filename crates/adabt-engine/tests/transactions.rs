@@ -359,6 +359,57 @@ fn a_unique_constraint_violation_anywhere_in_the_batch_commits_nothing() {
 }
 
 #[test]
+fn two_writes_in_one_transaction_claiming_one_unique_value_commit_nothing() {
+    // Each is unique against what is already stored; only together do they
+    // collide. Once a commit is one logged unit there is no applying the
+    // first and refusing the second, so this has to be caught up front.
+    let t = Tmp::new("unique-within-txn");
+    let mut db = open(t.path());
+    db.add_unique_constraint("accounts", "name").unwrap();
+
+    let mut txn = db.begin();
+    txn.insert(&mut db, "accounts", RecordId(1), rec(1, "same", 1))
+        .unwrap();
+    txn.insert(&mut db, "accounts", RecordId(2), rec(2, "same", 2))
+        .unwrap();
+
+    assert!(matches!(db.commit(txn), Err(Error::UniqueViolation { .. })));
+    assert_eq!(db.count("accounts").unwrap(), 0);
+    assert!(db.verify().unwrap().problems.is_empty());
+}
+
+#[test]
+fn a_transaction_may_move_a_unique_value_from_one_record_to_another() {
+    // Judged on the state the commit leaves behind: record 1 gives the name
+    // up in the same transaction that record 2 takes it, so no two records
+    // ever hold it at once.
+    let t = Tmp::new("unique-move");
+    let mut db = open(t.path());
+    db.add_unique_constraint("accounts", "name").unwrap();
+    db.insert("accounts", RecordId(1), rec(1, "handle", 1))
+        .unwrap();
+    db.insert("accounts", RecordId(2), rec(2, "other", 2))
+        .unwrap();
+
+    let mut txn = db.begin();
+    txn.update(&mut db, "accounts", RecordId(1), rec(1, "renamed", 1))
+        .unwrap();
+    txn.update(&mut db, "accounts", RecordId(2), rec(2, "handle", 2))
+        .unwrap();
+    db.commit(txn).unwrap();
+
+    assert_eq!(
+        db.get("accounts", RecordId(2)).unwrap(),
+        Some(rec(2, "handle", 2))
+    );
+    assert!(db.verify().unwrap().problems.is_empty());
+    // And the constraint still holds afterwards.
+    assert!(db
+        .insert("accounts", RecordId(3), rec(3, "handle", 3))
+        .is_err());
+}
+
+#[test]
 fn a_committed_transaction_reindexes_correctly() {
     let t = Tmp::new("reindex");
     let mut db = open(t.path());
