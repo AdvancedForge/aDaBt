@@ -7,7 +7,7 @@ when the goal is met, as opposed to a list of features.
 |---|---|---|
 | **Usable** | you could ship on it | Met, for a single node with sharding as the growth story |
 | **Manually optimal** | the engine's ceiling is the hardware's ceiling | Met against SQLite; not yet measured against memory bandwidth or core count |
-| **Automatically optimal** | an expert tuning by hand adds nothing | Built; the expert-versus-adaptive comparison has not been published |
+| **Automatically optimal** | an expert tuning by hand adds nothing | Not met: adaptive matches the expert on 1 of 5 soak phases at 5k rows and 0 of 5 at 20k, mostly because it enables the result cache late or never ([`benchmarks/expert-vs-adaptive.md`](benchmarks/expert-vs-adaptive.md)) |
 | **Good** | there is a workload where it is demonstrably the right answer | Met: 4 of 8 workloads won against SQLite, losses published alongside |
 
 "Met" means the finish line as defined here. It does not mean production-ready;
@@ -44,9 +44,6 @@ Everything below is open, ordered by the same rule the project has used
 throughout: evidence first, then what it unblocks.
 
 ### 1. Close the unmeasured finish tests (evidence, no new features)
-- **Expert vs adaptive:** adaptive must match the expert-chosen configuration
-  within noise on every soak phase, with the expert given the full move set.
-  The "automatically optimal" goal rests on this; publish it.
 - **Core scaling and memory bandwidth:** throughput against core count with
   `--shards 1` as the control, and scan throughput against measured memory
   bandwidth, with the gap stated.
@@ -62,6 +59,17 @@ throughout: evidence first, then what it unblocks.
   stops exiting with status 2; add YCSB- and TPC-C-shaped workloads.
 
 ### 3. Attack the published losses
+- **Adaptive behind the expert** ([`benchmarks/expert-vs-adaptive.md`](benchmarks/expert-vs-adaptive.md)):
+  - The driver admits the result cache late or never. Its fixed 1 MiB
+    reservation costs the whole resource budget on a small database, and its
+    speed estimate ignores how often queries repeat. That leaves point filters
+    about 1,000× behind and, at 5k rows, aggregates too.
+  - At 20k rows the identity phase ends without direct lookup (2.65× behind).
+  - Structures from ended phases are not retracted when they cost no
+    maintenance (identity-again, 1.2–1.8× behind).
+
+  Re-run `adabt-bench expert-vs-adaptive` after any change to the driver's
+  scoring. Matching on every phase is the finish line.
 - **Writes:** bulk load is ~11× and single-row inserts are behind SQLite.
   Per-record MVCC and WAL stay; batching, group commit and WAL-frame cost are
   the levers.

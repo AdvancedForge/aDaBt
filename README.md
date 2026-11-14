@@ -204,6 +204,7 @@ durability numbers mean nothing; the harness warns about this.
 | [`docs/roadmap.md`](docs/roadmap.md) | What was finished, and what comes next |
 | [`docs/semver.md`](docs/semver.md) | The on-disk compatibility promise |
 | [`docs/benchmarks/`](docs/benchmarks) | Measurements and methodology |
+| [`docs/benchmarks/expert-vs-adaptive.md`](docs/benchmarks/expert-vs-adaptive.md) | Adaptive against hand tuning, phase by phase |
 | [`docs/history/`](docs/history) | Milestone notes, kept as written at the time |
 
 ## License

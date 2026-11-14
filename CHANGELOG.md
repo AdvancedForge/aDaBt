@@ -44,6 +44,13 @@ A correctness and code-quality pass. No on-disk format change.
   under loom, and `tail` hid the failures. It now runs exactly the loom
   models and shows full failure output.
 
+### Added
+- **`adabt-bench expert-vs-adaptive`**, published in
+  `docs/benchmarks/expert-vs-adaptive.md`. Adaptive matches the best manual
+  configuration on 1 of 5 soak phases at 5k rows and 0 of 5 at 20k. It is
+  behind by 1.2× to about 1,000×, mostly because it enables the result cache
+  late or never.
+
 ### Changed
 - **Covering-index reads are faster, answers unchanged.** Stored projections
   share one name per field, the id → projection map is hashed, and `Project`
