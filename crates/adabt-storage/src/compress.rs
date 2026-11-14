@@ -83,6 +83,36 @@ pub fn decompress(encoding: Encoding, data: &[u8]) -> Result<Cow<'_, [u8]>> {
     }
 }
 
+/// The length a stored body decodes to, read from its framing.
+///
+/// No decompression: an LZ4 body begins with its uncompressed length, which
+/// `maybe_compress` writes for exactly this kind of question. `None` when the
+/// body is too short to hold that header, which only corruption produces.
+pub fn decoded_len(encoding: Encoding, data: &[u8]) -> Option<usize> {
+    match encoding {
+        Encoding::Raw => Some(data.len()),
+        Encoding::Lz4 => {
+            let header: [u8; 4] = data.get(..4)?.try_into().ok()?;
+            Some(u32::from_le_bytes(header) as usize)
+        }
+    }
+}
+
+/// The length `maybe_compress` would store `body` (held as `encoding`) at.
+///
+/// The same answer whether the body is stored compressed or not, which is
+/// the point: a decision about compression that is judged against what is
+/// stored *now* sees a different saving depending on whether it has
+/// already been made.
+pub fn compressed_len(encoding: Encoding, data: &[u8]) -> Result<usize> {
+    match encoding {
+        // Stored compressed means `maybe_compress` already chose this body,
+        // and it is deterministic, so it would choose it again.
+        Encoding::Lz4 => Ok(data.len()),
+        Encoding::Raw => Ok(maybe_compress(data).1.len()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,6 +139,21 @@ mod tests {
             let input = padded_record(i);
             let (enc, data) = maybe_compress(&input);
             assert_eq!(decompress(enc, &data).unwrap(), input, "record {i}");
+        }
+    }
+
+    #[test]
+    fn sizes_are_read_the_same_whichever_way_a_record_is_stored() {
+        for input in [padded_record(7), b"short".to_vec()] {
+            let (enc, data) = maybe_compress(&input);
+            assert_eq!(decoded_len(enc, &data), Some(input.len()));
+            assert_eq!(decoded_len(Encoding::Raw, &input), Some(input.len()));
+            assert_eq!(
+                compressed_len(enc, &data).unwrap(),
+                compressed_len(Encoding::Raw, &input).unwrap(),
+                "the would-be size must not depend on how the record is held now"
+            );
+            assert_eq!(compressed_len(enc, &data).unwrap(), data.len());
         }
     }
 

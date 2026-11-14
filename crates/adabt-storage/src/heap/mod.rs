@@ -87,6 +87,7 @@ mod write;
 pub use commit::TxnWrite;
 use mvcc::VersionChain;
 use placement::{ClusterState, FreeSpaceMap};
+pub use tuning::{RecordFootprint, FOOTPRINT_SAMPLE};
 
 /// `collection_id: u32 | record_id: u64 | encoding: u8` prefixed to every stored
 /// payload, so a slot says whose it is. That is what lets a slot be freed only

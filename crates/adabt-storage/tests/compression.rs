@@ -139,6 +139,56 @@ fn compressed_and_raw_records_coexist() {
 }
 
 #[test]
+fn the_footprint_is_the_same_whether_compression_is_on_or_off() {
+    // What an estimate of compression's saving is built on. If it read the
+    // stored bytes, it would see the saving shrink once made, and retract it.
+    let t = Tmp::new("footprint");
+    let mut h = HeapStore::open(t.path(), Durability::Relaxed, 256).unwrap();
+    fill(&mut h, 2_000);
+    let off = h.record_footprint().unwrap();
+
+    h.set_compression(true);
+    h.recompress_all().unwrap();
+    let on = h.record_footprint().unwrap();
+
+    assert_eq!(off, on);
+    let (name, fp) = &on[0];
+    assert_eq!(name, "c");
+    assert_eq!(fp.records, 2_000);
+    assert!(
+        fp.raw_bytes > h.stored_bytes().unwrap(),
+        "the uncompressed size should exceed what compression stores"
+    );
+    let ratio = fp.compression_ratio.unwrap();
+    assert!(ratio < 0.5, "padded records should at least halve: {ratio}");
+}
+
+#[test]
+fn records_too_short_to_compress_measure_a_ratio_of_one() {
+    let t = Tmp::new("footprint-short");
+    let mut h = HeapStore::open(t.path(), Durability::Relaxed, 256).unwrap();
+    let schema = Schema::new(
+        SchemaMode::Fixed,
+        vec![
+            FieldDef::new("id", FieldType::U64).required(),
+            FieldDef::new("n", FieldType::I64),
+        ],
+    )
+    .unwrap();
+    h.create_collection("small", schema).unwrap();
+    for i in 0..1_000u64 {
+        h.insert(
+            "small",
+            RecordId(i),
+            Record::new().with("id", i).with("n", i as i64),
+        )
+        .unwrap();
+    }
+    let fp = h.record_footprint().unwrap()[0].1;
+    assert_eq!(fp.compression_ratio, Some(1.0), "{fp:?}");
+}
+
+#[test]
 fn recompressing_an_existing_store_saves_space_and_keeps_every_record() {
     let t = Tmp::new("recompress");
     let mut h = HeapStore::open(t.path(), Durability::Relaxed, 256).unwrap();
