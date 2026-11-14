@@ -113,15 +113,16 @@ orders of magnitude.
 | Strict vs relaxed durability, writes | **5,900×**, which is why guarantees filter rather than score |
 
 **Against SQLite** ([`comparison/`](comparison), workloads chosen to include
-ones aDaBt should lose), aDaBt wins 4 of 8 clearly, is at parity or slightly
-ahead on a fifth, and loses 3:
+ones aDaBt should lose), aDaBt wins 5 of 8 clearly, is at parity or slightly
+ahead on a sixth, and loses 2:
 
 | aDaBt wins | parity | aDaBt loses |
 |---|---|---|
-| point lookup by id: **1.9×** | indexed range, tuned: **1.0–1.3×** (noisy) | bulk load: **~11× slower** (per-record MVCC + WAL) |
-| full-scan count, tuned: **~10⁴×** | | single-row inserts |
-| group-by count, tuned: **~10⁴×** | | indexed equality: **~1.4–1.5× slower** |
+| point lookup by id: **1.9×** | indexed range, tuned: **1.0–1.3×** (noisy) | bulk load: **1.5–2.0× slower** (per-record versions + logged frames) |
+| full-scan count, tuned: **~10⁴×** | | indexed equality: **~1.4–1.5× slower** |
+| group-by count, tuned: **~10⁴×** | | |
 | top-20 sort, tuned: **2.8×** | | |
+| single-row inserts: **2.3–2.5×** | | |
 
 Full numbers and caveats are in
 [`docs/benchmarks/comparison-notes.md`](docs/benchmarks/comparison-notes.md).

@@ -24,7 +24,7 @@ file wins.
 - **DDL is not transactional** — `CreateCollection`/`DropCollection`/schema changes commit on write, and sit outside `Strict`'s guarantee: a collection dropped and re-created under a running transaction is judged only by writes to the new one
 - **Point-in-time recovery needs a backup** — `open_at` restores only from a base image at or before the target: a backup restored with `restore_from` and given the archived log (`docs/operations.md`). It refuses a live data directory once the buffer pool has written to its heap file since the last checkpoint, instead of restoring in place. Moving between timelines is manual: a restored database continues its log at target + 1, needs an archive directory of its own, and keeps the history it superseded in `superseded-log/` for an operator to deal with
 - **Persistent thread-per-core workers** — burst pinning only (`core_affinity` per query)
-- **Write throughput** — bulk load is ~11× slower than SQLite and single-row inserts also lose; per-record MVCC + WAL is the price (`docs/benchmarks/comparison-notes.md`)
+- **Write throughput** — bulk load is 1.5–2.0× slower than SQLite (single-row inserts are faster); a version per record and a checksummed log frame per row are the price (`docs/benchmarks/comparison-notes.md`)
 - **Comparison witnesses** — SQLite only; the PostgreSQL and RocksDB witnesses are planned and the harness exits 2 rather than fake them
 - **`loom` coverage** — `adabt-storage`'s transaction-id allocator is model-checked; `adabt-engine` does not yet compile with `--features loom` (loom's `Arc` meets std's at crate boundaries), so the engine has no model checks
 - **C ABI** — open/close, create-collection, i64 field put/get, count; nothing more

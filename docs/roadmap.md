@@ -70,9 +70,15 @@ throughout: evidence first, then what it unblocks.
 
   Re-run `adabt-bench expert-vs-adaptive` after any change to the driver's
   scoring. Matching on every phase is the finish line.
-- **Writes:** bulk load is ~11× and single-row inserts are behind SQLite.
-  Per-record MVCC and WAL stay; batching, group commit and WAL-frame cost are
-  the levers.
+- **Writes:** bulk load is 1.5–2.0× behind SQLite; single-row inserts are now
+  2.3–2.5× ahead. Both were lost mostly to placement: the free-space map
+  scanned every full page on every insert. With that fixed, and the per-row
+  copies, allocations and page-path costs around the log removed, a loaded
+  row costs ~600 ns in the engine (details in
+  `benchmarks/comparison-notes.md`). Per-record MVCC and the WAL stay. What
+  is left, largest first: per-row derived-structure lookups in the engine
+  (~140 ns), the log frame's FNV-1a checksum (~100 ns; changing it is a log
+  format change), and the free-space and directory updates (~185 ns).
 - **Indexed equality** (~1.4–1.5× behind; indexed range is now at parity). Profiling showed the cost was cache misses and allocator
   traffic, not record construction as such; shared field names, a hashed
   projection map, an in-place `Project`, and filtering and projecting the

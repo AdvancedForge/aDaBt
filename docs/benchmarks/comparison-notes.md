@@ -54,23 +54,27 @@ The two indexed rows are the exception: they were re-measured after the
 covering read path was reworked (see "The covering read path" below), on a
 different and faster machine than the rest of the table, so read their
 ratios within each row and never against another row's absolute values.
+The two write rows were likewise re-measured after the write path was
+profiled and fixed (see "The write path: where the time went" below); their
+figures are ranges over several runs on a shared machine, with the load
+noted there.
 
 | workload | unit | aDaBt L0 | aDaBt tuned | SQLite | verdict |
 |---|---|---:|---:|---:|---|
-| bulk load | ns/row | 17,259 | – | 1,563 | **11.0× slower** — structural: MVCC + WAL per record |
+| bulk load | ns/row | 848–985 | – | 493–556 | **1.5–2.0× slower** — was 7.3–11.8× before the write path was fixed |
 | point lookup by id | ns/probe | 4,714 | – | 8,870 | **1.9× faster** |
 | indexed equality | ns/query | 11.5 ms | 5.00 ms | 3.50 ms | **~1.4–1.5× slower** in the quietest paired runs (1.43×, 1.55×; up to 1.0–1.3× when SQLite's own time swung) — through `CoveringLookup`, zero fetches, rows filtered and projected before they are copied; 1.6–1.7× on the same machine just before that, 1.7–2.9× before the covering read path was reworked, 3.9× pre-auto-covering |
 | full scan count | ns/query | 208.4 ms | **967** | 8.65 ms | **~9,000–20,000× faster** across runs |
 | group by, count | ns/query | 296.4 ms | **3,014** | 61.30 ms | **~10,000–24,000× faster** across runs |
 | indexed range | ns/query | 10.8 ms | 2.66 ms | 6.50 ms | **faster, 1.3–2.9× across six runs** — through `CoveringRange`; was 1.23–1.30× slower on the same machine before the covering read path was reworked |
 | top-20 sort | ns/query | 512.1 ms | **4.72 ms** | 13.31 ms | **2.8× FASTER than SQLite** after tuning |
-| single-row inserts | ns/row | 31,250 | – | 15,087 | **2.1× slower** |
+| single-row inserts | ns/row | 1,512–1,907 | – | 3,665–4,741 | **2.3–2.5× FASTER** — was 2.2–2.5× slower before the write path was fixed |
 
-**At its best configuration aDaBt wins 4 of 8 clearly, is at parity to slightly ahead on indexed range (about 1.0–1.3× against SQLite's steadier timings; the raw spread is wider), and loses 3.** One loss,
+**At its best configuration aDaBt wins 5 of 8 clearly, is at parity to slightly ahead on indexed range (about 1.0–1.3× against SQLite's steadier timings; the raw spread is wider), and loses 2.** One loss,
 indexed equality, is per-row materialization cost on a shape that already
-answers through a purpose-built structure; the other two (the write paths)
-are the price of the durability-and-exactness posture this project will not
-trade for benchmark points.
+answers through a purpose-built structure; the other, bulk load, is what is
+left of the price of a version per record and a checksummed log frame per
+row once the overhead around them was removed.
 
 Two rows changed kind since the first published run of this harness:
 
@@ -92,6 +96,14 @@ Two rows changed kind since the first published run of this harness:
 
 ## Where it genuinely wins
 
+**Single-row inserts (2.3–2.5×)** — autocommit on both sides, and on both
+sides each write is handed to the operating system before it is acknowledged
+(SQLite's WAL under `synchronous = OFF`, aDaBt's log under `Relaxed`). aDaBt
+makes one `write` per insert; SQLite takes and releases its file locks and
+writes WAL frames per statement (`strace -c`: about six `fcntl` and two
+`pwrite` calls per insert). This was a 2.2–2.5× loss until the write path's
+per-row overhead was removed.
+
 **Point lookups (1.8×)** — the resident page directory against SQLite's rowid
 b-tree. Expected, and it is the same advantage that sets the scale ceiling;
 it does not survive the dataset outgrowing RAM, which SQLite tolerates and
@@ -109,17 +121,133 @@ mechanism that produces them also produces the losses.
 
 ## Where it loses, and why
 
-- **Bulk load, 10–15×.** aDaBt pays per-record version chains, WAL appends and
-  index upkeep row by row; SQLite appends inside one transaction. Nothing
-  surprising — batch writes exist (`insert_batch`, used here) but the
-  per-record machinery dominates. Narrowable, not flippable: the bookkeeping
-  is the product.
+- **Bulk load, 1.5–2.0×** (7–15× until the write path was profiled). aDaBt
+  still writes a version-chain entry, a checksummed log frame and a slot per
+  row; SQLite appends to b-tree pages inside one transaction. What remains is
+  itemized in "The write path: where the time went".
 - **Indexed equality, ~1.6×.** Answered fetch-free through a covering
   index; the remainder is per-row allocation, broken down below.
-- **Single-row inserts, 2.3–2.5×.** Autocommit on both sides, WAL append on
-  both sides; the difference is per-statement bookkeeping.
 - **Untuned scans/sorts** remain decode-and-materialize versus packed pages —
   which is exactly why the tuned rows exist.
+
+## The write path: where the time went
+
+Profiled with a scratch timing harness (per-stage timers inside
+`HeapStore::insert_batch` and around the engine call), the counting allocator
+from `crates/adabt-engine/tests/allocations.rs`, and `strace -c`; `perf` was
+not available. The harness loads through `Database::insert_batch` — one commit
+record and one log flush for the whole batch — under `Durability::Relaxed`
+against SQLite's `synchronous = OFF`, and inserts single rows through
+`Database::insert`, autocommit, against SQLite's autocommit statements. The
+postures match, and neither side's timing includes work the other's leaves
+out, so the harness was left as it is.
+
+**Before**, per row, 100,000-row load, single rows inserted after it (load
+average 4–6):
+
+| stage | bulk load | single-row insert |
+|---|---:|---:|
+| whole engine call | 4,800–5,800 ns | 9,700–11,000 ns |
+| normalise, validate, encode | ~70 ns | ~70 ns |
+| build and append the log frame | 190–270 ns | 190–270 ns |
+| `write` syscall (a batch flushes once) | – | ~300–400 ns |
+| **finding a page with room** | **~3,500–5,500 ns** | **most of the rest** |
+| heap allocations | 10.2 | 11.2 |
+
+Nearly all of it was one loop in placement. The free-space map bucketed
+pages into eight 1 KiB classes and, to find room for a record, scanned the
+class the record's size fell into page by page. Every full page — fewer than
+1,024 bytes free — sits in the lowest class, which is also the class every
+small record asks first, so each insert walked past every full page in the
+heap: O(pages) per write, about 900 pages by the end of this load, and the
+whole heap for every single-row insert that followed it. Syscalls were never
+the problem: the load makes one `write` per few hundred rows, a single-row
+insert exactly one.
+
+What changed. Each change keeps every answer, and none moves a log append,
+flush or fsync relative to the page change it covers:
+
+1. **The free-space map is ordered by free space** (`heap::placement`). An
+   ordered set of `(free bytes, page)` answers "the fullest page that still
+   fits" in O(log pages). The policy is the same in spirit — nearly full
+   pages are topped up before emptier ones, so a load fills pages in turn and
+   reclaimed space is reused before the file grows. Placement only chooses
+   among pages with room; where a record lands is still logged and recorded
+   in the directory exactly as before.
+2. **Clock eviction without a search per hit** (`pager::Clock`). Recording a
+   hit searched the ring of resident pages for the page touched — about 1,000
+   comparisons per page access once the pool had filled, ~270 ns on every
+   write and every read. The reference bits now live in a map beside the
+   ring, so a hit is one lookup; victims are chosen in exactly the same order.
+3. **Log frames are encoded from borrowed parts into a reused buffer**
+   (`wal::RecordFrame`, `Wal::append_record`). A data write used to copy its
+   collection name and encoded record into a `WalOp`, encode that into a new
+   vector and hand the writer three pieces; it now encodes straight from the
+   caller's buffers and makes one `write_all`. The bytes on disk are
+   identical — `WalOp`'s own insert, update and delete encode through the
+   same code — and a frame is still appended, made durable per policy and
+   handed to the operating system before any page changes.
+4. **A batch borrows its records and encodes them into one buffer.** The
+   engine normalises the batch in place and lends it to the store
+   (`HeapStore::insert_batch_from`) instead of cloning every record to keep a
+   copy for indexing. Strictly ascending ids — what a load is — skip the
+   within-batch duplicate set, and skip the per-row existence check when the
+   first id is past the collection's highest; each check is skipped only
+   where it cannot fail. The batch is still validated in full before anything
+   is logged, logged under one commit record, and applied only after.
+5. **Smaller per-write costs on the page path.** The slot payload is built in
+   a buffer the store keeps instead of two fresh vectors; a page remembers
+   how many of its leading slots are live, so an insert does not reread them
+   looking for a dead one to reuse (a lower bound kept in memory, never
+   stored); a new page is written from one pre-sealed empty page instead of
+   checksumming 8 KiB each time; and the maps every page access goes through
+   hash page ids with one multiply instead of SipHash.
+
+**After**, same scratch harness and machine (load average 2–3):
+
+| stage | bulk load | single-row insert |
+|---|---:|---:|
+| whole engine call | 600–640 ns | 1,200–1,280 ns |
+| validate and encode into the batch buffer | ~50 ns | ~70 ns |
+| log frame, most of it the FNV-1a checksum | ~135 ns | ~135 ns |
+| `write` syscall | – | ~300–400 ns |
+| place: free-space lookup, page insert | ~100 ns | ~100 ns |
+| directory: version chain and bookkeeping | ~85 ns | ~85 ns |
+| engine: normalise, derived-structure upkeep, telemetry | ~140 ns | ~200 ns |
+| heap allocations | 1.3 | 5.2 |
+
+Both allocation counts are now pinned by tripwires in
+`crates/adabt-engine/tests/allocations.rs`. The comparison harness, built
+from `main` and from this change side by side and run interleaved at load
+average 3.4–3.5:
+
+| | bulk load (ns/row) | single-row insert (ns/row) |
+|---|---:|---:|
+| before | 4,276–4,344 (SQLite 537–556) | 8,667–8,891 (SQLite 3,645–3,695) |
+| after | 848–875 (SQLite 538–555) | 1,512–1,613 (SQLite 3,665–3,751) |
+
+A separate run of the new build at load 2.8 gave 944–985 against SQLite's
+493–502 for the load and 1,883–1,907 against 4,726–4,741 for single rows. The
+baseline runs at load 5.7–7.0 gave 5,034–6,575 against 474–907, and
+10,314–14,243 against 4,782–5,766. The table at the top uses the ranges
+across the after runs.
+
+What is left of the bulk-load gap, largest first:
+
+1. **The engine's per-row upkeep** (~140 ns): derived structures are looked
+   up by collection name for every row even when the collection has none,
+   and the caller's records are freed at the end of the call.
+2. **The log frame's checksum** (~100 of its ~135 ns). FNV-1a is a serial
+   multiply per byte. A faster checksum is a log format change — a version
+   bump and a reader for both formats — so it is left for a deliberate
+   decision rather than slipped in here.
+3. **Placement and the directory** (~185 ns together): an ordered-set update
+   per row, and a `BTreeMap` insert and a one-element vector for each new
+   version chain.
+
+Group commit for concurrent autocommits was not built: a `Database` is
+written through `&mut self`, so there are no concurrent autocommits to
+group, and `GroupCommit` already batches the fsyncs of sequential ones.
 
 ## The covering read path: where the time went
 

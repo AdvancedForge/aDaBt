@@ -136,6 +136,24 @@ files are new (`base.adabt`, `superseded-log/`).
   late or never.
 
 ### Changed
+- **Writes are about 5× faster, answers and durability unchanged.** Against
+  SQLite, bulk load went from 7–12× slower to 1.5–2.0× slower and single-row
+  inserts from 2.2–2.5× slower to 2.3–2.5× faster (comparison harness, before
+  and after run interleaved: 4,276–4,344 → 848–875 ns per loaded row,
+  8,667–8,891 → 1,512–1,613 ns per single-row insert). Most of the time was
+  placement: the free-space map scanned every full page on every insert. It
+  is now ordered by free space and finds the fullest page that fits in
+  O(log pages). Also: clock eviction records a hit with one lookup instead of
+  a search of the ring; data log frames are encoded from borrowed parts into
+  a reused buffer (bytes on disk unchanged); `Database::insert_batch` lends
+  its records to the store instead of cloning them, and the store encodes a
+  batch into one buffer; slot payloads use a reused buffer; pages skip their
+  live leading slots when looking for one to reuse; new pages are written
+  from a pre-sealed empty page; page-id maps hash with one multiply.
+  Allocations per row: 10.2 → 1.3 for a batch insert, 11.2 → 5.2 for an
+  autocommit insert, both now pinned by tests. New
+  `HeapStore::insert_batch_from`, `RecordCodec::encode_into`,
+  `Wal::append_record` with `RecordFrame`, and `page::PageMap`.
 - **Covering-index reads are faster, answers unchanged.** Stored projections
   share one name per field, the id → projection map is hashed, and `Project`
   narrows owned rows in place: tuned indexed range went from ~1.3× slower
