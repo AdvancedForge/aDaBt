@@ -62,6 +62,38 @@ fn priorities(policy: &Policy) -> Priorities {
     policy.priority.clamped()
 }
 
+/// The resource effect of adding `bytes` (negative for a saving), from -1 to 1,
+/// positive when resources are freed.
+///
+/// A stated ceiling is the budget, and the effect is the fraction of it spent
+/// or freed: a user who names a budget means that budget.
+///
+/// Otherwise the change is judged against the database itself, as the
+/// relative change in its footprint measured against **the larger of before
+/// and after**. That is bounded by construction, and it makes doubling the
+/// database and halving it equal and opposite (-0.5 and +0.5).
+///
+/// It used to be measured against the footprint before the change and clamped
+/// to [-1, 1]. Halving scored +0.5 but doubling scored -1, so on that scale a
+/// byte spent counted for twice as much as a byte saved, and any structure as
+/// large as the data it serves took the whole resource budget whatever it
+/// bought. On the expert comparison that is how `direct_lookup` lost the
+/// 20,000-row identity phase: a second copy of a 1.1 MB table, for lookups
+/// 2.6x faster, scored -3.00 on resources, the same as an unbounded cost.
+///
+/// An absolute yardstick (a fixed budget, or the machine's memory) was
+/// considered and rejected: it makes every small database's savings vanish,
+/// which M8 found makes them unoptimizable (`docs/history/m8-notes.md`), and it
+/// would make the same decision depend on which machine took it.
+fn resource_change(bytes: i64, policy: &Policy, footprint: u64) -> f64 {
+    if let Some(budget) = policy.constraints.max_ram_bytes {
+        return (-(bytes as f64) / budget as f64).clamp(-1.0, 1.0);
+    }
+    let before = (footprint as f64).max(MIN_FOOTPRINT_BYTES);
+    let after = (before + bytes as f64).max(0.0);
+    (before - after) / before.max(after)
+}
+
 /// Score a candidate under a policy. Higher is better; negative means the
 /// change is judged not worth making.
 pub fn score(effects: &AxisEffects, est: &CostEstimate, policy: &Policy) -> Score {
@@ -70,10 +102,11 @@ pub fn score(effects: &AxisEffects, est: &CostEstimate, policy: &Policy) -> Scor
 
 /// Score against an explicit resource scale.
 ///
-/// `footprint` is what the database currently costs; savings are judged as a
-/// fraction of it, so the same proportional win counts the same on a small
-/// database as on a large one. A stated `max_ram` ceiling overrides it, because
-/// a user who names a budget means that budget.
+/// `footprint` is what the database currently costs; memory spent or saved is
+/// judged relative to it (see [`resource_change`]), so the same proportional
+/// change counts the same on a small database as on a large one. A stated
+/// `max_ram` ceiling overrides it, because a user who names a budget means
+/// that budget.
 pub fn score_against(
     effects: &AxisEffects,
     est: &CostEstimate,
@@ -94,14 +127,7 @@ pub fn score_against(
     // term is comparable to the latency one. CPU is charged separately because
     // a CPU-for-storage trade is exactly the kind this axis must express, and
     // netting them together would hide it.
-    // A stated ceiling wins; otherwise judge against what the database costs
-    // now, floored so an empty database cannot divide by nothing.
-    let budget = policy
-        .constraints
-        .max_ram_bytes
-        .map(|b| b as f64)
-        .unwrap_or_else(|| (footprint as f64).max(MIN_FOOTPRINT_BYTES));
-    let bytes_saved = (-(est.ram_bytes + est.storage_bytes) as f64 / budget).clamp(-1.0, 1.0);
+    let bytes_saved = resource_change(est.ram_bytes + est.storage_bytes, policy, footprint);
     let resource_term = p.resources as f64 * (bytes_saved - est.cpu_frac);
 
     // Freedom comes from the declared axis effect: it is a statement about what
@@ -271,6 +297,52 @@ mod tests {
         let indifferent = score(&effects, &est, &policy_of(10, 1, 0)).total;
         let protective = score(&effects, &est, &policy_of(10, 1, 10)).total;
         assert!(protective < indifferent);
+    }
+
+    #[test]
+    fn doubling_the_database_costs_what_halving_it_saves() {
+        let policy = policy_of(5, 10, 5);
+        let mb = 1_048_576_i64;
+        let footprint = 4 * mb as u64;
+        let resources = |bytes: i64| {
+            score_against(
+                &AxisEffects::default(),
+                &CostEstimate::neutral().with_ram(bytes),
+                &policy,
+                footprint,
+            )
+            .resource_term
+        };
+        let doubled = resources(4 * mb);
+        let halved = resources(-2 * mb);
+        assert!((doubled + halved).abs() < 1e-9, "{doubled} vs {halved}");
+        assert!((halved - 5.0).abs() < 1e-9, "halving is half of the axis");
+    }
+
+    #[test]
+    fn a_structure_as_large_as_the_data_does_not_take_the_whole_budget() {
+        // The 20,000-row identity phase of the expert comparison: a second
+        // copy of a 1.1 MB table for lookups 2.6x faster.
+        let effects = AxisEffects::new(9, -7, -4);
+        let est = CostEstimate::faster(0.4, 0.35)
+            .with_ram(1_280_000)
+            .with_confidence(0.5);
+        let s = score_against(&effects, &est, &policy_of(9, 3, 5), 1_120_000);
+        assert!(s.resource_term > -3.0 * 0.6, "{}", s.describe());
+        assert!(s.total > 0.5, "{}", s.describe());
+    }
+
+    #[test]
+    fn a_stated_ceiling_is_still_the_budget() {
+        let mut policy = policy_of(5, 10, 5);
+        policy.constraints.max_ram_bytes = Some(1_000_000);
+        let s = score_against(
+            &AxisEffects::default(),
+            &CostEstimate::neutral().with_ram(250_000),
+            &policy,
+            10_000_000,
+        );
+        assert!((s.resource_term + 2.5).abs() < 1e-9, "{}", s.describe());
     }
 
     #[test]
