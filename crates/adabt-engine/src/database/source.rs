@@ -18,12 +18,9 @@ impl Source for Database {
         id: RecordId,
         field: &str,
     ) -> Result<Option<Option<adabt_core::value::Value>>> {
-        self.note_touch(collection, id);
-        if !self
-            .masked()
-            .is_some_and(|h| h.hides_direct(self.revealed(), collection))
-        {
-            if let Some(d) = self.direct.get(collection) {
+        self.telemetry.note_touch(collection, id);
+        if !self.experiments.hides_direct(collection) {
+            if let Some(d) = self.derived.direct.get(collection) {
                 // Row liveness first, from one bit — otherwise a dead row and
                 // a live row missing the field would be indistinguishable.
                 if !d.contains(id) {
@@ -45,12 +42,9 @@ impl Source for Database {
         id: RecordId,
         fields: &[&str],
     ) -> Result<Option<Record>> {
-        self.note_touch(collection, id);
-        if !self
-            .masked()
-            .is_some_and(|h| h.hides_direct(self.revealed(), collection))
-        {
-            if let Some(d) = self.direct.get(collection) {
+        self.telemetry.note_touch(collection, id);
+        if !self.experiments.hides_direct(collection) {
+            if let Some(d) = self.derived.direct.get(collection) {
                 if !d.contains(id) {
                     return Ok(None);
                 }
@@ -72,15 +66,12 @@ impl Source for Database {
     }
 
     fn fetch(&mut self, collection: &str, id: RecordId) -> Result<Option<Record>> {
-        self.note_touch(collection, id);
+        self.telemetry.note_touch(collection, id);
         // The Level 10 path: no page directory, no slot table, just an address
         // calculation. Falls through to the heap when no array exists — or when
         // one exists but is a candidate this query is not allowed to see.
-        if !self
-            .masked()
-            .is_some_and(|h| h.hides_direct(self.revealed(), collection))
-        {
-            if let Some(d) = self.direct.get(collection) {
+        if !self.experiments.hides_direct(collection) {
+            if let Some(d) = self.derived.direct.get(collection) {
                 return d.get(id);
             }
         }
@@ -102,7 +93,7 @@ impl Source for Database {
         predicate: Option<&adabt_ir::Expr>,
     ) -> Result<Option<Vec<(RecordId, Record)>>> {
         use adabt_ir::plan::AggKind;
-        let Some(store) = self.columns.get(collection) else {
+        let Some(store) = self.derived.columns.get(collection) else {
             return Ok(None);
         };
         let col_aggs: Vec<crate::column::ColumnAgg> = aggs
@@ -162,7 +153,7 @@ impl Source for Database {
         collection: &str,
         fields: &[String],
     ) -> Result<Option<Vec<(RecordId, Record)>>> {
-        let Some(c) = self.columns.get(collection) else {
+        let Some(c) = self.derived.columns.get(collection) else {
             return Ok(None);
         };
         let refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
@@ -176,7 +167,7 @@ impl Source for Database {
         descending: bool,
         k: usize,
     ) -> Result<Option<Vec<RecordId>>> {
-        let Some(c) = self.columns.get(collection) else {
+        let Some(c) = self.derived.columns.get(collection) else {
             return Ok(None);
         };
         Ok(c.topk_ids(field, descending, k))
@@ -189,6 +180,7 @@ impl Source for Database {
         key: &Value,
     ) -> Result<Option<Vec<RecordId>>> {
         Ok(self
+            .derived
             .indexes
             .get(collection)
             .and_then(|l| {
@@ -228,7 +220,7 @@ impl Source for Database {
         key: &Value,
         needed: &[String],
     ) -> Result<Option<Vec<(RecordId, Record)>>> {
-        let Some(list) = self.indexes.get(collection) else {
+        let Some(list) = self.derived.indexes.get(collection) else {
             return Ok(None);
         };
         let found = list.iter().find(|i| {
@@ -271,7 +263,7 @@ impl Source for Database {
         hi: Bound<&Value>,
         needed: &[String],
     ) -> Result<Option<Vec<(RecordId, Record)>>> {
-        let Some(list) = self.indexes.get(collection) else {
+        let Some(list) = self.derived.indexes.get(collection) else {
             return Ok(None);
         };
         let found = list.iter().find(|i| {
@@ -311,6 +303,7 @@ impl Source for Database {
     ) -> Result<Option<Vec<RecordId>>> {
         let name = adabt_index::composite_name(fields);
         Ok(self
+            .derived
             .indexes
             .get(collection)
             .and_then(|l| l.iter().find(|i| i.field() == name))
@@ -325,6 +318,7 @@ impl Source for Database {
         hi: Bound<&Value>,
     ) -> Result<Option<Vec<RecordId>>> {
         Ok(self
+            .derived
             .indexes
             .get(collection)
             .and_then(|l| {

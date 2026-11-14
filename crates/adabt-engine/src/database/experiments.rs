@@ -18,11 +18,6 @@ use super::{Database, QueryMode};
 impl Database {
     // -- experiments -------------------------------------------------------
 
-    /// Find a running experiment by id.
-    pub(super) fn experiment_index(&self, id: u64) -> Option<usize> {
-        self.experiments.iter().position(|e| e.experiment.id == id)
-    }
-
     /// Begin proving a change against live traffic.
     ///
     /// Nothing is built yet: the experiment starts in `Proposed` and each call
@@ -39,9 +34,16 @@ impl Database {
         }
         let inputs = self.opt_inputs()?;
         let plan = {
-            let opt = self.registry.get(decision.optimization).ok_or_else(|| {
-                Error::InvalidOptimization(format!("{} is not registered", decision.optimization))
-            })?;
+            let opt = self
+                .optimizer
+                .registry
+                .get(decision.optimization)
+                .ok_or_else(|| {
+                    Error::InvalidOptimization(format!(
+                        "{} is not registered",
+                        decision.optimization
+                    ))
+                })?;
             opt.plan_enable(&inputs.ctx(), &decision.scope, &decision.params)
         };
         if plan.apply.is_empty() {
@@ -70,6 +72,7 @@ impl Database {
 
         if let Some(clash) = self
             .experiments
+            .running
             .iter()
             .find(|e| crate::experiment::scopes_overlap(&e.collection, &candidate_collection))
         {
@@ -90,9 +93,8 @@ impl Database {
             )));
         }
 
-        let id = self.next_experiment_id;
-        self.next_experiment_id += 1;
-        self.experiments.push(LiveExperiment::new(
+        let id = self.experiments.allocate_id();
+        self.experiments.running.push(LiveExperiment::new(
             id,
             decision,
             candidate_collection,
@@ -106,17 +108,18 @@ impl Database {
     /// Kept for the common case of driving one at a time; see
     /// [`Database::experiments`] when several may be running.
     pub fn experiment(&self) -> Option<&LiveExperiment> {
-        self.experiments.first()
+        self.experiments.running.first()
     }
 
     /// Every experiment running right now, oldest first.
     pub fn experiments(&self) -> impl Iterator<Item = &LiveExperiment> {
-        self.experiments.iter()
+        self.experiments.running.iter()
     }
 
     /// Changes the controller accepted, over the database's whole life.
     pub fn decision_count(&self) -> usize {
-        self.controller
+        self.optimizer
+            .controller
             .log()
             .records()
             .iter()
@@ -124,17 +127,15 @@ impl Database {
             .count()
     }
 
-    /// Experiments that have ever been started.
-    ///
-    /// Counted from the id allocator rather than from a list, so it includes
-    /// the ones already retired and does not grow a structure to answer.
+    /// Experiments that have ever been started, including those retired.
     pub fn experiments_started(&self) -> usize {
-        (self.next_experiment_id - 1) as usize
+        self.experiments.started()
     }
 
     /// Experiments that ended by being promoted.
     pub fn promoted_count(&self) -> usize {
-        self.finished
+        self.experiments
+            .finished
             .iter()
             .filter(|e| e.phase() == Phase::Promoted)
             .count()
@@ -142,7 +143,8 @@ impl Database {
 
     /// Experiments that ended by being reverted.
     pub fn reverted_count(&self) -> usize {
-        self.finished
+        self.experiments
+            .finished
             .iter()
             .filter(|e| e.phase() == Phase::Reverted)
             .count()
@@ -150,17 +152,18 @@ impl Database {
 
     /// Experiments that reached a verdict, oldest first.
     pub fn finished_experiments(&self) -> &[LiveExperiment] {
-        &self.finished
+        &self.experiments.finished
     }
 
     pub fn explain_experiment(&self) -> String {
-        if self.experiments.is_empty() {
-            return match self.finished.last() {
+        if self.experiments.running.is_empty() {
+            return match self.experiments.finished.last() {
                 Some(e) => e.explain(),
                 None => "no experiments\n".to_string(),
             };
         }
         self.experiments
+            .running
             .iter()
             .map(|e| e.explain())
             .collect::<Vec<_>>()
@@ -176,16 +179,21 @@ impl Database {
     /// calling it too often merely produces `Inconclusive` until the samples
     /// arrive.
     pub fn advance_experiments(&mut self) -> Result<Vec<(u64, Phase)>> {
-        let ids: Vec<u64> = self.experiments.iter().map(|e| e.experiment.id).collect();
+        let ids: Vec<u64> = self
+            .experiments
+            .running
+            .iter()
+            .map(|e| e.experiment.id)
+            .collect();
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
             // Re-found each time: retiring one experiment removes it from the
             // vector, so an index taken before the loop would drift.
-            let Some(i) = self.experiment_index(id) else {
+            let Some(i) = self.experiments.index_of(id) else {
                 continue;
             };
             let ram = self.derived_memory_bytes() as u64;
-            let live = &mut self.experiments[i];
+            let live = &mut self.experiments.running[i];
             live.fold(ram);
             let before = live.phase();
             let after = live.experiment.advance();
@@ -204,7 +212,12 @@ impl Database {
 
     /// Stop every running experiment and undo whatever each built.
     pub fn abort_experiment(&mut self, why: &str) -> Result<()> {
-        let ids: Vec<u64> = self.experiments.iter().map(|e| e.experiment.id).collect();
+        let ids: Vec<u64> = self
+            .experiments
+            .running
+            .iter()
+            .map(|e| e.experiment.id)
+            .collect();
         for id in ids {
             self.abort_experiment_by_id(id, why)?;
         }
@@ -213,16 +226,16 @@ impl Database {
 
     /// Stop one experiment and undo whatever it built.
     pub fn abort_experiment_by_id(&mut self, id: u64, why: &str) -> Result<()> {
-        if let Some(i) = self.experiment_index(id) {
-            self.experiments[i].experiment.abort(why);
+        if let Some(i) = self.experiments.index_of(id) {
+            self.experiments.running[i].experiment.abort(why);
         }
         self.retire_experiment(id, why.to_string(), false)
     }
 
     fn enter_phase(&mut self, id: u64, phase: Phase) -> Result<()> {
         if phase.is_measuring() {
-            if let Some(i) = self.experiment_index(id) {
-                self.experiments[i].reset_measurements();
+            if let Some(i) = self.experiments.index_of(id) {
+                self.experiments.running[i].reset_measurements();
             }
         }
         match phase {
@@ -234,8 +247,9 @@ impl Database {
                 // how it is doing and be told, accurately and uselessly, that it
                 // is serving no traffic.
                 let why = self
-                    .experiment_index(id)
-                    .map(|i| self.experiments[i].experiment.outcome())
+                    .experiments
+                    .index_of(id)
+                    .map(|i| self.experiments.running[i].experiment.outcome())
                     .unwrap_or_else(|| "reverted".into());
                 self.retire_experiment(id, why, false)
             }
@@ -245,28 +259,28 @@ impl Database {
 
     /// Build one experiment's candidate where the planner cannot see it.
     fn build_candidate(&mut self, id: u64) -> Result<()> {
-        let Some(i) = self.experiment_index(id) else {
+        let Some(i) = self.experiments.index_of(id) else {
             return Ok(());
         };
-        let decision = self.experiments[i].experiment.decision.clone();
+        let decision = self.experiments.running[i].experiment.decision.clone();
         let ram_before = self.derived_memory_bytes() as u64;
-        self.experiments[i].set_ram_before(ram_before);
+        self.experiments.running[i].set_ram_before(ram_before);
         // Mask first, build second. The other order would leave a window in
         // which the structure exists and is usable, and one query through it is
         // one query the experiment was supposed to be protecting.
-        self.candidate_visible = false;
-        self.recording_candidate = Some(id);
+        self.experiments.candidate_visible = false;
+        self.experiments.recording_candidate = Some(id);
         let inputs = self.opt_inputs()?;
         let mut trial = decision.clone();
         trial.trigger = format!("trialled by experiment #{id}: {}", decision.trigger);
         let report = self.run_decisions(vec![trial], DecisionSource::Adaptive, inputs);
-        self.recording_candidate = None;
+        self.experiments.recording_candidate = None;
         let report = report?;
 
         // Asked of *this* experiment, not of the mask as a whole: with another
         // experiment running, a globally non-empty mask says nothing about
         // whether this one built anything worth comparing.
-        if !report.all_applied() || self.hidden.is_empty_for(id) {
+        if !report.all_applied() || self.experiments.hidden.is_empty_for(id) {
             // Either the controller refused, or it applied something with
             // nothing to mask. Both mean there is no comparison to run, and
             // measuring one anyway would compare the database against itself
@@ -289,14 +303,14 @@ impl Database {
 
     /// End one experiment, keeping or undoing what it built.
     fn retire_experiment(&mut self, id: u64, why: String, promoted: bool) -> Result<()> {
-        let Some(i) = self.experiment_index(id) else {
+        let Some(i) = self.experiments.index_of(id) else {
             return Ok(());
         };
-        let mut live = self.experiments.remove(i);
-        live.candidates = self.hidden.clone();
+        let mut live = self.experiments.running.remove(i);
+        live.candidates = self.experiments.hidden.clone();
         let decision = live.experiment.decision.clone();
 
-        if !promoted && !self.hidden.is_empty_for(id) {
+        if !promoted && !self.experiments.hidden.is_empty_for(id) {
             // Undo through the controller, which knows the exact inverse of what
             // it applied. Reverting is instant because every candidate is a
             // derived representation: dropping one costs a deallocation and
@@ -316,9 +330,9 @@ impl Database {
         // experiment's unproven structure the instant an unrelated
         // experiment finished, exposing it to live traffic it was
         // specifically being kept away from.
-        self.hidden.forget(id);
-        self.candidate_visible = false;
-        self.experiment_under_test = None;
+        self.experiments.hidden.forget(id);
+        self.experiments.candidate_visible = false;
+        self.experiments.under_test = None;
 
         let detail = if promoted {
             format!(
@@ -334,24 +348,11 @@ impl Database {
         } else {
             Verdict::Failed
         };
-        self.controller
+        self.optimizer
+            .controller
             .note(decision, verdict, detail, DecisionSource::Adaptive);
-        self.finished.push(live);
+        self.experiments.finished.push(live);
         Ok(())
-    }
-
-    /// The experiment, if any, that this query is evidence for.
-    ///
-    /// At most one: `begin_experiment` refuses overlapping scopes, so a query
-    /// on a collection can match a collection-scoped experiment or a global
-    /// one but never both.
-    fn experiment_for(&self, collection: &str) -> Option<u64> {
-        self.experiments
-            .iter()
-            .find(|e| {
-                e.phase().is_measuring() && (e.collection.is_empty() || e.collection == collection)
-            })
-            .map(|e| e.experiment.id)
     }
 
     /// Route one query according to the phase its experiment is in.
@@ -359,19 +360,19 @@ impl Database {
         &mut self,
         logical: &LogicalPlan,
     ) -> Result<Vec<(RecordId, Record)>> {
-        let Some(id) = self.experiment_for(logical.collection()) else {
+        let Some(id) = self.experiments.measuring(logical.collection()) else {
             return self.query_in(logical, QueryMode::Normal);
         };
-        let Some(i) = self.experiment_index(id) else {
+        let Some(i) = self.experiments.index_of(id) else {
             return self.query_in(logical, QueryMode::Normal);
         };
         // Taken out for the duration so the query path can borrow `self`
         // mutably, and put back before returning on every path.
-        let mut live = self.experiments.remove(i);
+        let mut live = self.experiments.running.remove(i);
         // Names whose candidate may be revealed while this query runs. Without
         // it, `candidate_visible` would expose every running experiment's
         // structures at once and each would be measuring the others.
-        self.experiment_under_test = Some(id);
+        self.experiments.under_test = Some(id);
 
         let out = match live.phase() {
             // Both paths, same query, same state. The caller receives the
@@ -389,11 +390,11 @@ impl Database {
             // real workload actually produces.
             Phase::Canary(percent) => {
                 let use_candidate = live.route(percent);
-                self.candidate_visible = use_candidate;
+                self.experiments.candidate_visible = use_candidate;
                 let started = Instant::now();
                 let r = self.query_in(logical, QueryMode::Served);
                 let nanos = started.elapsed().as_nanos() as u64;
-                self.candidate_visible = false;
+                self.experiments.candidate_visible = false;
                 if use_candidate {
                     live.record_candidate(nanos, r.is_ok());
                 } else {
@@ -403,10 +404,12 @@ impl Database {
             }
             _ => self.query_in(logical, QueryMode::Normal),
         };
-        self.experiment_under_test = None;
+        self.experiments.under_test = None;
         // Back where it was, so age order — and therefore `experiment()` —
         // stays stable across queries.
-        self.experiments.insert(i.min(self.experiments.len()), live);
+        self.experiments
+            .running
+            .insert(i.min(self.experiments.running.len()), live);
         out
     }
 }
@@ -419,14 +422,14 @@ impl Database {
 /// change.
 impl crate::shadow::ShadowPair for Database {
     fn baseline(&mut self, plan: &LogicalPlan) -> Result<Vec<(RecordId, Record)>> {
-        self.candidate_visible = false;
+        self.experiments.candidate_visible = false;
         self.query_in(plan, QueryMode::Trial)
     }
 
     fn candidate(&mut self, plan: &LogicalPlan) -> Result<Vec<(RecordId, Record)>> {
-        self.candidate_visible = true;
+        self.experiments.candidate_visible = true;
         let out = self.query_in(plan, QueryMode::Trial);
-        self.candidate_visible = false;
+        self.experiments.candidate_visible = false;
         out
     }
 }

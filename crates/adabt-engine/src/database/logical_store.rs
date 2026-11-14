@@ -21,7 +21,7 @@ impl LogicalStore for Database {
         // or it would silently miss the optimization it was promised.
         if fixed && self.config().is_enabled_anywhere("direct_lookup") {
             if let Some(arr) = DirectArray::new(schema) {
-                self.direct.insert(name.to_string(), arr);
+                self.derived.direct.insert(name.to_string(), arr);
             }
         }
         Ok(())
@@ -29,11 +29,10 @@ impl LogicalStore for Database {
 
     fn drop_collection(&mut self, name: &str) -> Result<()> {
         self.store.drop_collection(name)?;
-        self.indexes.remove(name);
-        self.direct.remove(name);
-        self.bump_epoch(name);
-        self.plan_cache.clear();
-        self.compiled.clear();
+        self.derived.indexes.remove(name);
+        self.derived.direct.remove(name);
+        self.caches.bump_epoch(name);
+        self.caches.invalidate_plans();
         Ok(())
     }
 
@@ -50,29 +49,27 @@ impl LogicalStore for Database {
         let mut stored = rec.clone();
         adabt_core::store::normalize_for_storage(&mut stored);
         self.check_unique_constraints(collection, None, &stored)?;
-        let key = self
-            .cluster_fields
-            .get(collection)
-            .and_then(|f| Self::cluster_key(collection, f, &rec));
-        match key {
+        match self.tuning.cluster_key(collection, &rec) {
             Some(k) => self.store.insert_keyed(collection, id, rec, k)?,
             None => self.store.insert(collection, id, rec)?,
         }
-        self.reindex_insert(collection, id, &stored);
-        self.bump_epoch(collection);
-        self.observe(collection, OpKind::Insert, t, 1);
+        self.derived
+            .on_insert(collection, id, &stored, &self.telemetry.probe);
+        self.caches.bump_epoch(collection);
+        self.telemetry.observe(collection, OpKind::Insert, t, 1);
         Ok(())
     }
 
     fn get(&mut self, collection: &str, id: RecordId) -> Result<Option<Record>> {
         let t = Instant::now();
-        let r = if let Some(d) = self.direct.get(collection) {
+        let r = if let Some(d) = self.derived.direct.get(collection) {
             d.get(id)?
         } else {
             self.store.get(collection, id)?
         };
-        self.note_touch(collection, id);
-        self.observe(collection, OpKind::Get, t, r.is_some() as u64);
+        self.telemetry.note_touch(collection, id);
+        self.telemetry
+            .observe(collection, OpKind::Get, t, r.is_some() as u64);
         Ok(r)
     }
 
@@ -81,7 +78,7 @@ impl LogicalStore for Database {
         // The old record is needed to un-index it. This read is the standing
         // cost of maintaining any index, and it is why an index nobody queries
         // is a pure loss rather than merely a neutral one.
-        let old = if self.needs_old_record(collection) {
+        let old = if self.derived.needs_old_record(collection) {
             self.store.get(collection, id)?
         } else {
             None
@@ -91,53 +88,61 @@ impl LogicalStore for Database {
         self.check_unique_constraints(collection, Some(id), &stored)?;
         let existed = self.store.update(collection, id, rec)?;
         if let Some(old) = old {
-            self.reindex_remove(collection, id, &old);
+            self.derived
+                .on_remove(collection, id, &old, &self.telemetry.probe);
         }
-        self.reindex_insert(collection, id, &stored);
-        self.bump_epoch(collection);
-        self.observe(collection, OpKind::Update, t, existed as u64);
+        self.derived
+            .on_insert(collection, id, &stored, &self.telemetry.probe);
+        self.caches.bump_epoch(collection);
+        self.telemetry
+            .observe(collection, OpKind::Update, t, existed as u64);
         Ok(existed)
     }
 
     fn delete(&mut self, collection: &str, id: RecordId) -> Result<bool> {
         let t = Instant::now();
-        let old = if self.needs_old_record(collection) {
+        let old = if self.derived.needs_old_record(collection) {
             self.store.get(collection, id)?
         } else {
             None
         };
         let existed = self.store.delete(collection, id)?;
         match old {
-            Some(old) => self.reindex_remove(collection, id, &old),
+            Some(old) => self
+                .derived
+                .on_remove(collection, id, &old, &self.telemetry.probe),
             // Not every derived structure needs to be told *what* was removed.
             // A direct array and a column store are keyed by identity alone, so
             // an id is enough — and they must still be told, or a database with
             // a column store and no index goes on counting rows that are gone.
             None => {
-                if let Some(d) = self.direct.get_mut(collection) {
+                if let Some(d) = self.derived.direct.get_mut(collection) {
                     d.remove(id);
                 }
-                if let Some(c) = self.columns.get_mut(collection) {
+                if let Some(c) = self.derived.columns.get_mut(collection) {
                     c.mark_dead(id);
                 }
             }
         }
-        self.bump_epoch(collection);
-        self.observe(collection, OpKind::Delete, t, existed as u64);
+        self.caches.bump_epoch(collection);
+        self.telemetry
+            .observe(collection, OpKind::Delete, t, existed as u64);
         Ok(existed)
     }
 
     fn scan(&mut self, collection: &str) -> Result<Vec<(RecordId, Record)>> {
         let t = Instant::now();
         let rows = self.store.scan(collection)?;
-        self.observe(collection, OpKind::Scan, t, rows.len() as u64);
+        self.telemetry
+            .observe(collection, OpKind::Scan, t, rows.len() as u64);
         Ok(rows)
     }
 
     fn count(&mut self, collection: &str) -> Result<usize> {
         let t = Instant::now();
         let n = self.store.count(collection)?;
-        self.observe(collection, OpKind::Count, t, n as u64);
+        self.telemetry
+            .observe(collection, OpKind::Count, t, n as u64);
         Ok(n)
     }
 

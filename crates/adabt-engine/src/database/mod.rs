@@ -9,12 +9,17 @@
 //! is what makes it safe for the controller to switch them on and off under a
 //! live workload — and why `Database` can implement `ActionSink` at all.
 //!
-//! The struct and the types shared across its responsibilities live here;
-//! the methods are split by responsibility into the child modules below.
+//! `Database` is a composition of parts, each owning one concept: the derived
+//! structures, the query caches, telemetry, the optimizer, experiments,
+//! tuning switches and per-query execution state. The struct and the types
+//! shared across its responsibilities live here; the methods are split by
+//! responsibility into the child modules below.
 
 mod action_sink;
 mod constraints;
+mod derived;
 mod durability;
+mod experiment_state;
 mod experiments;
 mod indexes;
 mod introspection;
@@ -23,29 +28,31 @@ mod lifecycle;
 mod logical_store;
 mod optimization;
 mod query;
+mod query_caches;
 mod source;
+mod telemetry;
+mod tuning;
 mod writes;
 
 use adabt_core::index_kind::IndexKind;
 use adabt_core::policy::Policy;
 use adabt_exec::exec::ExecStats;
-use adabt_index::Index;
 use adabt_opt::optimization::OptContext;
 use adabt_opt::{OptimizationController, Registry};
 use adabt_storage::heap::HeapStore;
-use adabt_telemetry::{CollectingProbe, Snapshot};
+use adabt_telemetry::Snapshot;
 #[cfg(feature = "loom")]
 use loom::sync::Arc;
-use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 #[cfg(not(feature = "loom"))]
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::caches::{PlanCache, ResultCache};
-use crate::column::ColumnStore;
-use crate::direct::DirectArray;
-use crate::experiment::{Candidates, LiveExperiment};
+use derived::DerivedStructures;
+use experiment_state::Experiments;
+use query_caches::QueryCaches;
+use telemetry::Telemetry;
+use tuning::Tuning;
 
 pub struct IndexSpec {
     pub collection: String,
@@ -71,75 +78,38 @@ pub struct SlowQueryEvent {
 type SlowQuerySink = Box<dyn FnMut(&SlowQueryEvent) + Send>;
 
 pub struct Database {
+    /// The primary representation: the one thing here that is not rebuildable.
     store: HeapStore,
-    indexes: HashMap<String, Vec<Box<dyn Index>>>,
-    /// Directly-addressed arrays, where the schema and density allow.
-    direct: HashMap<String, DirectArray>,
-    /// Columnar copies, for scans and aggregates over a bounded field set.
-    columns: HashMap<String, ColumnStore>,
-    /// Grouped counts kept up to date on write, so an aggregate costs the number
-    /// of groups rather than the number of rows.
-    views: crate::matview::MaterializedViews,
-    plan_cache: PlanCache,
-    result_cache: ResultCache,
-    /// Bumped on every write, so a cached result can never be stale.
-    epochs: HashMap<String, u64>,
-    /// Shapes specialised past the general query path.
-    compiled: crate::compiled::CompiledPaths,
-    /// Sampling stride for temperature observation. Feeding the sketch on
-    /// every read would add a lock to the hot path to measure something only
-    /// relative frequency is wanted from, and uniform sampling preserves that.
-    touch_sample: std::cell::Cell<u32>,
     policy: Policy,
-    registry: Registry,
-    controller: OptimizationController,
-    adaptive: adabt_opt::AdaptiveDriver,
-    probe: Arc<CollectingProbe>,
-    last_stats: ExecStats,
-    /// The change currently being proved against live traffic.
-    /// Experiments running right now, on scopes that do not overlap.
-    ///
-    /// A `Vec` rather than an `Option` because there is no reason two changes
-    /// to *different* collections should have to be proved one after the
-    /// other. The reason it was an `Option` was safety, not simplicity: with a
-    /// single global candidate mask and a single global "candidates visible"
-    /// flag, a second experiment would have had its unproven structures
-    /// exposed to the first experiment's canary traffic, and each would have
-    /// been measuring the other. Both of those are now per-experiment, so the
-    /// remaining requirement is only that their scopes are disjoint.
-    experiments: Vec<LiveExperiment>,
-    /// The experiment whose query is being run right now, if any.
-    ///
-    /// Paired with `candidate_visible`: together they name *which* candidate
-    /// is allowed to be seen, rather than merely that some candidate is.
-    experiment_under_test: Option<u64>,
-    /// Experiments that reached a verdict, kept so the reasoning survives them.
-    finished: Vec<LiveExperiment>,
+    telemetry: Telemetry,
+    derived: DerivedStructures,
+    caches: QueryCaches,
+    optimizer: Optimizer,
+    experiments: Experiments,
     /// Fields where two records may not share a value. See `crate::unique`.
     unique_constraints: crate::unique::UniqueConstraints,
+    tuning: Tuning,
+    execution: Execution,
     /// The next id `begin` hands out. Purely an in-memory label — see
     /// `crate::transaction` for why nothing about an open transaction needs to
     /// be durable until it commits.
     next_txn_id: u64,
-    /// Structures built for an experiment and not yet trusted.
-    ///
-    /// Held here rather than on the experiment because the mask has to outlive
-    /// a borrow of it: a shadow trial moves the experiment aside to record into
-    /// it, and if the mask went with it both halves of the pair would take the
-    /// candidate path and the comparison would be of a thing against itself.
-    hidden: Candidates,
-    /// Whether *this* query may use the hidden structures.
-    candidate_visible: bool,
-    /// Whether actions passing through the sink are part of a candidate build.
-    /// The experiment whose candidate is being built right now, if any.
-    ///
-    /// Carries the id rather than a bare flag because what gets recorded is
-    /// *whose* candidate a structure is. With one experiment the id could be
-    /// looked up; with several running, "the experiment" is not a thing, and
-    /// attributing a structure to the wrong one would mask it for the wrong
-    /// trial.
-    recording_candidate: Option<u64>,
-    next_experiment_id: u64,
+}
+
+/// The optimizer's machinery: which optimizations exist, what has been
+/// applied, and the adaptive driver's memory across cycles.
+struct Optimizer {
+    registry: Registry,
+    controller: OptimizationController,
+    /// Kept across cycles — cooldowns, what it last changed — so it lives here
+    /// rather than being constructed per call.
+    adaptive: adabt_opt::AdaptiveDriver,
+}
+
+/// What surrounds each run of the executor: the cancel flag it is handed, the
+/// slow-query sink it reports to, and the statistics the last run left behind.
+struct Execution {
+    last_stats: ExecStats,
     /// Set for the duration of one `query_cancellable` call, so `execute`
     /// (reached from many internal call sites — direct queries, canaries,
     /// experiment shadows) does not need a cancel token threaded through all
@@ -150,18 +120,6 @@ pub struct Database {
     /// `None` is the default: logging every query's wall-clock time is a cost
     /// nobody asked for, so this opts in rather than the reverse.
     slow_query: Option<(Duration, SlowQuerySink)>,
-    /// Per-collection clustering hints, set with [`Database::declare_cluster_field`]:
-    /// the field whose integer value steers *where* a record is placed. A hint,
-    /// not a constraint — see that method for exactly what is and is not promised.
-    cluster_fields: HashMap<String, String>,
-    /// Whether delta-varint encoding is enabled for column stores.
-    delta_encoding: bool,
-    /// Whether thread-per-core execution is enabled.
-    thread_per_core: bool,
-    /// Whether join order optimization is enabled.
-    join_order: bool,
-    /// Whether data-driven partitioning is enabled.
-    data_partitioning: bool,
 }
 
 /// Everything an `OptContext` borrows, owned.

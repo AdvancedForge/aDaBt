@@ -15,12 +15,15 @@ use std::path::Path;
 #[cfg(not(feature = "loom"))]
 use std::sync::Arc;
 
-use crate::caches::{PlanCache, ResultCache};
-use crate::experiment::Candidates;
 use crate::optimizations::register_builtins;
 
+use super::derived::DerivedStructures;
 use super::durability::{decode_index_entries, index_cache_key};
-use super::Database;
+use super::experiment_state::Experiments;
+use super::query_caches::QueryCaches;
+use super::telemetry::Telemetry;
+use super::tuning::Tuning;
+use super::{Database, Execution, Optimizer};
 
 impl Database {
     pub fn open(dir: &Path, policy: Policy) -> Result<Self> {
@@ -82,37 +85,30 @@ impl Database {
         }
         let mut db = Self {
             store,
-            indexes: HashMap::new(),
-            direct: HashMap::new(),
-            columns: HashMap::new(),
-            views: crate::matview::MaterializedViews::new(),
-            plan_cache: PlanCache::new(0),
-            result_cache: ResultCache::new(0),
-            epochs: HashMap::new(),
-            compiled: crate::compiled::CompiledPaths::new(),
-            touch_sample: std::cell::Cell::new(0),
             policy,
-            registry,
-            controller: OptimizationController::new(),
-            adaptive: adabt_opt::AdaptiveDriver::new(),
-            probe: Arc::new(CollectingProbe::new()),
-            last_stats: ExecStats::default(),
-            experiments: Vec::new(),
-            finished: Vec::new(),
-            hidden: Candidates::default(),
-            candidate_visible: false,
-            experiment_under_test: None,
-            recording_candidate: None,
-            next_experiment_id: 1,
+            telemetry: Telemetry::new(),
+            derived: DerivedStructures::new(),
+            caches: QueryCaches::new(),
+            optimizer: Optimizer {
+                registry,
+                controller: OptimizationController::new(),
+                adaptive: adabt_opt::AdaptiveDriver::new(),
+            },
+            experiments: Experiments::new(),
             unique_constraints: crate::unique::UniqueConstraints::default(),
+            tuning: Tuning {
+                cluster_fields: HashMap::new(),
+                delta_encoding: true,
+                thread_per_core: false,
+                join_order: false,
+                data_partitioning: false,
+            },
+            execution: Execution {
+                last_stats: ExecStats::default(),
+                pending_cancel: None,
+                slow_query: None,
+            },
             next_txn_id: 1,
-            pending_cancel: None,
-            slow_query: None,
-            cluster_fields: HashMap::new(),
-            delta_encoding: true,
-            thread_per_core: false,
-            join_order: false,
-            data_partitioning: false,
         };
         db.unique_constraints = crate::unique::read(db.store.dir());
         // Restore the indexes the log says existed.
@@ -140,12 +136,12 @@ impl Database {
         // declarations are state; the placement ranges are not, and rebuild
         // from subsequent keyed inserts.
         for (collection, field) in db.store.declared_cluster_fields() {
-            db.cluster_fields.insert(collection, field);
+            db.tuning.cluster_fields.insert(collection, field);
         }
         // Restore optimizer-controlled global flags persisted via the catalog.
-        db.delta_encoding = db.store.delta_encoding();
-        db.thread_per_core = db.store.thread_per_core();
-        crate::column::set_delta_enabled(db.delta_encoding);
+        db.tuning.delta_encoding = db.store.delta_encoding();
+        db.tuning.thread_per_core = db.store.thread_per_core();
+        crate::column::set_delta_enabled(db.tuning.delta_encoding);
         // Apply whatever the policy asks for, so opening at level 3 gives a
         // level-3 database rather than a level-0 one that drifts up later.
         db.optimize()?;
@@ -157,15 +153,15 @@ impl Database {
     }
 
     pub fn probe(&self) -> Arc<CollectingProbe> {
-        Arc::clone(&self.probe)
+        Arc::clone(&self.telemetry.probe)
     }
 
     pub fn telemetry(&self) -> Snapshot {
-        self.probe.snapshot()
+        self.telemetry.probe.snapshot()
     }
 
     pub fn last_exec_stats(&self) -> ExecStats {
-        self.last_stats
+        self.execution.last_stats
     }
 
     pub fn durability(&self) -> Durability {
@@ -173,18 +169,18 @@ impl Database {
     }
 
     pub fn is_thread_per_core(&self) -> bool {
-        self.thread_per_core
+        self.tuning.thread_per_core
     }
 
     pub fn is_delta_encoding(&self) -> bool {
-        self.delta_encoding
+        self.tuning.delta_encoding
     }
 
     pub fn is_join_order(&self) -> bool {
-        self.join_order
+        self.tuning.join_order
     }
 
     pub fn is_data_partitioning(&self) -> bool {
-        self.data_partitioning
+        self.tuning.data_partitioning
     }
 }

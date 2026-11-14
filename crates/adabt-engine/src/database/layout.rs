@@ -14,7 +14,7 @@ use super::Database;
 impl Database {
     /// Build a view for this query, if it is one a view can serve.
     pub(super) fn maybe_materialize(&mut self, op: &adabt_ir::plan::LogicalOp) -> Result<()> {
-        if !self.views.is_enabled() || self.views.has_view_for(op) {
+        if !self.derived.views.is_enabled() || self.derived.views.has_view_for(op) {
             return Ok(());
         }
         let Some((collection, _, _)) = crate::matview::MaterializedViews::definition_of(op) else {
@@ -22,28 +22,18 @@ impl Database {
         };
         let collection = collection.to_string();
         let rows = self.store.scan(&collection)?;
-        self.views.materialize(op, rows.iter().map(|(_, r)| r));
+        self.derived
+            .views
+            .materialize(op, rows.iter().map(|(_, r)| r));
         Ok(())
     }
 
     pub fn materialized_views(&self) -> usize {
-        self.views.len()
+        self.derived.views.len()
     }
 
     pub fn explain_materialized_views(&self) -> String {
-        self.views.describe()
-    }
-
-    /// Whether a write has to read what it is about to overwrite.
-    ///
-    /// The standing cost of maintaining anything derived from a record's
-    /// *contents* rather than its identity: an index has to be told which key to
-    /// remove, a view which group to decrement, and neither can be worked out
-    /// from the new record. It is why a structure nobody queries is a loss
-    /// rather than merely neutral.
-    pub(super) fn needs_old_record(&self, collection: &str) -> bool {
-        self.indexes.get(collection).is_some_and(|l| !l.is_empty())
-            || self.views.watches(collection)
+        self.derived.views.describe()
     }
 
     /// Build a direct array for every collection whose schema allows one.
@@ -55,14 +45,14 @@ impl Database {
             }
             let rows = self.store.scan(&name)?;
             if let Some(arr) = DirectArray::rebuild(schema, rows.iter().map(|(i, r)| (*i, r)))? {
-                self.direct.insert(name, arr);
+                self.derived.direct.insert(name, arr);
             }
         }
         Ok(())
     }
 
     pub(super) fn disable_direct_lookup(&mut self) {
-        self.direct.clear();
+        self.derived.direct.clear();
     }
 
     /// Raise a collection's schema to the most rigid its data supports.
@@ -119,41 +109,40 @@ impl Database {
     /// where a crash left a new codec reading bytes the old one wrote
     /// (`docs/history/m14-notes.md`). Cheap either way, since every one of these is rebuildable.
     fn invalidate_after_schema_change(&mut self, collection: &str) {
-        self.indexes.remove(collection);
-        self.direct.remove(collection);
-        self.columns.remove(collection);
-        self.plan_cache.clear();
-        self.compiled.clear();
-        self.bump_epoch(collection);
+        self.derived.indexes.remove(collection);
+        self.derived.direct.remove(collection);
+        self.derived.columns.remove(collection);
+        self.caches.invalidate_plans();
+        self.caches.bump_epoch(collection);
     }
 
     /// Build a columnar copy of every collection.
     pub(super) fn enable_column_store(&mut self) -> Result<()> {
         for name in self.store.collection_names() {
             let rows = self.store.scan(&name)?;
-            self.columns
+            self.derived
+                .columns
                 .insert(name, ColumnStore::build(rows.iter().map(|(i, r)| (*i, r))));
         }
-        self.plan_cache.clear();
-        self.compiled.clear();
+        self.caches.invalidate_plans();
         Ok(())
     }
 
     pub(super) fn disable_column_store(&mut self) {
-        self.columns.clear();
-        self.plan_cache.clear();
-        self.compiled.clear();
+        self.derived.columns.clear();
+        self.caches.invalidate_plans();
     }
 
     /// Fraction of columnar rows that are tombstones, worst across collections.
     pub fn column_store_dead_fraction(&self) -> f64 {
-        self.columns
+        self.derived
+            .columns
             .values()
             .map(|c| c.dead_fraction())
             .fold(0.0, f64::max)
     }
 
     pub fn has_column_store(&self, collection: &str) -> bool {
-        self.columns.contains_key(collection)
+        self.derived.columns.contains_key(collection)
     }
 }

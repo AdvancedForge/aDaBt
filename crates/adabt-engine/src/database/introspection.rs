@@ -38,11 +38,11 @@ fn classify_index(name: &str) -> IndexShape {
 
 impl Database {
     pub fn plan_cache_stats(&self) -> CacheStats {
-        self.plan_cache.stats()
+        self.caches.plans.stats()
     }
 
     pub fn result_cache_stats(&self) -> CacheStats {
-        self.result_cache.stats()
+        self.caches.results.stats()
     }
 
     /// Buffer pool counters: hits, misses, evictions, reads, read-ahead.
@@ -66,16 +66,16 @@ impl Database {
     /// than assuming it did — a test that silently ran against the heap
     /// proves nothing about columnar reads.
     pub fn column_store_collections(&self) -> usize {
-        self.columns.len()
+        self.derived.columns.len()
     }
 
     /// Shapes currently specialised past the general query path.
     pub fn compiled_paths(&self) -> usize {
-        self.compiled.len()
+        self.caches.compiled.len()
     }
 
     pub fn compiled_hits(&self) -> u64 {
-        self.compiled.hits
+        self.caches.compiled.hits
     }
 
     /// Read one field of one record without decoding the rest.
@@ -89,7 +89,7 @@ impl Database {
         id: RecordId,
         field: &str,
     ) -> Result<Option<Value>> {
-        if let Some(d) = self.direct.get(collection) {
+        if let Some(d) = self.derived.direct.get(collection) {
             return d.field_at(id, field);
         }
         Ok(self
@@ -99,7 +99,7 @@ impl Database {
     }
 
     pub fn has_direct_array(&self, collection: &str) -> bool {
-        self.direct.contains_key(collection)
+        self.derived.direct.contains_key(collection)
     }
 
     /// Why the database is the way it is.
@@ -138,7 +138,7 @@ impl Database {
             let heap: std::collections::HashMap<RecordId, &Record> =
                 rows.iter().map(|(id, r)| (*id, r)).collect();
 
-            if let Some(list) = self.indexes.get(&collection) {
+            if let Some(list) = self.derived.indexes.get(&collection) {
                 report.indexes_checked += list.len();
                 for idx in list.iter() {
                     let name = idx.field();
@@ -214,7 +214,7 @@ impl Database {
             }
 
             // Columnar id set versus the heap's.
-            if let Some(cs) = self.columns.get(&collection) {
+            if let Some(cs) = self.derived.columns.get(&collection) {
                 let mut store_ids = cs.live_ids();
                 store_ids.sort_unstable();
                 let mut heap_ids: Vec<RecordId> = heap.keys().copied().collect();
@@ -248,11 +248,11 @@ impl Database {
     }
 
     pub fn explain_optimizations(&self) -> String {
-        self.controller.explain_all()
+        self.optimizer.controller.explain_all()
     }
 
     pub fn explain_optimization(&self, name: &str) -> String {
-        self.controller.explain(name)
+        self.optimizer.controller.explain(name)
     }
 }
 
@@ -265,7 +265,7 @@ impl Database {
         collection: &str,
         needle: &str,
     ) -> Option<(String, String, u64)> {
-        let list = self.indexes.get_mut(collection)?;
+        let list = self.derived.indexes.get_mut(collection)?;
         for idx in list.iter_mut() {
             let f_name = idx.field().to_string();
             if f_name.contains(needle) {
@@ -291,7 +291,7 @@ impl Database {
         key_string: &str,
         fake_id: u64,
     ) -> bool {
-        let list = match self.indexes.get_mut(collection) {
+        let list = match self.derived.indexes.get_mut(collection) {
             Some(l) => l,
             None => return false,
         };

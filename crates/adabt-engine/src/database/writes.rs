@@ -176,10 +176,12 @@ impl Database {
         }
         let n = self.store.insert_batch(collection, records)?;
         for (id, rec) in &normalized {
-            self.reindex_insert(collection, *id, rec);
+            self.derived
+                .on_insert(collection, *id, rec, &self.telemetry.probe);
         }
-        self.bump_epoch(collection);
-        self.observe(collection, OpKind::Insert, t, n as u64);
+        self.caches.bump_epoch(collection);
+        self.telemetry
+            .observe(collection, OpKind::Insert, t, n as u64);
         Ok(n)
     }
 

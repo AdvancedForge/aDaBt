@@ -17,11 +17,11 @@ use super::{Database, OptInputs};
 
 impl Database {
     pub fn registry(&self) -> &Registry {
-        &self.registry
+        &self.optimizer.registry
     }
 
     pub fn config(&self) -> &OptimizationConfig {
-        self.controller.config()
+        self.optimizer.controller.config()
     }
 
     // -- optimization ------------------------------------------------------
@@ -68,7 +68,7 @@ impl Database {
     fn forget_a_little(&self) {
         if matches!(self.policy.mode, Mode::Adaptive) {
             let (n, d) = adabt_opt::adaptive::TELEMETRY_DECAY;
-            self.probe.decay(n, d);
+            self.telemetry.probe.decay(n, d);
         }
     }
 
@@ -99,7 +99,7 @@ impl Database {
         // starting more than one at a time would mean proposing changes from
         // one set of inputs and judging them against a database that the other
         // has already altered.
-        let held = if self.experiments.is_empty() {
+        let held = if self.experiments.running.is_empty() {
             decisions
                 .iter()
                 .position(|d| self.is_shadowable(d, &inputs))
@@ -132,6 +132,7 @@ impl Database {
         // something that is no longer there.
         let under_experiment: Vec<(&'static str, String)> = self
             .experiments
+            .running
             .iter()
             .map(|e| {
                 (
@@ -141,8 +142,8 @@ impl Database {
             })
             .collect();
         let input = adabt_opt::DriverInput {
-            registry: &self.registry,
-            current: self.controller.config(),
+            registry: &self.optimizer.registry,
+            current: self.optimizer.controller.config(),
             policy: &inputs.policy,
             telemetry: &inputs.snapshot,
             ctx: &ctx,
@@ -153,7 +154,7 @@ impl Database {
         // last changed — so it lives on the database rather than being
         // constructed per call.
         match self.policy.mode {
-            Mode::Adaptive => self.adaptive.decide(input),
+            Mode::Adaptive => self.optimizer.adaptive.decide(input),
             Mode::Manual { .. } => ManualDriver.decide(input),
         }
     }
@@ -182,15 +183,19 @@ impl Database {
     /// Whether this decision leaves an old path to compare a new one against.
     fn is_shadowable(&self, decision: &Decision, inputs: &OptInputs) -> bool {
         decision.action == DecisionAction::Enable
-            && self.registry.get(decision.optimization).is_some_and(|o| {
-                let plan = o.plan_enable(&inputs.ctx(), &decision.scope, &decision.params);
-                !plan.apply.is_empty() && plan.apply.iter().all(|a| a.is_shadowable())
-            })
+            && self
+                .optimizer
+                .registry
+                .get(decision.optimization)
+                .is_some_and(|o| {
+                    let plan = o.plan_enable(&inputs.ctx(), &decision.scope, &decision.params);
+                    !plan.apply.is_empty() && plan.apply.iter().all(|a| a.is_shadowable())
+                })
     }
 
     /// Gather everything the optimizer needs to describe this database.
     pub(super) fn opt_inputs(&mut self) -> Result<OptInputs> {
-        let snapshot = self.probe.snapshot();
+        let snapshot = self.telemetry.probe.snapshot();
         let collections = self.collection_sizes()?;
         let filtered = snapshot.most_filtered_fields();
         Ok(OptInputs {
@@ -223,8 +228,11 @@ impl Database {
         }
         // The controller needs `&mut self` as a sink while borrowing registry
         // and policy, so both are moved aside for the call.
-        let registry = std::mem::take(&mut self.registry);
-        let mut controller = std::mem::replace(&mut self.controller, OptimizationController::new());
+        let registry = std::mem::take(&mut self.optimizer.registry);
+        let mut controller = std::mem::replace(
+            &mut self.optimizer.controller,
+            OptimizationController::new(),
+        );
         let ctx = inputs.ctx();
         let report = controller.apply(
             decisions,
@@ -236,8 +244,8 @@ impl Database {
             self,
             source,
         );
-        self.registry = registry;
-        self.controller = controller;
+        self.optimizer.registry = registry;
+        self.optimizer.controller = controller;
         report
     }
 

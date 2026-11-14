@@ -1,16 +1,12 @@
-//! Index management and maintenance: creating and dropping every index
-//! shape, index queries and memory accounting, clustering, per-collection
-//! epochs, and keeping indexes in step with record changes.
+//! Index management: creating and dropping every index shape, index queries
+//! and memory accounting, and clustering hints.
 
 use adabt_core::error::{Error, Result};
 use adabt_core::ids::RecordId;
 use adabt_core::index_kind::IndexKind;
-use adabt_core::record::Record;
 use adabt_core::store::LogicalStore;
 use adabt_core::value::Value;
 use adabt_index::{BTreeIndex, BitmapIndex, HashIndex, Index};
-use adabt_telemetry::event::Event;
-use adabt_telemetry::Probe;
 
 use super::{Database, IndexSpec};
 
@@ -40,20 +36,24 @@ impl Database {
             ));
         }
         let name = adabt_index::composite_name(fields);
-        if self.index_exists(collection, &name, IndexKind::Hash) {
+        if self
+            .derived
+            .index_exists(collection, &name, IndexKind::Hash)
+        {
             return Ok(());
         }
         let rows = self.store.scan(collection)?;
         let idx =
             adabt_index::CompositeIndex::build(fields.to_vec(), rows.iter().map(|(i, r)| (*i, r)));
-        self.indexes
+        self.derived
+            .indexes
             .entry(collection.to_string())
             .or_default()
             .push(Box::new(idx));
         self.store
             .record_index(collection, &name, IndexKind::Hash.as_str())?;
-        self.bump_epoch(collection);
-        self.plan_cache.clear();
+        self.caches.bump_epoch(collection);
+        self.caches.plans.clear();
         Ok(())
     }
 
@@ -97,7 +97,7 @@ impl Database {
         covers.sort();
         covers.dedup();
         let name = adabt_index::covering_name(field, &covers);
-        if self.index_exists(collection, &name, kind) {
+        if self.derived.index_exists(collection, &name, kind) {
             return Ok(());
         }
         let rows = self.store.scan(collection)?;
@@ -107,14 +107,14 @@ impl Database {
             kind,
             rows.iter().map(|(i, r)| (*i, r)),
         );
-        self.indexes
+        self.derived
+            .indexes
             .entry(collection.to_string())
             .or_default()
             .push(Box::new(idx));
         self.store.record_index(collection, &name, kind.as_str())?;
-        self.bump_epoch(collection);
-        self.plan_cache.clear();
-        self.compiled.clear();
+        self.caches.bump_epoch(collection);
+        self.caches.invalidate_plans();
         Ok(())
     }
 
@@ -146,7 +146,7 @@ impl Database {
         // holding a subset of the rows and claiming to hold all of them.
         let encoded = crate::exprcodec::encode_expr_hex(&condition)?;
         let name = adabt_index::partial_name(field, &encoded);
-        if self.index_exists(collection, &name, kind) {
+        if self.derived.index_exists(collection, &name, kind) {
             return Ok(());
         }
         let rows = self.store.scan(collection)?;
@@ -157,14 +157,14 @@ impl Database {
             kind,
             rows.iter().map(|(i, r)| (*i, r)),
         );
-        self.indexes
+        self.derived
+            .indexes
             .entry(collection.to_string())
             .or_default()
             .push(Box::new(idx));
         self.store.record_index(collection, &name, kind.as_str())?;
-        self.bump_epoch(collection);
-        self.plan_cache.clear();
-        self.compiled.clear();
+        self.caches.bump_epoch(collection);
+        self.caches.invalidate_plans();
         Ok(())
     }
 
@@ -183,7 +183,7 @@ impl Database {
         if self.store.schema_of(collection).is_err() {
             return Err(Error::NoSuchCollection(collection.to_string()));
         }
-        if self.index_exists(collection, field, kind) {
+        if self.derived.index_exists(collection, field, kind) {
             return Ok(());
         }
         // A composite index answers to the NUL-joined name of its fields, so
@@ -246,42 +246,35 @@ impl Database {
                 }
             }
         }
-        self.indexes
+        self.derived
+            .indexes
             .entry(collection.to_string())
             .or_default()
             .push(idx);
         self.store.record_index(collection, field, kind.as_str())?;
         // A cached plan may encode an access path that is now suboptimal, or
         // one that referenced a structure that has changed.
-        self.plan_cache.clear();
-        self.compiled.clear();
+        self.caches.invalidate_plans();
         Ok(())
     }
 
     pub fn drop_index(&mut self, collection: &str, field: &str, kind: IndexKind) -> bool {
-        let Some(list) = self.indexes.get_mut(collection) else {
+        let Some(list) = self.derived.indexes.get_mut(collection) else {
             return false;
         };
         let before = list.len();
         list.retain(|i| !(i.field() == field && i.kind() == kind));
         let changed = before != list.len();
         if changed {
-            self.plan_cache.clear();
-            self.compiled.clear();
+            self.caches.invalidate_plans();
             let _ = self.store.forget_index(collection, field, kind.as_str());
         }
         changed
     }
 
-    pub(super) fn index_exists(&self, collection: &str, field: &str, kind: IndexKind) -> bool {
-        self.indexes
-            .get(collection)
-            .is_some_and(|l| l.iter().any(|i| i.field() == field && i.kind() == kind))
-    }
-
     pub fn index_specs(&self) -> Vec<IndexSpec> {
         let mut out = Vec::new();
-        for (c, list) in &self.indexes {
+        for (c, list) in &self.derived.indexes {
             for i in list {
                 out.push(IndexSpec {
                     collection: c.clone(),
@@ -301,13 +294,15 @@ impl Database {
     }
 
     pub fn has_index(&self, collection: &str, field: &str) -> bool {
-        self.indexes
+        self.derived
+            .indexes
             .get(collection)
             .is_some_and(|list| list.iter().any(|i| i.field() == field))
     }
 
     pub fn index_kind(&self, collection: &str, field: &str) -> Option<IndexKind> {
-        self.indexes
+        self.derived
+            .indexes
             .get(collection)
             .and_then(|list| list.iter().find(|i| i.field() == field).map(|i| i.kind()))
     }
@@ -315,8 +310,9 @@ impl Database {
     /// Memory held by every derived structure, for the resource axis.
     pub fn derived_memory_bytes(&self) -> usize {
         self.index_memory_bytes()
-            + self.result_cache.memory_bytes()
+            + self.caches.results.memory_bytes()
             + self
+                .derived
                 .direct
                 .values()
                 .map(|d| d.memory_bytes())
@@ -351,7 +347,8 @@ impl Database {
     pub fn declare_cluster_field(&mut self, collection: &str, field: &str) -> Result<()> {
         self.store.schema_of(collection)?;
         self.store.set_cluster_field(collection, Some(field))?;
-        self.cluster_fields
+        self.tuning
+            .cluster_fields
             .insert(collection.to_string(), field.to_string());
         Ok(())
     }
@@ -361,7 +358,7 @@ impl Database {
     /// revert to first-fit.
     pub fn clear_cluster_field(&mut self, collection: &str) -> Result<()> {
         self.store.set_cluster_field(collection, None)?;
-        self.cluster_fields.remove(collection);
+        self.tuning.cluster_fields.remove(collection);
         Ok(())
     }
 
@@ -378,87 +375,13 @@ impl Database {
 
     /// The declared clustering hint for `collection`, if any.
     pub fn cluster_field(&self, collection: &str) -> Option<&str> {
-        self.cluster_fields.get(collection).map(String::as_str)
-    }
-
-    /// The integer key a record contributes to the clustering hint, or `None`
-    /// when the collection has no hint or the value is not an integer.
-    pub(super) fn cluster_key(collection: &str, field: &str, rec: &Record) -> Option<i64> {
-        match rec.get(field) {
-            Some(adabt_core::value::Value::I64(v)) => Some(*v),
-            Some(adabt_core::value::Value::U64(v)) => i64::try_from(*v).ok(),
-            _ => {
-                let _ = collection;
-                None
-            }
-        }
+        self.tuning
+            .cluster_fields
+            .get(collection)
+            .map(String::as_str)
     }
 
     pub fn index_memory_bytes(&self) -> usize {
-        self.indexes
-            .values()
-            .flat_map(|l| l.iter())
-            .map(|i| i.memory_bytes())
-            .sum()
-    }
-
-    // -- derived-structure maintenance ------------------------------------
-
-    pub(super) fn bump_epoch(&mut self, collection: &str) {
-        *self.epochs.entry(collection.to_string()).or_default() += 1;
-        self.result_cache.invalidate_collection(collection);
-    }
-
-    pub(super) fn epoch(&self, collection: &str) -> u64 {
-        self.epochs.get(collection).copied().unwrap_or(0)
-    }
-
-    pub(super) fn reindex_insert(&mut self, collection: &str, id: RecordId, rec: &Record) {
-        if let Some(list) = self.indexes.get_mut(collection) {
-            for i in list {
-                i.index_record(id, rec);
-                // The price of this index, counted where it is actually paid.
-                // See `Event::IndexMaintained`: without this the optimizer can
-                // only see what an index is worth, never what it costs.
-                self.probe.record(Event::IndexMaintained {
-                    collection,
-                    field: i.field(),
-                });
-            }
-        }
-        if let Some(d) = self.direct.get_mut(collection) {
-            // A record that will not fit the stride means the direct array no
-            // longer matches the schema; dropping it is safe because it is
-            // derived, and correct because a partial array would lie.
-            if d.put(id, rec).is_err() {
-                self.direct.remove(collection);
-            }
-        }
-        // A columnar copy is append-structured, so an update in place is not
-        // expressible: the old row is tombstoned and the new one appended.
-        if let Some(c) = self.columns.get_mut(collection) {
-            c.mark_dead(id);
-            c.append_row(id, rec);
-        }
-        self.views.on_insert(collection, rec);
-    }
-
-    pub(super) fn reindex_remove(&mut self, collection: &str, id: RecordId, rec: &Record) {
-        if let Some(list) = self.indexes.get_mut(collection) {
-            for i in list {
-                i.unindex_record(id, rec);
-                self.probe.record(Event::IndexMaintained {
-                    collection,
-                    field: i.field(),
-                });
-            }
-        }
-        if let Some(d) = self.direct.get_mut(collection) {
-            d.remove(id);
-        }
-        if let Some(c) = self.columns.get_mut(collection) {
-            c.mark_dead(id);
-        }
-        self.views.on_remove(collection, rec);
+        self.derived.index_memory_bytes()
     }
 }

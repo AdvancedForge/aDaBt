@@ -106,7 +106,7 @@ impl Database {
     /// arriving would be stale before it hit the disk.
     fn save_derived(&mut self) -> Result<()> {
         let mut blobs = Vec::new();
-        for (collection, list) in &self.indexes {
+        for (collection, list) in &self.derived.indexes {
             for idx in list {
                 blobs.push((
                     index_cache_key(collection, idx.field(), idx.kind()),
@@ -186,9 +186,8 @@ impl Database {
         // Vacuum moves records between pages, so anything addressing them by
         // physical position is no longer valid. Same invalidation a schema
         // change needs, for the same reason.
-        self.direct.clear();
-        self.plan_cache.clear();
-        self.compiled.clear();
+        self.derived.direct.clear();
+        self.caches.invalidate_plans();
         Ok(freed)
     }
 
@@ -200,12 +199,12 @@ impl Database {
     /// knows which they have. It was reachable only through an `Action`, which
     /// means only through the optimizer.
     pub fn set_result_cache_entries(&mut self, n: usize) {
-        self.result_cache.set_capacity(n);
+        self.caches.results.set_capacity(n);
     }
 
     /// Resize the plan cache, in entries. Zero disables it.
     pub fn set_plan_cache_entries(&mut self, n: usize) {
-        self.plan_cache.set_capacity(n);
+        self.caches.plans.set_capacity(n);
     }
 
     /// Resize the buffer pool, in 4 KiB pages.

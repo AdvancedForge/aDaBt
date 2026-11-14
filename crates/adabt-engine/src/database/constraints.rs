@@ -46,7 +46,10 @@ impl Database {
             }
             seen.insert(value, id);
         }
-        if !self.index_exists(collection, field, IndexKind::Hash) {
+        if !self
+            .derived
+            .index_exists(collection, field, IndexKind::Hash)
+        {
             self.create_index(collection, field, IndexKind::Hash)?;
         }
         self.unique_constraints.add(collection, field);
@@ -93,6 +96,7 @@ impl Database {
                 continue;
             };
             let conflict = self
+                .derived
                 .indexes
                 .get(collection)
                 .and_then(|list| list.iter().find(|i| i.field() == field))

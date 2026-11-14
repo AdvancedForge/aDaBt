@@ -25,13 +25,7 @@ impl ActionSink for Database {
         // the engine actually did would mask the wrong structure — and masking
         // the wrong structure means the "baseline" measurement is quietly taken
         // through the candidate.
-        if let Some(id) = self.recording_candidate {
-            let for_collection = self
-                .experiment_index(id)
-                .map(|i| self.experiments[i].collection.clone())
-                .unwrap_or_default();
-            self.hidden.record(id, action, &for_collection);
-        }
+        self.experiments.record_candidate_action(action);
         match action {
             Action::CreateIndex {
                 collection,
@@ -48,11 +42,11 @@ impl ActionSink for Database {
             }
             Action::SetBufferPoolPages(n) => self.store.set_pool_capacity(*n),
             Action::SetPlanCacheEntries(n) => {
-                self.plan_cache.set_capacity(*n);
+                self.caches.plans.set_capacity(*n);
                 Ok(())
             }
             Action::SetResultCacheEntries(n) => {
-                self.result_cache.set_capacity(*n);
+                self.caches.results.set_capacity(*n);
                 Ok(())
             }
             Action::SetDirectLookup(on) => {
@@ -70,15 +64,15 @@ impl ActionSink for Database {
             Action::ClearClusterField { collection } => self.clear_cluster_field(collection),
             Action::SetDeltaEncoding(on) => {
                 crate::column::set_delta_enabled(*on);
-                self.delta_encoding = *on;
+                self.tuning.delta_encoding = *on;
                 self.store.set_delta_encoding(*on);
-                for store in self.columns.values_mut() {
+                for store in self.derived.columns.values_mut() {
                     store.set_delta_enabled(*on);
                 }
                 Ok(())
             }
             Action::SetThreadPerCore(on) => {
-                self.thread_per_core = *on;
+                self.tuning.thread_per_core = *on;
                 self.store.set_thread_per_core(*on);
                 Ok(())
             }
@@ -95,7 +89,7 @@ impl ActionSink for Database {
                 // query asks for one, which is the only moment the engine knows
                 // which aggregates are worth keeping — guessing up front would
                 // maintain totals nobody reads on every write.
-                self.views.set_enabled(*on);
+                self.derived.views.set_enabled(*on);
                 Ok(())
             }
             Action::SetRecordCompression(on) => {
@@ -110,11 +104,11 @@ impl ActionSink for Database {
                 Ok(())
             }
             Action::SetJoinOrder(on) => {
-                self.join_order = *on;
+                self.tuning.join_order = *on;
                 Ok(())
             }
             Action::SetDataPartitioning(on) => {
-                self.data_partitioning = *on;
+                self.tuning.data_partitioning = *on;
                 Ok(())
             }
         }
