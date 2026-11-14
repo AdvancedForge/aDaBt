@@ -64,14 +64,13 @@
 //! already visible to the transaction fails right away, exactly as the
 //! ordinary non-transactional `insert` would.
 //!
-//! Schema validity and unique constraints are checked at commit, once, across
-//! the whole write-set, before anything is applied — deliberately duplicating
-//! a check the ordinary update path will make again on the way in, because the
-//! alternative is validating everything and applying each write as it passes,
-//! which leaves a window in which an unrelated later failure aborts a
-//! transaction that has already partly landed. Checking everything first and
-//! applying second is the same all-or-nothing shape
-//! [`Database::insert_batch`](crate::database::Database::insert_batch) uses, for the same reason.
+//! Schema validity and unique constraints are checked at commit, once,
+//! against the state the whole write-set leaves, before anything is logged or
+//! applied. Validating and applying each write as it passed would leave a
+//! window in which a later failure aborts a transaction that has already
+//! partly landed. After validation the write-set is logged as one group under
+//! a single commit record, so it survives a crash entirely or not at all; see
+//! the `commit` module of `database` for why that holds.
 //!
 //! # DDL is not transactional
 //!
