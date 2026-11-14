@@ -549,12 +549,10 @@ impl Wal {
 
     /// The oldest entry the log still holds.
     ///
-    /// Zero while nothing has been discarded, which is to say always, today.
-    /// It becomes meaningful when the log learns to drop segments below a
-    /// checkpoint — and the *reason* it is here already is that everything which
-    /// rebuilds state from the log has to be able to ask whether the log is
-    /// still complete. Adding the question later would mean adding it to code
-    /// that had already been written on the assumption that the answer was yes.
+    /// Zero until `discard_below` drops segments behind a checkpoint; then
+    /// the first LSN of the oldest surviving segment. Everything that rebuilds
+    /// state from the log asks this first, to know whether the log is still
+    /// complete.
     pub fn start_lsn(&self) -> Lsn {
         Lsn(self.start_lsn)
     }

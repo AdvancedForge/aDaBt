@@ -220,9 +220,7 @@ impl LogicalOp {
     }
 
     /// Every collection this plan reads, leaves first, left before right at a
-    /// `Join`. Length 1 for every plan that can execute today — `Join` is
-    /// reserved but the planner refuses it before anything downstream would
-    /// need to ask this question of one.
+    /// `Join`. Length 1 for every plan without a `Join`.
     pub fn sources(&self) -> Vec<&str> {
         match self {
             LogicalOp::GetById { collection, .. }
@@ -243,18 +241,18 @@ impl LogicalOp {
 
     /// Whether this plan or anything beneath it is a `Join`.
     ///
-    /// The one thing a caller needs to know about `Join` before doing anything
-    /// else with a plan: whether it is safe to hand to the planner at all. See
-    /// `Error::Unsupported` and its call site in `adabt-engine`.
+    /// The one thing a caller needs to know about a plan before routing it:
+    /// join plans take their own planning path (`plan_join` in `adabt-exec`)
+    /// and are refused by the sharded engine, whose shards partition each
+    /// collection independently.
     pub fn contains_join(&self) -> bool {
         matches!(self, LogicalOp::Join { .. }) || self.children().iter().any(|c| c.contains_join())
     }
 
     /// The collection this plan reads, for a plan with exactly one.
     ///
-    /// Panics on a plan with more than one source — today, only a tree
-    /// containing `Join`, which cannot reach here anyway since the planner and
-    /// executor reject `Join` before consulting this. Kept rather than removed
+    /// Panics on a plan with more than one source, i.e. one containing a
+    /// `Join`; callers route those away first (see `contains_join`). Kept
     /// because most of this codebase legitimately has exactly one collection to
     /// ask about and `sources()[0]` at every call site would be noise, not
     /// rigor.
@@ -515,10 +513,8 @@ impl LogicalOp {
                 out.extend(aggs.iter().filter_map(|a| a.field.clone()));
                 input.collect_required_below(out)
             }
-            // Unreachable through an executable plan today — the planner
-            // rejects `Join` before field-pushdown analysis would ever see
-            // one — but a two-input pass-through is the right shape to have
-            // waiting rather than a wildcard that silently drops one side.
+            // Both sides need their own fields; a wildcard here would
+            // silently drop one.
             LogicalOp::Join { left, right, .. } => {
                 let l = left.collect_required_below(out);
                 let r = right.collect_required_below(out);

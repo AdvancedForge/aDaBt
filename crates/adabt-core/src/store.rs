@@ -47,9 +47,9 @@ pub fn normalize_for_storage(rec: &mut Record) {
 ///
 /// Reads take `&mut self`. A real engine mutates on read — the buffer pool
 /// faults pages in, hit counters move, the eviction policy is touched — and a
-/// `&self` signature would be a lie maintained by a lock that buys nothing
-/// until there are threads to contend for it. Concurrent reads will arrive as a
-/// snapshot handle obtained from the engine, not by pretending reads are pure.
+/// `&self` signature would be a lie maintained by a lock. Concurrent readers
+/// instead take a snapshot from the engine (`Database::snapshot`) and read
+/// through it, rather than pretending reads are pure.
 pub trait LogicalStore {
     fn create_collection(&mut self, name: &str, schema: Schema) -> Result<()>;
     fn drop_collection(&mut self, name: &str) -> Result<()>;

@@ -150,8 +150,8 @@ impl OptContext<'_> {
 ///
 /// Everything here is deliberately *descriptive*: an optimization reports what
 /// it would do and what that would cost, and produces a `ChangePlan`. It never
-/// touches the engine directly. That is what lets the same definition serve the
-/// manual driver today and the adaptive driver later without change.
+/// touches the engine directly. That is what lets one definition serve both
+/// the manual and the adaptive driver.
 pub trait Optimization: Send + Sync {
     fn meta(&self) -> &OptMeta;
 

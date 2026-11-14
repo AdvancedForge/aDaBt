@@ -23,15 +23,14 @@
 //! not an error, just plausible records containing the wrong data. So the
 //! binding is written down rather than re-derived.
 //!
-//! # Authoritative, but not yet load-bearing
+//! # Authoritative, with a fallback only while it is sound
 //!
-//! Today the log is never truncated, so a missing catalog is recoverable by
-//! walking the whole log — and that is exactly what happens. `log_start_lsn`
-//! records the oldest entry the log still contains; while it is zero, the log is
-//! complete and the fallback is sound. When truncation arrives, that field
-//! becomes non-zero and the fallback becomes an error rather than a guess. The
-//! field is here now so that truncation is a behaviour change rather than a
-//! format change.
+//! A missing or damaged catalog can be rebuilt by replaying the log, but only
+//! while the log is complete. `log_start_lsn` records the oldest entry the log
+//! still contains: zero until a checkpoint discards segments, after which a
+//! missing catalog is an error rather than a guess (`log_is_complete`). The
+//! field predates truncation, so adding truncation changed behaviour, not the
+//! on-disk format.
 
 use adabt_core::error::{Error, Result};
 use adabt_core::ids::Lsn;
