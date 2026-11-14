@@ -69,7 +69,7 @@ use adabt_core::record::Record;
 use adabt_core::store::normalize_for_storage;
 
 use super::HeapStore;
-use crate::wal::WalOp;
+use crate::wal::{RecordFrame, WalOp};
 
 /// One write in a group committed by [`HeapStore::commit_writes`].
 #[derive(Debug, Clone)]
@@ -104,23 +104,23 @@ impl Prepared {
     ///
     /// Deleting a record that is not there changes nothing, so — exactly as
     /// for a standalone delete — nothing is logged for it.
-    fn frame(&self) -> Option<WalOp> {
+    fn frame(&self) -> Option<RecordFrame<'_>> {
         match self {
             Prepared::Put {
                 collection,
                 id,
                 bytes,
-            } => Some(WalOp::Update {
-                collection: collection.clone(),
+            } => Some(RecordFrame::Update {
+                collection,
                 id: *id,
-                bytes: bytes.clone(),
+                bytes,
             }),
             Prepared::Delete {
                 collection,
                 id,
                 existed: true,
-            } => Some(WalOp::Delete {
-                collection: collection.clone(),
+            } => Some(RecordFrame::Delete {
+                collection,
                 id: *id,
             }),
             Prepared::Delete { existed: false, .. } => None,
@@ -228,7 +228,10 @@ impl HeapStore {
     /// The caller must not touch a page for any of these writes until this
     /// returns; that ordering is the whole of the correctness argument in the
     /// module documentation.
-    pub(super) fn log_atomically(&mut self, frames: impl IntoIterator<Item = WalOp>) -> Result<()> {
+    pub(super) fn log_atomically<'a>(
+        &mut self,
+        frames: impl IntoIterator<Item = RecordFrame<'a>>,
+    ) -> Result<()> {
         let mut frames = frames.into_iter().peekable();
         if self.replaying || frames.peek().is_none() {
             return Ok(());
@@ -238,8 +241,8 @@ impl HeapStore {
         // every frame between this one and the commit record.
         let txn = TxnId(self.wal.next_lsn().0);
         debug_assert_ne!(txn, TxnId(0), "LSNs start at 1; 0 means autocommit");
-        for op in frames {
-            self.wal.append(txn, op)?;
+        for frame in frames {
+            self.wal.append_record(txn, frame)?;
         }
         self.wal.append(txn, WalOp::Commit { txn })?;
         self.wal.commit()?;

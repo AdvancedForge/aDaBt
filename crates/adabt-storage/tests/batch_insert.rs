@@ -153,6 +153,59 @@ fn an_empty_batch_is_a_well_defined_no_op() {
     assert_eq!(h.count("c").unwrap(), 0);
 }
 
+/// The borrowed form stores exactly what the owned one does — nulls dropped,
+/// as every write path drops them — and leaves the caller's records alone.
+#[test]
+fn a_lent_batch_is_stored_normalised_and_left_as_it_was() {
+    let t = Tmp::new("lent");
+    let mut h = HeapStore::open(t.path(), Durability::Relaxed, 64).unwrap();
+    h.create_collection("c", Schema::dynamic()).unwrap();
+    let with_null = Record::new()
+        .with("i", 1u64)
+        .with("gone", adabt_core::value::Value::Null);
+    let records = vec![(RecordId(0), rec(0)), (RecordId(1), with_null.clone())];
+    assert_eq!(h.insert_batch_from("c", &records).unwrap(), 2);
+    assert_eq!(records[1].1, with_null, "the caller's record was changed");
+    assert_eq!(
+        h.get("c", RecordId(1)).unwrap(),
+        Some(Record::new().with("i", 1u64))
+    );
+    assert_eq!(h.get("c", RecordId(0)).unwrap(), Some(rec(0)));
+}
+
+/// Ids in ascending order skip the per-row checks only where they cannot
+/// fail: a batch reaching below the highest existing id is still checked
+/// against every record already there, live or deleted.
+#[test]
+fn an_ascending_batch_is_still_checked_against_what_exists() {
+    let t = Tmp::new("ascending");
+    let mut h = HeapStore::open(t.path(), Durability::Relaxed, 64).unwrap();
+    h.create_collection("c", Schema::dynamic()).unwrap();
+    h.insert("c", RecordId(10), rec(10)).unwrap();
+    h.insert("c", RecordId(20), rec(20)).unwrap();
+    h.delete("c", RecordId(20)).unwrap();
+
+    // Past the highest id: nothing to collide with.
+    assert_eq!(
+        h.insert_batch("c", (21..25).map(|i| (RecordId(i), rec(i))).collect())
+            .unwrap(),
+        4
+    );
+    // Overlapping a live record: refused whole.
+    let refused = h.insert_batch("c", (5..15).map(|i| (RecordId(i), rec(i))).collect());
+    assert!(matches!(
+        refused,
+        Err(adabt_core::error::Error::RecordExists(RecordId(10)))
+    ));
+    assert_eq!(h.get("c", RecordId(5)).unwrap(), None);
+    // Over a deleted one: allowed, as a single insert would be.
+    assert_eq!(
+        h.insert_batch("c", vec![(RecordId(20), rec(20))]).unwrap(),
+        1
+    );
+    assert_eq!(h.get("c", RecordId(20)).unwrap(), Some(rec(20)));
+}
+
 #[test]
 fn batched_inserts_answer_queries_identically_to_one_at_a_time() {
     // The differential idea applied narrowly: two stores built two different

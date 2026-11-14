@@ -185,6 +185,9 @@ pub struct HeapStore {
     /// Pages touched by `get` since the last clear — the diagnostic a
     /// locality claim is measured against. See [`Self::touched_pages`].
     touched: std::collections::HashSet<u32>,
+    /// Scratch space for the slot payload a write is building; see
+    /// `write::apply_put_placed`.
+    payload: Vec<u8>,
 }
 
 /// How far to replay the log when opening a store.
@@ -321,6 +324,7 @@ impl HeapStore {
             identity: superblock.identity,
             recover_target: target,
             touched: std::collections::HashSet::new(),
+            payload: Vec::new(),
         };
         store.recover()?;
         store.replaying = false;

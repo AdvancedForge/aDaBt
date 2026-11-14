@@ -39,16 +39,16 @@ impl Database {
         records: Vec<(RecordId, Record)>,
     ) -> Result<usize> {
         let t = Instant::now();
-        // Normalised here, once, rather than trusted from the store: reindexing
-        // has to see the same shape of record a plain `insert` would reindex,
-        // and recomputing it from what was actually written would mean a second
-        // scan for no reason — `insert_batch` is all-or-nothing, so if it
-        // returns at all, every one of these was written exactly as given.
-        let mut normalized = Vec::with_capacity(records.len());
-        for (id, rec) in &records {
-            let mut r = rec.clone();
-            adabt_core::store::normalize_for_storage(&mut r);
-            normalized.push((*id, r));
+        // Normalised here, once and in place, rather than trusted from the
+        // store: reindexing has to see the same shape of record a plain
+        // `insert` would reindex, and recomputing it from what was actually
+        // written would mean a second scan for no reason — the batch is
+        // all-or-nothing, so if it returns at all, every one of these was
+        // written exactly as given. The store is then lent these same records,
+        // already in the shape it stores, so nothing is copied.
+        let mut normalized = records;
+        for (_, rec) in &mut normalized {
+            adabt_core::store::normalize_for_storage(rec);
         }
         // Checked against existing data *and* against the rest of the batch,
         // before a single row is written — a batch is all-or-nothing, and two
@@ -75,7 +75,7 @@ impl Database {
                 }
             }
         }
-        let n = self.store.insert_batch(collection, records)?;
+        let n = self.store.insert_batch_from(collection, &normalized)?;
         for (id, rec) in &normalized {
             self.derived
                 .on_insert(collection, *id, rec, &self.telemetry.probe);

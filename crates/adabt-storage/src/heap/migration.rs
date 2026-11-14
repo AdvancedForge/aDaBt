@@ -10,7 +10,7 @@ use adabt_core::store::LogicalStore;
 use super::HeapStore;
 use crate::catalog::encode_schema;
 use crate::codec::RecordCodec;
-use crate::wal::WalOp;
+use crate::wal::{RecordFrame, WalOp};
 
 /// Prefix marking a collection as a migration's staging area.
 ///
@@ -139,10 +139,10 @@ impl HeapStore {
 
         for (id, rec) in &projected {
             let bytes = self.coll(&staging)?.codec.encode(rec)?;
-            self.log(WalOp::Insert {
-                collection: staging.clone(),
+            self.log_record(RecordFrame::Insert {
+                collection: &staging,
                 id: *id,
-                bytes: bytes.clone(),
+                bytes: &bytes,
             })?;
             self.apply_put(&staging, *id, &bytes)?;
         }

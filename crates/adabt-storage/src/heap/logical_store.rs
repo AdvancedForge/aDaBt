@@ -12,7 +12,7 @@ use super::migration::is_migration_name;
 use super::{HeapStore, SLOT_PREFIX};
 use crate::catalog::encode_schema;
 use crate::page::RecordLocation;
-use crate::wal::WalOp;
+use crate::wal::{RecordFrame, WalOp};
 
 impl HeapStore {
     /// Read one record out of the page it lives on.
@@ -94,10 +94,10 @@ impl LogicalStore for HeapStore {
         }
         let bytes = c.codec.encode(&rec)?;
         self.check_fits(&bytes)?;
-        self.log(WalOp::Insert {
-            collection: collection.to_string(),
+        self.log_record(RecordFrame::Insert {
+            collection,
             id,
-            bytes: bytes.clone(),
+            bytes: &bytes,
         })?;
         self.apply_put(collection, id, &bytes)
     }
@@ -121,10 +121,10 @@ impl LogicalStore for HeapStore {
         // The log carries the same op either way: clustering is placement, not
         // content, so replay reproduces the bytes exactly and re-derives (or
         // forgets, which is equally correct) the locality.
-        self.log(WalOp::Insert {
-            collection: collection.to_string(),
+        self.log_record(RecordFrame::Insert {
+            collection,
             id,
-            bytes: bytes.clone(),
+            bytes: &bytes,
         })?;
         self.apply_put_keyed(collection, id, &bytes, key)
     }
@@ -217,10 +217,10 @@ impl LogicalStore for HeapStore {
         let existed = c.directory.get(&id).is_some_and(|v| !v.is_absent());
         let bytes = c.codec.encode(&rec)?;
         self.check_fits(&bytes)?;
-        self.log(WalOp::Update {
-            collection: collection.to_string(),
+        self.log_record(RecordFrame::Update {
+            collection,
             id,
-            bytes: bytes.clone(),
+            bytes: &bytes,
         })?;
         self.apply_put(collection, id, &bytes)?;
         Ok(existed)
@@ -233,10 +233,7 @@ impl LogicalStore for HeapStore {
             .get(&id)
             .is_some_and(|v| !v.is_absent());
         if existed {
-            self.log(WalOp::Delete {
-                collection: collection.to_string(),
-                id,
-            })?;
+            self.log_record(RecordFrame::Delete { collection, id })?;
         }
         self.apply_delete(collection, id)
     }

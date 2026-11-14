@@ -346,3 +346,90 @@ fn a_scan_under_a_declared_schema_has_the_same_budget() {
          (budget {SCAN_BUDGET})"
     );
 }
+
+// -- writes --------------------------------------------------------------
+
+fn rows(from: u64, to: u64) -> Vec<(RecordId, Record)> {
+    (from..to)
+        .map(|i| {
+            (
+                RecordId(i),
+                Record::new()
+                    .with("id", i)
+                    .with("bucket", (i % 100) as i64)
+                    .with("status", if i % 2 == 0 { "open" } else { "shut" }),
+            )
+        })
+        .collect()
+}
+
+/// Durability decides how often the log is synced, not what is allocated, and
+/// a sync per row would only make the fixture slow.
+fn relaxed() -> Policy {
+    let mut policy = Policy::manual(0);
+    policy.guarantees.durability = adabt_core::policy::Durability::Relaxed;
+    policy
+}
+
+/// A batch insert's floor is one allocation per row: the new record's version
+/// chain in the page directory. Everything else is per batch — the records
+/// are encoded into one shared buffer, and logged and placed through buffers
+/// the store keeps.
+///
+/// It used to be ten: the engine cloned every record to keep a normalised
+/// copy, and the store encoded each into its own vector, copied it into a log
+/// op that also carried a copy of the collection name, framed that into
+/// another vector, and built the slot payload in two more. Twice the floor
+/// catches any of that coming back.
+const BATCH_INSERT_BUDGET: u64 = 2;
+
+/// An autocommit insert sits at five today: the copy of the record the engine
+/// keeps for indexing (its field vector and its string), the encoded record,
+/// the version chain, and the engine's per-collection write epoch. Logging and
+/// placing allocate nothing; at eleven, they used to account for most of it.
+const AUTOCOMMIT_INSERT_BUDGET: u64 = 10;
+
+#[test]
+fn a_batch_insert_allocates_a_bounded_amount_per_row() {
+    let _exclusive = exclusive();
+    let dir = Tmp::new("batch");
+    let mut db = Database::open(dir.path(), relaxed()).unwrap();
+    db.create_collection("c", Schema::dynamic()).unwrap();
+    let batch = rows(0, N);
+    let allocs = allocations_during(|| db.insert_batch("c", batch).unwrap());
+    let per_row = allocs / N;
+
+    println!(
+        "batch insert: {per_row} allocations/row ({allocs} for {N}), budget {BATCH_INSERT_BUDGET}"
+    );
+    assert!(
+        per_row <= BATCH_INSERT_BUDGET,
+        "a batch insert cost {per_row} allocations per row (budget {BATCH_INSERT_BUDGET}); \
+         is a record being copied, or encoded into a buffer of its own, again?"
+    );
+}
+
+#[test]
+fn an_autocommit_insert_allocates_a_bounded_amount() {
+    let _exclusive = exclusive();
+    let dir = Tmp::new("autocommit");
+    let mut db = Database::open(dir.path(), relaxed()).unwrap();
+    db.create_collection("c", Schema::dynamic()).unwrap();
+    db.insert_batch("c", rows(0, N)).unwrap();
+    let more = rows(N, 2 * N);
+    let allocs = allocations_during(|| {
+        for (id, rec) in more {
+            db.insert("c", id, rec).unwrap();
+        }
+    });
+    let per_row = allocs / N;
+
+    println!(
+        "autocommit insert: {per_row} allocations/row ({allocs} for {N}), \
+         budget {AUTOCOMMIT_INSERT_BUDGET}"
+    );
+    assert!(
+        per_row <= AUTOCOMMIT_INSERT_BUDGET,
+        "an autocommit insert cost {per_row} allocations (budget {AUTOCOMMIT_INSERT_BUDGET})"
+    );
+}

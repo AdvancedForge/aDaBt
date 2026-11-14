@@ -241,8 +241,15 @@ impl RecordCodec {
 
     pub fn encode(&self, rec: &Record) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(64);
-        self.encode_with_header(rec, RecordHeader::new(), &mut out)?;
+        self.encode_into(rec, &mut out)?;
         Ok(out)
+    }
+
+    /// [`Self::encode`] into `out`, replacing whatever it held — for a caller
+    /// encoding many records, which can then reuse one buffer for all of them.
+    pub fn encode_into(&self, rec: &Record, out: &mut Vec<u8>) -> Result<()> {
+        out.clear();
+        self.encode_with_header(rec, RecordHeader::new(), out)
     }
 
     pub fn decode(&self, buf: &[u8]) -> Result<Record> {

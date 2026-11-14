@@ -8,7 +8,7 @@ use adabt_core::store::LogicalStore;
 use super::migration::is_migration_name;
 use super::HeapStore;
 use crate::page::RecordLocation;
-use crate::wal::WalOp;
+use crate::wal::RecordFrame;
 
 impl HeapStore {
     pub fn delta_encoding(&self) -> bool {
@@ -50,10 +50,10 @@ impl HeapStore {
                 let bytes = self.coll(&name)?.codec.encode(&rec)?;
                 // Goes through the ordinary write path, so the WAL records it
                 // and a crash mid-rewrite replays correctly.
-                self.log(WalOp::Update {
-                    collection: name.clone(),
+                self.log_record(RecordFrame::Update {
+                    collection: &name,
                     id,
-                    bytes: bytes.clone(),
+                    bytes: &bytes,
                 })?;
                 self.apply_put(&name, id, &bytes)?;
             }

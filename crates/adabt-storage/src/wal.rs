@@ -166,54 +166,112 @@ fn put_bytes(b: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(b);
 }
 
-impl WalEntry {
-    fn encode_payload(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(64);
-        out.extend_from_slice(&self.lsn.0.to_le_bytes());
-        out.extend_from_slice(&self.nanos.to_le_bytes());
-        out.extend_from_slice(&self.txn.0.to_le_bytes());
-        match &self.op {
-            WalOp::Insert {
+/// A record-level log frame — insert, update or delete — described by
+/// borrowed parts.
+///
+/// These are the frames every data write appends, and building a [`WalOp`]
+/// for one means copying the collection name and the encoded record only to
+/// encode the copy and drop it. Appending a `RecordFrame` encodes straight
+/// from the caller's buffers. It is not a second format: [`WalOp`]'s own
+/// `Insert`, `Update` and `Delete` are encoded through this type, so the two
+/// cannot disagree about a byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordFrame<'a> {
+    Insert {
+        collection: &'a str,
+        id: RecordId,
+        bytes: &'a [u8],
+    },
+    Update {
+        collection: &'a str,
+        id: RecordId,
+        bytes: &'a [u8],
+    },
+    Delete {
+        collection: &'a str,
+        id: RecordId,
+    },
+}
+
+impl RecordFrame<'_> {
+    /// Append this frame's op code and fields to `out`.
+    fn encode_op(&self, out: &mut Vec<u8>) {
+        match *self {
+            RecordFrame::Insert {
                 collection,
                 id,
                 bytes,
             } => {
                 out.push(OP_INSERT);
-                put_str(collection, &mut out);
-                varint::write_u64(id.0, &mut out);
-                put_bytes(bytes, &mut out);
+                put_str(collection, out);
+                varint::write_u64(id.0, out);
+                put_bytes(bytes, out);
             }
-            WalOp::Update {
+            RecordFrame::Update {
                 collection,
                 id,
                 bytes,
             } => {
                 out.push(OP_UPDATE);
-                put_str(collection, &mut out);
-                varint::write_u64(id.0, &mut out);
-                put_bytes(bytes, &mut out);
+                put_str(collection, out);
+                varint::write_u64(id.0, out);
+                put_bytes(bytes, out);
             }
-            WalOp::Delete { collection, id } => {
+            RecordFrame::Delete { collection, id } => {
                 out.push(OP_DELETE);
-                put_str(collection, &mut out);
-                varint::write_u64(id.0, &mut out);
+                put_str(collection, out);
+                varint::write_u64(id.0, out);
             }
+        }
+    }
+}
+
+impl WalOp {
+    /// Append this op's code and fields to `out`: everything a frame holds
+    /// after its LSN, timestamp and transaction id.
+    fn encode_op(&self, out: &mut Vec<u8>) {
+        match self {
+            WalOp::Insert {
+                collection,
+                id,
+                bytes,
+            } => RecordFrame::Insert {
+                collection,
+                id: *id,
+                bytes,
+            }
+            .encode_op(out),
+            WalOp::Update {
+                collection,
+                id,
+                bytes,
+            } => RecordFrame::Update {
+                collection,
+                id: *id,
+                bytes,
+            }
+            .encode_op(out),
+            WalOp::Delete { collection, id } => RecordFrame::Delete {
+                collection,
+                id: *id,
+            }
+            .encode_op(out),
             WalOp::CreateCollection { name, schema } => {
                 out.push(OP_CREATE_COLLECTION);
-                put_str(name, &mut out);
-                put_bytes(schema, &mut out);
+                put_str(name, out);
+                put_bytes(schema, out);
             }
             WalOp::DropCollection { name } => {
                 out.push(OP_DROP_COLLECTION);
-                put_str(name, &mut out);
+                put_str(name, out);
             }
             WalOp::Commit { txn } => {
                 out.push(OP_COMMIT);
-                varint::write_u64(txn.0, &mut out);
+                varint::write_u64(txn.0, out);
             }
             WalOp::Checkpoint { flushed_lsn } => {
                 out.push(OP_CHECKPOINT);
-                varint::write_u64(flushed_lsn.0, &mut out);
+                varint::write_u64(flushed_lsn.0, out);
             }
             WalOp::CreateIndex {
                 collection,
@@ -221,9 +279,9 @@ impl WalEntry {
                 kind,
             } => {
                 out.push(OP_CREATE_INDEX);
-                put_str(collection, &mut out);
-                put_str(field, &mut out);
-                put_str(kind, &mut out);
+                put_str(collection, out);
+                put_str(field, out);
+                put_str(kind, out);
             }
             WalOp::DropIndex {
                 collection,
@@ -231,38 +289,39 @@ impl WalEntry {
                 kind,
             } => {
                 out.push(OP_DROP_INDEX);
-                put_str(collection, &mut out);
-                put_str(field, &mut out);
-                put_str(kind, &mut out);
+                put_str(collection, out);
+                put_str(field, out);
+                put_str(kind, out);
             }
             WalOp::AdoptMigration { target, source } => {
                 out.push(OP_ADOPT_MIGRATION);
-                put_str(target, &mut out);
-                put_str(source, &mut out);
+                put_str(target, out);
+                put_str(source, out);
             }
             WalOp::AlterSchemaInPlace { collection, schema } => {
                 out.push(OP_ALTER_SCHEMA_IN_PLACE);
-                put_str(collection, &mut out);
+                put_str(collection, out);
                 // Varint length, matching `blob()`'s reader — a raw u32 here
                 // made replay consume three zero bytes of the length word as
                 // the first three bytes of the schema.
-                put_bytes(schema, &mut out);
+                put_bytes(schema, out);
             }
             WalOp::SetClusterField { collection, field } => {
                 out.push(OP_SET_CLUSTER_FIELD);
-                put_str(collection, &mut out);
+                put_str(collection, out);
                 match field {
                     Some(f) => {
                         out.push(1);
-                        put_str(f, &mut out);
+                        put_str(f, out);
                     }
                     None => out.push(0),
                 }
             }
         }
-        out
     }
+}
 
+impl WalEntry {
     fn decode_payload(buf: &[u8]) -> Result<Self> {
         let mut r = PayloadReader { buf, pos: 0 };
         let lsn = Lsn(r.u64()?);
@@ -438,6 +497,9 @@ pub struct Wal {
     group_size: u32,
     syncs: u64,
     appended: u64,
+    /// Where the next frame is assembled; kept so appending reuses one
+    /// allocation instead of making one per entry.
+    frame: Vec<u8>,
 }
 
 impl Wal {
@@ -494,6 +556,7 @@ impl Wal {
             group_size: 32,
             syncs: 0,
             appended: 0,
+            frame: Vec::new(),
         })
     }
 
@@ -882,26 +945,43 @@ impl Wal {
 
     /// Append an operation and return the LSN assigned to it.
     pub fn append(&mut self, txn: TxnId, op: WalOp) -> Result<Lsn> {
+        self.append_with(txn, |out| op.encode_op(out))
+    }
+
+    /// Append a record-level frame from borrowed parts and return the LSN
+    /// assigned to it. Byte for byte what [`Self::append`] writes for the
+    /// equivalent [`WalOp`].
+    pub fn append_record(&mut self, txn: TxnId, frame: RecordFrame<'_>) -> Result<Lsn> {
+        self.append_with(txn, |out| frame.encode_op(out))
+    }
+
+    /// Frame whatever `encode_op` writes as the next entry.
+    ///
+    /// The frame is assembled in a buffer the log keeps — length and checksum
+    /// first, as placeholders filled in once the payload is known — and handed
+    /// to the writer in one piece, so an append allocates nothing once the
+    /// buffer has grown to the size of a typical entry.
+    fn append_with(&mut self, txn: TxnId, encode_op: impl FnOnce(&mut Vec<u8>)) -> Result<Lsn> {
         let lsn = Lsn(self.next_lsn);
         self.next_lsn += 1;
-        let entry = WalEntry {
-            lsn,
-            nanos: Self::now_nanos(),
-            txn,
-            op,
-        };
-        let payload = entry.encode_payload();
-        if payload.len() as u32 > MAX_ENTRY {
+        let frame = &mut self.frame;
+        frame.clear();
+        frame.extend_from_slice(&[0u8; 8]);
+        frame.extend_from_slice(&lsn.0.to_le_bytes());
+        frame.extend_from_slice(&Self::now_nanos().to_le_bytes());
+        frame.extend_from_slice(&txn.0.to_le_bytes());
+        encode_op(frame);
+        let payload_len = frame.len() - 8;
+        if payload_len as u64 > MAX_ENTRY as u64 {
             return Err(Error::Corruption(format!(
-                "wal entry of {} bytes exceeds the {MAX_ENTRY}-byte limit",
-                payload.len()
+                "wal entry of {payload_len} bytes exceeds the {MAX_ENTRY}-byte limit"
             )));
         }
-        self.writer
-            .write_all(&(payload.len() as u32).to_le_bytes())?;
-        self.writer.write_all(&checksum(&payload).to_le_bytes())?;
-        self.writer.write_all(&payload)?;
-        self.active_bytes += 8 + payload.len() as u64;
+        let sum = checksum(&frame[8..]);
+        frame[0..4].copy_from_slice(&(payload_len as u32).to_le_bytes());
+        frame[4..8].copy_from_slice(&sum.to_le_bytes());
+        self.writer.write_all(frame)?;
+        self.active_bytes += frame.len() as u64;
         self.pending += 1;
         self.appended += 1;
         if self.active_bytes >= self.segment_bytes {
