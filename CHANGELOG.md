@@ -2,9 +2,37 @@
 
 ## Unreleased
 
-A correctness and code-quality pass. No on-disk format change.
+A correctness and code-quality pass. The existing formats are unchanged; two
+files are new (`base.adabt`, `superseded-log/`).
 
 ### Fixed
+- **Point-in-time recovery could show writes from after its target.**
+  `open_at` replayed the log up to the target over the heap file as it
+  stood, but the buffer pool writes dirty pages to that file whenever it
+  needs room, so later writes were already there and showed through. In the
+  reproduction (10 rows, a checkpoint, a two-page pool, 20 more inserts) a
+  restore to the first of the 20 returned 20 rows instead of 11. A restore
+  now starts from a *base image*: a heap file exactly as a checkpoint left
+  it, plus that checkpoint's page directory. Every backup is one, and it
+  replays the log forward from there. **Behaviour change:** `open_at` on a
+  directory whose heap file has changed since its last checkpoint (in
+  practice, a live data directory) is refused with `InvalidRestore`, and so is
+  a log with a gap between the base image and the target. The supported
+  procedure is `restore_from(backup)`, copy the archived segments in, then
+  `open_at` (`docs/operations.md`). Related fixes on the same path:
+  - a restore ends the restored directory's log at the target and moves the
+    entries after it to `superseded-log/`, where they are kept. Before this, a
+    restored database replayed that later history on its next open and mixed
+    it with its own new writes.
+  - replay starts at the backup's checkpoint, not at whichever later
+    checkpoint the supplied log records. That also applies to a plain `open`
+    of a restored backup that has been given later log; before this, such an
+    open skipped every write between the backup and the source's next
+    checkpoint.
+  - a backup carries its page-directory snapshot. Without it, opening a
+    backup rebuilt the directory by scanning pages and brought back records
+    deleted or overwritten before the backup.
+  No API signature changed.
 - **Manual mode undid its own work:** a second `optimize()` at the same
   level disabled the per-field indexes the level had created, because the
   level's unscoped request was diffed against its own scoped expansion.

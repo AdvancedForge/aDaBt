@@ -9,7 +9,7 @@ use adabt_core::error::{Error, Result};
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::page::{Page, PageId, PAGE_SIZE};
 
@@ -17,6 +17,9 @@ use crate::page::{Page, PageId, PAGE_SIZE};
 pub struct PagedFile {
     file: File,
     page_count: u32,
+    /// The directory of a base-image marker that must be removed before this
+    /// file changes. See [`crate::base_image`].
+    base_image: Option<PathBuf>,
 }
 
 impl PagedFile {
@@ -38,7 +41,28 @@ impl PagedFile {
         Ok(Self {
             file,
             page_count: (len / PAGE_SIZE as u64) as u32,
+            base_image: None,
         })
+    }
+
+    /// Remove the base-image marker in `dir` before this file next changes.
+    ///
+    /// The marker claims the file is byte for byte what a checkpoint left. The
+    /// claim is withdrawn here, at the one place every heap write passes
+    /// through, rather than by each caller that might write — an eviction, a
+    /// flush, an allocation, a vacuum's truncation — so no write path can
+    /// leave it standing over a file it no longer describes.
+    pub fn guard_base_image(&mut self, dir: PathBuf) {
+        self.base_image = Some(dir);
+    }
+
+    /// Withdraw the base-image claim, durably, ahead of a change to the file.
+    fn invalidate_base_image(&mut self) -> Result<()> {
+        if let Some(dir) = &self.base_image {
+            crate::base_image::discard(dir)?;
+            self.base_image = None;
+        }
+        Ok(())
     }
 
     pub fn page_count(&self) -> u32 {
@@ -90,6 +114,7 @@ impl PagedFile {
     }
 
     pub fn write_page(&mut self, id: PageId, page: &mut Page) -> Result<()> {
+        self.invalidate_base_image()?;
         page.seal();
         self.file
             .seek(SeekFrom::Start(id.0 as u64 * PAGE_SIZE as u64))?;
@@ -116,6 +141,7 @@ impl PagedFile {
         if pages >= self.page_count {
             return Ok(());
         }
+        self.invalidate_base_image()?;
         self.file.set_len(pages as u64 * PAGE_SIZE as u64)?;
         self.file.sync_all()?;
         self.page_count = pages;
@@ -460,6 +486,11 @@ impl BufferPool {
         self.flush_all()?;
         self.frames.retain(|id, _| id.0 < pages);
         self.file.truncate_to(pages)
+    }
+
+    /// See [`PagedFile::guard_base_image`].
+    pub fn guard_base_image(&mut self, dir: PathBuf) {
+        self.file.guard_base_image(dir);
     }
 
     /// Write every dirty frame back. Does not fsync; see `checkpoint`.

@@ -141,6 +141,10 @@ impl Database {
     /// the derived-representation stamp — is exactly as reconstructible from
     /// `dest` as it is from any other reopened directory, so none of it needs
     /// copying either.
+    ///
+    /// The backup is a base image as of its own checkpoint: the starting point
+    /// for a point-in-time restore to that checkpoint or any later moment the
+    /// archived log reaches (see [`Database::open_at`]).
     pub fn backup_to(&mut self, dest: &Path) -> Result<()> {
         self.store.backup_to(dest)?;
         if !self.unique_constraints.is_empty() {
@@ -156,6 +160,12 @@ impl Database {
     /// is an asymmetry nobody would guess at. `HeapStore::restore_from`
     /// copies the whole directory, so the engine-level sidecar
     /// (`unique.adabt`) that `backup_to` writes comes back with it.
+    ///
+    /// Opening `dest` with [`Database::open`] gives the database as of the
+    /// backup's checkpoint plus whatever log `dest/wal/` holds. For a
+    /// point-in-time restore, copy the archived segments (then, for a target
+    /// past the last archived one, the source's own `wal/` segments) into
+    /// `dest/wal/` and open `dest` with [`Database::open_at`].
     pub fn restore_from(src: &Path, dest: &Path) -> Result<()> {
         HeapStore::restore_from(src, dest)
     }
@@ -171,6 +181,9 @@ impl Database {
     ///
     /// `None` means every entry in the log is already after `nanos`: there
     /// is no prefix of this log ending at or before that moment.
+    ///
+    /// Ask it of the restored directory once its log has been supplied: that
+    /// is the log `open_at` will replay.
     pub fn lsn_at_or_before(dir: &Path, nanos: u64) -> Result<Option<adabt_core::ids::Lsn>> {
         adabt_storage::wal::Wal::lsn_at_or_before(&HeapStore::wal_path(dir), nanos)
     }
@@ -221,19 +234,17 @@ impl Database {
 
     /// Send discarded log segments to `dir` instead of deleting them.
     ///
-    /// **Without this, point-in-time recovery cannot reach anything but a
-    /// backup's own checkpoint.** `backup_to` checkpoints before copying, and
-    /// a checkpoint discards every segment it has folded into pages — so a
-    /// backup taken on its own carries no history before its own checkpoint,
-    /// and `open_at` correctly refuses (`RestoreTargetUnreachable`) any
-    /// earlier target rather than answering wrongly. Archiving is what keeps
-    /// those segments, and it is therefore the difference between "restore to
-    /// exactly when I backed up" and real PITR.
+    /// **Without this, point-in-time recovery cannot reach past the next
+    /// checkpoint after a backup.** A restore replays the log forward from a
+    /// backup's checkpoint, and every later checkpoint discards the segments
+    /// it has folded into pages — the very segments that restore needs.
+    /// Archiving keeps them, and it is therefore the difference between
+    /// "restore to exactly when I backed up" and real PITR. `open_at` refuses,
+    /// rather than answers wrongly, when a segment it needs is missing.
     ///
-    /// The mechanism lived in `adabt-storage` long before anything above it
-    /// could reach it, which made "point-in-time recovery" true of the
-    /// storage layer and not of anything an application could call. This
-    /// method is the fix.
+    /// Give a database restored with `open_at` an archive directory of its
+    /// own. It continues its log from the restore target, so its segments
+    /// reuse the names of the source's segments after that point.
     pub fn set_log_archive(&mut self, dir: Option<std::path::PathBuf>) {
         self.store.set_log_archive(dir);
     }

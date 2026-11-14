@@ -172,12 +172,34 @@ pub struct HeapStore {
 
 /// How far to replay the log when opening a store.
 ///
-/// The ordinary case is `Latest` — everything the log holds. `Lsn` is what a
-/// point-in-time restore is, mechanically: the exact same recovery passes
-/// every other open runs, fed a log deliberately truncated to a chosen prefix
-/// instead of one truncated by wherever a crash happened to land. Nothing
-/// about *how* recovery behaves once handed a shorter log is new; only the
-/// place the shortening comes from is.
+/// `Latest` replays everything the log holds — crash recovery — and works over
+/// any heap file, because replaying to the end corrects whatever pages the
+/// buffer pool wrote early.
+///
+/// `Lsn(t)` is a point-in-time restore: the state as of the entry at `t`,
+/// with a transaction whose commit record lies after `t` excluded entirely.
+/// Stopping short of the end is what makes the heap file matter. A page the
+/// pool wrote to the heap after `t` is never corrected, so the heap must be a
+/// *base image* ([`crate::base_image`]) — known to hold exactly the state as
+/// of some `b <= t` — and recovery replays `b+1..=t` from it, rather than from
+/// whichever checkpoint the log last records. Concretely, opening at `Lsn(t)`:
+///
+/// - refuses with [`Error::InvalidRestore`] when the heap file is not a base
+///   image. That is the normal state of a live directory once a page has been
+///   written since its last checkpoint; a restore of one starts from a backup
+///   (`backup_to`, `restore_from`) instead.
+/// - refuses with [`Error::RestoreTargetUnreachable`] when `t` is before the
+///   base image.
+/// - refuses with [`Error::InvalidRestore`] when the log does not hold every
+///   entry from `b+1` to `t` — a segment missing from the archive, or a target
+///   past the end of what was supplied — rather than replaying around the gap.
+/// - otherwise recovers, and then makes `t` the end of the directory's log:
+///   the entries after it describe a history the restored database did not
+///   have. They are moved, not deleted, to `superseded-log/` in the directory,
+///   and the database continues from `t + 1`.
+///
+/// Every check runs before anything is written, so a refusal leaves the
+/// directory exactly as it was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RecoverTarget {
     #[default]
@@ -254,7 +276,12 @@ impl HeapStore {
         // read it. Opening the heap first would mean interpreting bytes whose
         // format has not yet been agreed.
         let superblock = crate::superblock::open_or_create(dir, crate::page::PAGE_SIZE as u32)?;
-        let pool = BufferPool::open(&Self::heap_path(dir), pool_pages)?;
+        let mut pool = BufferPool::open(&Self::heap_path(dir), pool_pages)?;
+        // Whatever base-image marker is there — valid or not — goes before
+        // the heap file first changes. See `crate::base_image`.
+        if crate::base_image::path(dir).exists() {
+            pool.guard_base_image(dir.to_path_buf());
+        }
         // Opened before reading, so a torn tail on the active segment is
         // repaired first and recovery never sees a half-written entry.
         let wal = Wal::open(&Self::wal_path(dir), durability)?;

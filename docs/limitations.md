@@ -22,7 +22,8 @@ file wins.
 - **Full SQL** — a `SELECT` subset only; writes and DDL go through the Rust API
 - **Atomic cross-shard visibility** — coordinator-decides durability (`XSH1` journal), not 2PC: other connections can see shards disagree inside the commit window
 - **DDL is not transactional** — `CreateCollection`/`DropCollection`/schema changes commit on write, and sit outside `Strict`'s guarantee: a collection dropped and re-created under a running transaction is judged only by writes to the new one
-- **Point-in-time restore over a newer heap file** — `open_at` replays the log up to the target over the heap file as it stands. The buffer pool writes dirty pages to that file on eviction, so a page carrying writes from after the target may already be there, and those writes show through (transactional or not). It is sound when no page written after the target has reached the heap file; restoring from a base image older than the target is not yet supported
+- **Point-in-time recovery needs a backup** — `open_at` restores only from a base image at or before the target: a backup restored with `restore_from` and given the archived log (`docs/operations.md`). It refuses a live data directory once the buffer pool has written to its heap file since the last checkpoint, instead of restoring in place. Moving between timelines is manual: a restored database continues its log at target + 1, needs an archive directory of its own, and keeps the history it superseded in `superseded-log/` for an operator to deal with
+- **Crash recovery without the page-directory snapshot can bring back deleted rows** — a record deleted or overwritten before a checkpoint keeps its heap slot until version reclamation runs, and reclamation is lazy, so the checkpoint can flush that slot to disk. Crash recovery loads the directory snapshot from that checkpoint, but only while the heap file is the length the snapshot recorded. If the heap file has grown since the checkpoint, for example because a new page was allocated before the crash, recovery rebuilds the directory by scanning pages, and the scan cannot tell a dead slot from a live one. Backups and point-in-time restores are not affected: they always load the snapshot and refuse to fall back to a scan
 - **Persistent thread-per-core workers** — burst pinning only (`core_affinity` per query)
 - **Write throughput** — bulk load is ~11× slower than SQLite and single-row inserts also lose; per-record MVCC + WAL is the price (`docs/benchmarks/comparison-notes.md`)
 - **Comparison witnesses** — SQLite only; the PostgreSQL and RocksDB witnesses are planned and the harness exits 2 rather than fake them
@@ -32,7 +33,8 @@ file wins.
 ## Current guarantees
 - Catalog v4 (`FORMAT_VERSION`): reads v3; an unreadable catalog rebuilds from a complete WAL
 - Superblock version gate refuses a newer on-disk format
-- Crash recovery: WAL replay, torn-tail safe
+- Crash recovery: WAL replay, torn-tail safe (see the directory-snapshot gap above)
+- Point-in-time recovery from a backup plus archived log returns exactly the committed state at the target LSN, whatever the buffer pool wrote to the source's heap file. It refuses, and changes nothing, if the base image or a log segment is missing (`backup_restore.rs`, `backup.rs` compare every LSN against a reference model under a two-page pool)
 - Transactions and `insert_batch` are crash-atomic: the write-set is logged under one commit record, made durable once, and applied to pages only after; recovery applies it whole or not at all (`commit_window_chaos.rs`, `atomic_commit.rs`). Under `Strict` this holds through power loss; under `GroupCommit`/`Relaxed`, through a process crash
 - Cross-shard writes: crash-convergent (`commit_coordinated` holds a serialized lock; `open` re-drives pending writes)
 - Optimizations never change answers (differential runner + per-level query tests)

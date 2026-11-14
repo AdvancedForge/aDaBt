@@ -21,10 +21,10 @@
 //! both that heap and the final one must recover the whole transaction.
 //!
 //! A point-in-time restore is the same question asked deliberately: a target
-//! anywhere inside the transaction must not expose part of it either. That
-//! test keeps every page of the transaction out of the heap file, because a
-//! restore to an earlier point over a heap file that already holds later
-//! pages is unsound for any write, transactional or not (`docs/limitations.md`).
+//! anywhere inside the transaction must not expose part of it either. A
+//! restore starts from a backup taken before the transaction, so it holds
+//! whether or not the pool wrote the transaction's pages to the live heap
+//! file; the test runs both ways.
 
 use adabt_core::ids::{RecordId, TxnId};
 use adabt_core::policy::Policy;
@@ -308,30 +308,39 @@ fn every_cut_through_the_commit_window_recovers_all_or_none() {
 
 #[test]
 fn a_restore_target_inside_a_transaction_exposes_none_of_it() {
-    let t = Tmp::new("pitr");
-    let mut db = Database::open(t.path(), Policy::manual(4)).unwrap();
-    seed(&mut db);
-    commit_txn(&mut db, false);
-    drop(db);
+    for steal in [false, true] {
+        let t = Tmp::new(&format!("pitr-{steal}"));
+        let backup = Tmp::new(&format!("pitr-{steal}-backup"));
+        let mut db = Database::open(t.path(), Policy::manual(4)).unwrap();
+        seed(&mut db);
+        db.backup_to(backup.path()).unwrap();
+        commit_txn(&mut db, steal);
+        drop(db);
 
-    let entries = Wal::read_all(&HeapStore::wal_path(t.path())).unwrap();
-    let first = entries.iter().position(|e| e.txn != TxnId(0)).unwrap();
-    let commit = entries.len() - 1;
-    assert!(matches!(entries[commit].op, WalOp::Commit { .. }));
+        let entries = Wal::read_all(&HeapStore::wal_path(t.path())).unwrap();
+        let first = entries.iter().position(|e| e.txn != TxnId(0)).unwrap();
+        let commit = entries.len() - 1;
+        assert!(matches!(entries[commit].op, WalOp::Commit { .. }));
 
-    // Each target is restored into its own copy: a restore checkpoints what it
-    // recovered, and the next target must start from the original log.
-    for (n, e) in entries.iter().enumerate().skip(first) {
-        let copy = Tmp::new(&format!("pitr-{n}"));
-        copy_dir(t.path(), copy.path());
-        let mut db =
-            Database::open_at(copy.path(), Policy::manual(4), RecoverTarget::Lsn(e.lsn)).unwrap();
-        assert_eq!(
-            observed(&mut db),
-            expected(n == commit),
-            "restore to lsn {} (frame {n} of the log)",
-            e.lsn.0
-        );
-        assert!(db.verify().unwrap().problems.is_empty());
+        // Each target is restored from the backup into its own directory and
+        // handed the live log: a restore ends the log at its target.
+        for (n, e) in entries.iter().enumerate().skip(first) {
+            let copy = Tmp::new(&format!("pitr-{steal}-{n}"));
+            Database::restore_from(backup.path(), copy.path()).unwrap();
+            copy_dir(
+                &HeapStore::wal_path(t.path()),
+                &HeapStore::wal_path(copy.path()),
+            );
+            let mut db =
+                Database::open_at(copy.path(), Policy::manual(4), RecoverTarget::Lsn(e.lsn))
+                    .unwrap();
+            assert_eq!(
+                observed(&mut db),
+                expected(n == commit),
+                "restore to lsn {} (frame {n} of the log, steal {steal})",
+                e.lsn.0
+            );
+            assert!(db.verify().unwrap().problems.is_empty());
+        }
     }
 }

@@ -85,8 +85,17 @@ throughout: evidence first, then what it unblocks.
   through `fetch_projected_batches` would not help: there is no fetch left.
 
 ### 4. Correctness gaps a user will hit
-- Point-in-time restore from a base image: `open_at` over a heap file that
-  already holds pages written after the target can show those writes.
+- Crash recovery that falls back to a page scan, because the heap file grew
+  after the last checkpoint, can bring back records that were deleted or
+  overwritten before it and whose slots version reclamation had not yet
+  freed. Point-in-time recovery no longer has this problem: it restores from
+  a base image (a backup with its page-directory snapshot) and never scans.
+  The fix here is to make a checkpoint's heap readable on its own, for
+  example by reclaiming dead versions before the flush or by marking
+  superseded slots.
+- Point-in-time recovery timelines: a restored database continues its log at
+  the target, so it needs an archive directory of its own. Superseded
+  history is kept in `superseded-log/` but there is no tooling for it.
 - `loom` model checks for `adabt-engine`, which does not yet compile with the
   feature (loom's `Arc` meets std's at crate boundaries).
 - Writes and DDL through SQL.

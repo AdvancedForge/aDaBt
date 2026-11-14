@@ -11,9 +11,16 @@
 //! everything else. Once the derived-representation cache removed the index
 //! rebuild, this became the whole of the remaining cost.
 //!
-//! Like [`crate::derived`], nothing here is authoritative and every failure to
-//! read is reported as "no cache". A directory that cannot be loaded costs a
-//! scan, which is exactly what opening without this file costs.
+//! Like [`crate::derived`], every failure to read is reported as "no cache",
+//! and for ordinary recovery a directory that cannot be loaded costs a scan,
+//! which is exactly what opening without this file costs.
+//!
+//! The one exception is a base image ([`crate::base_image`]), which a
+//! point-in-time restore starts from. There the snapshot is part of the state
+//! rather than a shortcut to it: a heap file at a checkpoint can still hold the
+//! slots of records deleted or overwritten before it, which a page scan cannot
+//! tell from live ones. A restore refuses a base image without its snapshot,
+//! and the snapshot is fsynced so that a base image does not outlive it.
 //!
 //! # Why this stamp is different
 //!
@@ -99,7 +106,12 @@ pub fn write(dir: &Path, stamp: &Stamp, snapshot: &Snapshot) -> Result<()> {
     body.extend_from_slice(&sum.to_le_bytes());
 
     let tmp = dir.join("directory.adabt.tmp");
-    std::fs::write(&tmp, &body)?;
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&body)?;
+        f.sync_all()?;
+    }
     std::fs::rename(&tmp, path(dir))?;
     Ok(())
 }

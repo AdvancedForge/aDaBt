@@ -101,6 +101,11 @@ impl HeapStore {
 
     /// Flush every dirty page, fsync, and record the point replay may start from.
     pub fn checkpoint(&mut self) -> Result<()> {
+        self.checkpoint_at().map(|_| ())
+    }
+
+    /// [`Self::checkpoint`], returning the LSN the heap file now reflects.
+    fn checkpoint_at(&mut self) -> Result<Lsn> {
         self.pool.checkpoint()?;
         // Ordering matters: the pages must be on disk before the log claims they
         // are, or a crash between the two would skip replaying live changes.
@@ -116,10 +121,14 @@ impl HeapStore {
         // Written after the log entry, so its stamp names the checkpoint it
         // belongs to. A failure here is not a failure of the checkpoint — the
         // database is durable either way and a missing cache costs a scan — so
-        // the stale file is removed rather than the error propagated.
+        // the stale file is removed rather than the error propagated. All it
+        // costs beyond a scan is this checkpoint's standing as a base image,
+        // which needs the snapshot (see below).
         let flushed_lsn = flushed;
         let stamp = self.directory_stamp(flushed);
-        if crate::directory::write(&self.dir, &stamp, &self.directory_snapshot()).is_err() {
+        let directory_written =
+            crate::directory::write(&self.dir, &stamp, &self.directory_snapshot()).is_ok();
+        if !directory_written {
             crate::directory::discard(&self.dir);
         }
         // The catalog, unlike the directory, is authoritative: a failure to
@@ -140,19 +149,37 @@ impl HeapStore {
         // has lost its beginning.
         let catalog = self.catalog_snapshot(flushed.0);
         crate::metadata::write(&self.dir, self.identity, &catalog)?;
-        Ok(())
+
+        // Last of all: the heap file is now exactly what this checkpoint left,
+        // and everything that describes it is durable. Until the heap file
+        // next changes, this directory is a valid starting point for a restore
+        // to any later target its log reaches. Without its directory snapshot
+        // it is not one, and any marker an earlier checkpoint left must go too:
+        // it would name a snapshot that has just been replaced.
+        if directory_written {
+            crate::base_image::write(&self.dir, self.identity, flushed)?;
+            self.pool.guard_base_image(self.dir.clone());
+        } else {
+            crate::base_image::discard(&self.dir)?;
+        }
+        Ok(flushed)
     }
 
     /// Make `dest` a complete, independently openable copy of this database as
     /// of a fresh checkpoint.
     ///
-    /// Only the files a restart itself depends on are copied — the heap, the
-    /// log, the superblock, the catalog. `directory.adabt` and
-    /// `derived.adabt` are not: they are caches (see their own modules), a
-    /// restored database rebuilds them exactly as any other reopen would if
-    /// they turned out to be missing or stale, and starting a restore from
-    /// cache entries stamped against a checkpoint that may not even be
-    /// `dest`'s most recent has no advantage over just not copying them.
+    /// The files a restart depends on are copied — the heap, the log, the
+    /// superblock, the catalog — and the page directory as of the checkpoint
+    /// is written fresh from memory. `derived.adabt` is not copied: it is a
+    /// cache of the engine's derived structures, which a restored database
+    /// rebuilds exactly as any other reopen would.
+    ///
+    /// The page directory is not optional here, although ordinary recovery
+    /// treats it as a cache. A checkpointed heap can still hold the slots of
+    /// records deleted or overwritten before the checkpoint — version
+    /// reclamation is lazy — and a directory rebuilt by scanning pages would
+    /// bring them back. The snapshot names the one live location of each
+    /// record, so a backup without it is not a faithful copy.
     ///
     /// Checkpointing first is what makes the copy meaningful: without it,
     /// `dest` would need every log segment back to the last one, rather than
@@ -162,13 +189,21 @@ impl HeapStore {
     /// what keeps the two facts — "the log copied" and "the state the log
     /// starts from" — from being able to drift apart.
     ///
+    /// The copy is a *base image* as of that checkpoint ([`crate::base_image`]),
+    /// and records itself as one: the starting point for a point-in-time
+    /// restore to any later target, given the log from there on. That claim
+    /// rests on nothing being able to reach the heap file between the
+    /// checkpoint and the copy. The checkpoint leaves no dirty page in the
+    /// pool, and `&mut self` is held from the checkpoint until the last byte
+    /// is copied, so no write — and so no eviction — can run in between.
+    ///
     /// Refuses if `dest` already exists and is non-empty, exactly as
     /// `restore_from` does — a backup target is not a thing this library
     /// unilaterally clears out from under a caller who typo'd a path;
     /// deleting whatever was already there is the caller's decision to make
     /// explicitly, not this function's to make for them.
     pub fn backup_to(&mut self, dest: &Path) -> Result<()> {
-        self.checkpoint()?;
+        let base = self.checkpoint_at()?;
         std::fs::create_dir_all(dest)?;
         if std::fs::read_dir(dest)?.next().is_some() {
             return Err(Error::InvalidRestore(format!(
@@ -186,7 +221,15 @@ impl HeapStore {
             crate::metadata::path(&self.dir),
             crate::metadata::path(dest),
         )?;
-        Ok(())
+        // Both written for the copy rather than copied from the source: they
+        // state what this function just guaranteed about `dest`, not whatever
+        // the source's own files happen to say — the checkpoint's directory
+        // write is allowed to fail, and this one is not. The stamp is the
+        // source's, which is `dest`'s too: same identity, same checkpoint,
+        // same heap file.
+        let stamp = self.directory_stamp(base);
+        crate::directory::write(dest, &stamp, &self.directory_snapshot())?;
+        crate::base_image::write(dest, self.identity, base)
     }
 
     /// Reconstruct a database directory from a backup made by `backup_to`.
@@ -196,9 +239,15 @@ impl HeapStore {
     /// worse: overwriting a live database's files with a backup's is exactly
     /// the kind of destructive action this library never takes without the
     /// caller asking for it by name. Once this returns, `dest` opens exactly
-    /// as `src` would, including through `open_at` with a `RecoverTarget::Lsn`
-    /// short of `src`'s own history — restoring copies bytes; it does not
-    /// decide how much of them a later open replays.
+    /// as `src` would — restoring copies bytes; it does not decide how much of
+    /// them a later open replays.
+    ///
+    /// This is the first step of a point-in-time restore. `dest` is a base
+    /// image as of the backup's checkpoint, so `open_at` can bring it to any
+    /// later target whose log it holds: copy the archived segments (and, for a
+    /// target past the last archived one, the source's current `wal/`
+    /// segments) into `dest/wal/` first. See [`super::RecoverTarget`] for
+    /// what `open_at` checks before it replays anything.
     pub fn restore_from(src: &Path, dest: &Path) -> Result<()> {
         if !crate::superblock::path(src).exists() {
             return Err(Error::InvalidRestore(format!(

@@ -49,6 +49,19 @@ impl Database {
     /// Open a database, replaying the log only up to `target` — a
     /// point-in-time restore. See [`adabt_storage::heap::RecoverTarget`].
     ///
+    /// `dir` must hold a base image: in practice, a backup restored with
+    /// [`Database::restore_from`], with the archived log segments that reach
+    /// `target` copied into its `wal/` directory. A live directory whose heap
+    /// file has changed since its last checkpoint is refused with
+    /// `InvalidRestore` — pages written after `target` may already be in it —
+    /// as are a target before the base image (`RestoreTargetUnreachable`) and
+    /// a log with a gap before `target` (`InvalidRestore`). A refusal leaves
+    /// `dir` as it was.
+    ///
+    /// On success `dir` *is* the restored database: its log ends at `target`,
+    /// and what followed is moved to `dir/superseded-log/` rather than
+    /// replayed by the next open or deleted.
+    ///
     /// Everything past the store itself — indexes, materialized views, the
     /// unique-constraint sidecar — is loaded exactly as `open_shared` loads
     /// it, because there is nothing target-specific left to decide once the

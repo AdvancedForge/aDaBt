@@ -1,5 +1,14 @@
 //! Rebuilding in-memory state on open: adopt the persisted catalog, load or
 //! rebuild the page directory, then replay the log over it.
+//!
+//! Crash recovery and a point-in-time restore run the same passes and differ
+//! in one input: the LSN the heap file is taken to reflect, which replay
+//! starts after. Crash recovery takes the last checkpoint and replays to the
+//! end of the log. A restore takes the heap's base image and replays only to
+//! its target, which is sound only because a base image holds nothing after
+//! its LSN — see [`crate::base_image`] for why a heap the buffer pool has
+//! written to since cannot be restored from, and `restore_base` for what is
+//! checked before a restore replays anything.
 
 use adabt_core::error::{Error, Result};
 use adabt_core::ids::{CollectionId, Lsn, RecordId, TxnId};
@@ -20,25 +29,54 @@ impl HeapStore {
         let entries = self.read_log(from_lsn)?;
         let entries = &entries[..];
 
+        // The checkpoint the heap file is known to reflect, which replay starts
+        // after. For crash recovery that is the last checkpoint: the heap holds
+        // at least everything up to it, possibly more, and replaying to the end
+        // of the log corrects the "more". A restore stops short of the end and
+        // so cannot correct it; it starts from a heap holding exactly the state
+        // at a known checkpoint, and nothing later. `None` — never
+        // checkpointed — means the heap may hold anything and only the log
+        // knows what.
+        //
+        // A base image outranks the log's last checkpoint even when replaying
+        // to the end. In a live directory the two agree. In a restored backup
+        // handed later log they do not: that log records the source's later
+        // checkpoints, whose pages this heap file never received.
+        let heap_lsn = match self.recover_target {
+            RecoverTarget::Latest => self.base_image(from_lsn).or(last_checkpoint(entries)),
+            RecoverTarget::Lsn(target) => {
+                let base = self.restore_base(entries, from_lsn, target)?;
+                self.end_log_at(target)?;
+                Some(base)
+            }
+        };
+
         // Pass 1: collection definitions, for whatever the catalog did not
         // already cover. The page scan below cannot interpret a stored record
         // without knowing its schema.
         self.replay_definitions(entries, from_lsn)?;
 
-        // Pass 2: the page directory and free-space map, as of the last
-        // checkpoint. Loaded from the cache when one describes that exact
-        // checkpoint, and rebuilt by reading every page when it does not.
+        // Pass 2: the page directory and free-space map, as of `heap_lsn`.
+        // Loaded from the snapshot when one describes that exact checkpoint,
+        // and otherwise — crash recovery only — rebuilt by reading every page.
         //
-        // Both produce the same directory. The scan is the definition and the
-        // cache is an optimization of it, which is why a cache that cannot be
-        // trusted for any reason costs a scan rather than an error.
-        let flushed_lsn = last_checkpoint(entries);
-        if !self.load_directory(flushed_lsn)? {
+        // A restore never scans. A scan cannot tell a live record's slot from
+        // one that was deleted or overwritten before the checkpoint and not yet
+        // reclaimed, and `restore_base` has already established that the
+        // snapshot is there.
+        let loaded = match heap_lsn {
+            Some(lsn) => self.load_directory(lsn)?,
+            None => false,
+        };
+        if !loaded {
+            if let (RecoverTarget::Lsn(target), Some(base)) = (self.recover_target, heap_lsn) {
+                return Err(self.no_directory_snapshot(target, base));
+            }
             self.scan_pages()?;
         }
 
         // Pass 3: replay everything the heap file might not yet contain.
-        self.replay_records(entries, flushed_lsn)?;
+        self.replay_records(entries, heap_lsn.unwrap_or(Lsn(0)))?;
 
         // Pass 4: schema migrations that reached their commit entry, in log
         // order. Deferred to here because an adoption hands over records, and
@@ -92,6 +130,121 @@ impl HeapStore {
                     earliest: from_lsn,
                 });
             }
+        }
+        Ok(())
+    }
+
+    /// The base image a restore to `target` starts from, once it is shown to
+    /// be one this log can bring to `target`.
+    ///
+    /// Four things must hold, and each is checked here, before recovery has
+    /// written anything:
+    ///
+    /// 1. The heap file is a base image ([`crate::base_image`]) at least as
+    ///    new as the catalog. Without that, pages written after `target` may
+    ///    be in the heap file, and replay cannot take them back out.
+    /// 2. The base image's directory snapshot is there. Without it the heap
+    ///    file cannot be read faithfully (see `crate::base_image`).
+    /// 3. The base image is at or before `target`. Replay only runs forward.
+    /// 4. The log holds every entry from the base image to `target`. Replay
+    ///    skips nothing it is not given, so a missing segment would otherwise
+    ///    produce a state that never existed, under the target's name.
+    fn restore_base(&self, entries: &[WalEntry], from_lsn: u64, target: Lsn) -> Result<Lsn> {
+        let Some(base) = self.base_image(from_lsn) else {
+            return Err(Error::InvalidRestore(format!(
+                "cannot restore {} to lsn {}: its heap file is not a base image. Pages \
+                 written since its last checkpoint may already be in it, and replaying \
+                 the log cannot take later writes back out. Restore a backup taken at or \
+                 before the target (`restore_from`), add the archived log segments that \
+                 cover the target to its wal directory, and open that directory at the \
+                 target instead",
+                self.dir.display(),
+                target.0
+            )));
+        };
+        if crate::directory::read(&self.dir, &self.directory_stamp(base)).is_none() {
+            return Err(self.no_directory_snapshot(target, base));
+        }
+        if target < base {
+            return Err(Error::RestoreTargetUnreachable {
+                requested: target.0,
+                earliest: base.0,
+            });
+        }
+        // `entries` is already cut at `target`, so the log reaches it exactly
+        // when the entries after the base run on from it without a gap and end
+        // at it.
+        let mut reached = base.0;
+        for e in entries.iter().filter(|e| e.lsn > base) {
+            if e.lsn.0 != reached + 1 {
+                return Err(Error::InvalidRestore(format!(
+                    "cannot restore {} to lsn {}: the log is missing lsns {}..={} after the \
+                     base image at lsn {}. Add the log segments that hold them — from the \
+                     log archive, or the source database's wal directory — and try again",
+                    self.dir.display(),
+                    target.0,
+                    reached + 1,
+                    e.lsn.0 - 1,
+                    base.0
+                )));
+            }
+            reached = e.lsn.0;
+        }
+        if reached < target.0 {
+            return Err(Error::InvalidRestore(format!(
+                "cannot restore {} to lsn {}: the log ends at lsn {}. Add the log segments \
+                 that reach the target — from the log archive, or the source database's \
+                 wal directory — and try again",
+                self.dir.display(),
+                target.0,
+                reached
+            )));
+        }
+        Ok(base)
+    }
+
+    /// The LSN this directory's heap file is a base image as of, if it is one
+    /// recovery can start from: at least as new as the catalog it adopted,
+    /// since replay never revisits what the catalog already reflects.
+    fn base_image(&self, from_lsn: u64) -> Option<Lsn> {
+        crate::base_image::read(&self.dir, self.identity).filter(|base| base.0 >= from_lsn)
+    }
+
+    /// The refusal for a base image whose directory snapshot is missing.
+    fn no_directory_snapshot(&self, target: Lsn, base: Lsn) -> Error {
+        Error::InvalidRestore(format!(
+            "cannot restore {} to lsn {}: the page directory recorded with its base image \
+             at lsn {} is missing or damaged, and the heap file cannot be read faithfully \
+             without it. Restore the backup again",
+            self.dir.display(),
+            target.0,
+            base.0
+        ))
+    }
+
+    /// Make `target` the end of this directory's log, setting aside what
+    /// follows it.
+    ///
+    /// The entries after a restore target are a history the restored database
+    /// did not have. Left in place, the next ordinary open would replay them,
+    /// and the database's own next writes would be interleaved with them. They
+    /// go to a fresh directory under `superseded-log/`, never deleted.
+    ///
+    /// The derived-structure cache may describe a checkpoint among those
+    /// set-aside entries; it goes too, and rebuilds as after any other loss.
+    /// The directory snapshot stays: `restore_base` has just established that
+    /// it describes the base image, which precedes the target.
+    fn end_log_at(&mut self, target: Lsn) -> Result<()> {
+        let parent = self.dir.join("superseded-log");
+        let mut aside = parent.join(format!("after-{:016}", target.0));
+        let mut n = 1;
+        while aside.exists() {
+            n += 1;
+            aside = parent.join(format!("after-{:016}-{n}", target.0));
+        }
+        if self.wal.rewind_to(target, &aside)? {
+            crate::sync_dir(&self.dir)?;
+            crate::derived::discard(&self.dir);
         }
         Ok(())
     }
@@ -299,11 +452,6 @@ impl HeapStore {
 
     /// Load the directory as of the last checkpoint. Returns whether it worked.
     fn load_directory(&mut self, flushed_lsn: Lsn) -> Result<bool> {
-        // A database that has never checkpointed has nothing to load: the heap
-        // may hold anything and only the log knows what.
-        if flushed_lsn.0 == 0 {
-            return Ok(false);
-        }
         let stamp = self.directory_stamp(flushed_lsn);
         let Some(snapshot) = crate::directory::read(&self.dir, &stamp) else {
             return Ok(false);
@@ -370,16 +518,12 @@ impl HeapStore {
     }
 }
 
-/// The flushed LSN named by the last checkpoint in `entries`, or zero.
-fn last_checkpoint(entries: &[WalEntry]) -> Lsn {
-    entries
-        .iter()
-        .rev()
-        .find_map(|e| match e.op {
-            WalOp::Checkpoint { flushed_lsn } => Some(flushed_lsn),
-            _ => None,
-        })
-        .unwrap_or(Lsn(0))
+/// The flushed LSN named by the last checkpoint in `entries`, if any.
+fn last_checkpoint(entries: &[WalEntry]) -> Option<Lsn> {
+    entries.iter().rev().find_map(|e| match e.op {
+        WalOp::Checkpoint { flushed_lsn } => Some(flushed_lsn),
+        _ => None,
+    })
 }
 
 /// Refuse to apply a transaction unless the log holds every one of its frames.

@@ -380,9 +380,12 @@ fn a_log_written_before_transactional_frames_replays_unchanged() {
 #[test]
 fn a_restore_target_inside_a_transaction_excludes_all_of_it() {
     let t = Tmp::new("pitr");
+    let backup = Tmp::new("pitr-backup");
     let mut h = HeapStore::open(t.path(), Durability::Strict, 64).unwrap();
     h.create_collection("c", Schema::dynamic()).unwrap();
     h.insert("c", RecordId(0), rec(0, "old")).unwrap();
+    // The base every restore below starts from.
+    h.backup_to(backup.path()).unwrap();
     let writes = (1..6u64)
         .map(|i| TxnWrite::Put {
             collection: "c".into(),
@@ -401,16 +404,29 @@ fn a_restore_target_inside_a_transaction_excludes_all_of_it() {
         .position(|e| matches!(e.op, WalOp::Commit { .. }))
         .unwrap();
 
-    // Every target from the group's first frame to the one before its commit
-    // record restores the state before the transaction.
-    for target in &entries[first..commit] {
-        let mut r = HeapStore::open_at(
-            t.path(),
+    // Each target is restored from the backup into its own directory, given
+    // the live log: a restore ends the log it restored at its target.
+    let restore = |target: &WalEntry| {
+        let copy = Tmp::new(&format!("pitr-{}", target.lsn.0));
+        HeapStore::restore_from(backup.path(), copy.path()).unwrap();
+        copy_dir(
+            &HeapStore::wal_path(t.path()),
+            &HeapStore::wal_path(copy.path()),
+        );
+        let r = HeapStore::open_at(
+            copy.path(),
             Durability::Strict,
             64,
             RecoverTarget::Lsn(target.lsn),
         )
         .unwrap();
+        (copy, r)
+    };
+
+    // Every target from the group's first frame to the one before its commit
+    // record restores the state before the transaction.
+    for target in &entries[first..commit] {
+        let (_copy, mut r) = restore(target);
         assert_eq!(
             state(&mut r),
             vec![(RecordId(0), rec(0, "old"))],
@@ -419,13 +435,7 @@ fn a_restore_target_inside_a_transaction_excludes_all_of_it() {
         );
     }
     // The commit record itself is the moment the whole transaction appears.
-    let mut r = HeapStore::open_at(
-        t.path(),
-        Durability::Strict,
-        64,
-        RecoverTarget::Lsn(entries[commit].lsn),
-    )
-    .unwrap();
+    let (_copy, mut r) = restore(&entries[commit]);
     assert_eq!(r.count("c").unwrap(), 6);
     assert_eq!(r.get("c", RecordId(9)).unwrap(), None);
 }

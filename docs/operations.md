@@ -40,12 +40,32 @@ Per-core: `SetThreadPerCore(true)` (level 9) pins `broadcast` workers via `core_
 ## Checkpoints, backup, PITR
 
 ```rust
-db.checkpoint()? // pages fsynced, WAL Checkpoint, directory + catalog fsynced, discard below flushed_lsn
-db.backup_to("/tmp/bak")? // checkpoint + copy heap/wal/superblock/catalog
-Database::restore_from("/tmp/bak", "/tmp/restored")?
-db.set_log_archive(Some("/var/log/adabt"))? // keep segments for open_at
-Database::open_at(dir, policy, RecoverTarget::Lsn(lsn))?
+db.checkpoint()? // pages fsynced, WAL Checkpoint, directory + catalog fsynced, discard below flushed_lsn, base.adabt
+db.backup_to("/backups/mon")? // checkpoint + copy heap/wal/superblock/catalog, write directory + base.adabt
+Database::restore_from("/backups/mon", "/srv/restored")? // plain copy; `open` it to get the backup's state
 ```
+
+### Point-in-time recovery
+
+PITR restores a **base image** taken at or before the target and replays the log forward to the target. A base image is a heap file exactly as a checkpoint left it, plus that checkpoint's page directory; `base.adabt` records that a directory holds one, and the first write to the heap file after the checkpoint removes it. Backups are base images. A live data directory usually is not: the buffer pool writes dirty pages to the heap file whenever it needs room, so pages written after any earlier target may already be there, and replay cannot take them back out.
+
+1. **Before you need it**, on the running database: `db.set_log_archive(Some(archive_dir))`, then `db.backup_to(backup_dir)` on a schedule. Checkpoints move the segments they no longer need into the archive instead of deleting them; a restore needs every segment from its backup to its target.
+2. **Restore the newest backup taken before the target** into an empty directory: `Database::restore_from(backup_dir, dest)`.
+3. **Supply the log.** Copy every segment file (`seg-*.adabt`) from the archive into `dest/wal/`, replacing same-named files; if the target is later than the last archived segment, then also copy the source's current `wal/` segments the same way.
+4. **Find the target.** By time: `Database::lsn_at_or_before(dest, nanos)`; or an LSN read from the log.
+5. **Open at the target:** `Database::open_at(dest, policy, RecoverTarget::Lsn(lsn))`. The result is exactly the committed state as of that entry. A transaction whose commit record comes after the target is excluded completely.
+6. **Carry on with `dest` as the database.** `open_at` ends `dest`'s log at the target. Entries after it move to `dest/superseded-log/after-<lsn>/` and are kept there, not replayed and not deleted. Give the restored database **its own archive directory**: it continues its log at target + 1, so its segment names collide with the source's.
+
+`open_at` checks everything before it writes anything, so if it refuses, `dest` is left unchanged:
+
+| Refusal | Cause | Fix |
+|---|---|---|
+| `InvalidRestore`: not a base image | `dest` is a live directory whose heap file changed after its last checkpoint (or `base.adabt` is missing) | Restore a backup (step 2) |
+| `RestoreTargetUnreachable` | The target is before the base image's checkpoint | Use an older backup |
+| `InvalidRestore`: log missing lsns / log ends at | A segment between the backup and the target was not supplied | Copy the missing segments (step 3) |
+| `InvalidRestore`: page directory missing | `directory.adabt` was removed from the restored directory or damaged | Restore the backup again |
+
+If `open_at` fails or is interrupted partway through replay, restore the backup again. Replay may already have written pages to `dest`'s heap file, and then `dest` is no longer a base image. Running `open_at` straight after a checkpoint on a live directory works only if nothing has written to the heap file since, so do not rely on it.
 
 Catalog v4 (`delta_encoding`/`thread_per_core`) is authoritative; loss rebuilds from WAL if log is complete, otherwise `Corruption` with `log_start_lsn`.
 

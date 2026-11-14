@@ -725,6 +725,101 @@ impl Wal {
         Ok(removable)
     }
 
+    /// Make `last` the end of the log, moving every entry after it into
+    /// `aside`. Returns whether there was anything after it.
+    ///
+    /// What a point-in-time restore does to the log it restored from: the
+    /// entries past the target describe a history the restored database did not
+    /// have, and left in place they would be replayed by the next open and
+    /// interleaved with whatever the restored database writes next. They are
+    /// moved rather than deleted — they are somebody's history, and deleting
+    /// them is not this function's decision to make.
+    ///
+    /// Whole segments after `last` go first, newest first, so the log is a
+    /// prefix of itself at every step; the segment holding `last` is then
+    /// copied aside whole and cut back to end at it. A crash part-way leaves a
+    /// log that ends somewhere at or after `last`, with everything removed from
+    /// it already safe in `aside`.
+    pub fn rewind_to(&mut self, last: Lsn, aside: &Path) -> Result<bool> {
+        self.writer.flush()?;
+        let mut moved = false;
+        while self.segments.last().is_some_and(|s| s.first_lsn > last.0) {
+            let seg = self.segments.pop().expect("checked non-empty");
+            Self::set_aside(&seg.path, aside, |from, to| std::fs::rename(from, to))?;
+            moved = true;
+        }
+        if let Some(seg) = self.segments.last() {
+            let keep = Self::prefix_len_through(&seg.path, last)?;
+            if keep < std::fs::metadata(&seg.path)?.len() {
+                Self::set_aside(&seg.path, aside, |from, to| {
+                    std::fs::copy(from, to).map(|_| ())
+                })?;
+                let f = OpenOptions::new().write(true).open(&seg.path)?;
+                f.set_len(keep)?;
+                f.sync_all()?;
+                moved = true;
+            }
+        }
+        if !moved {
+            return Ok(false);
+        }
+        // The set-aside entries must not depend on directory entries a crash
+        // could still lose: `aside` names the segments, its parent names it.
+        crate::sync_dir(aside)?;
+        if let Some(parent) = aside.parent() {
+            crate::sync_dir(parent)?;
+        }
+        if self.segments.is_empty() {
+            // Everything from `last + 1` on was in segments that have just
+            // gone. The next entry must still be `last + 1` — the catalog and
+            // the heap are positioned against it — not the `1` an empty log
+            // directory would otherwise start from.
+            Self::create_segment(&self.dir, last.0 + 1)?;
+        }
+        crate::sync_dir(&self.dir)?;
+
+        let reopened = Self::open(&self.dir, self.durability)?;
+        let archive = self.archive.take();
+        let (segment_bytes, group_size) = (self.segment_bytes, self.group_size);
+        *self = reopened;
+        self.archive = archive;
+        self.segment_bytes = segment_bytes;
+        self.group_size = group_size;
+        Ok(true)
+    }
+
+    /// Put a copy of `segment` in `aside`, by `transfer`, under its own name.
+    fn set_aside(
+        segment: &Path,
+        aside: &Path,
+        transfer: impl Fn(&Path, &Path) -> std::io::Result<()>,
+    ) -> Result<()> {
+        std::fs::create_dir_all(aside)?;
+        let to = aside.join(segment.file_name().unwrap_or_default());
+        transfer(segment, &to)?;
+        Ok(())
+    }
+
+    /// Bytes of `path` up to and including the entry at `last`: the header
+    /// plus every intact frame whose LSN is at most `last`.
+    fn prefix_len_through(path: &Path, last: Lsn) -> Result<u64> {
+        let intact = Self::intact_prefix_len(path)? as usize;
+        let whole = std::fs::read(path)?;
+        let mut pos = SEGMENT_HEADER.min(intact);
+        // Every frame below `intact` has already been checked whole, so this
+        // only has to read each one's length and LSN: a frame is
+        // `len | checksum | payload`, and a payload begins with its LSN.
+        while pos + 16 <= intact {
+            let len = u32::from_le_bytes(whole[pos..pos + 4].try_into().expect("4 bytes"));
+            let lsn = u64::from_le_bytes(whole[pos + 8..pos + 16].try_into().expect("8 bytes"));
+            if lsn > last.0 {
+                break;
+            }
+            pos += 8 + len as usize;
+        }
+        Ok(pos as u64)
+    }
+
     /// Append an operation and return the LSN assigned to it.
     pub fn append(&mut self, txn: TxnId, op: WalOp) -> Result<Lsn> {
         let lsn = Lsn(self.next_lsn);
