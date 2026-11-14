@@ -195,15 +195,14 @@ impl AdaptiveDriver {
         self.cycles
     }
 
-    /// What the model has learned, for the decision log.
     /// Start with priors already corrected by earlier measurement.
     ///
     /// A driver that forgets everything it measured whenever the process
     /// restarts relearns the same corrections from scratch, and relearning is
     /// not free: it costs another round of applying changes that were already
-    /// known not to work. Persisting the model is later work; this is the seam
-    /// it needs, and it is what lets a test state "given this has been measured
-    /// N times" without simulating N cycles.
+    /// known not to work. Nothing persists the model yet; this is the seam that
+    /// persistence would plug into, and it is what lets a test state "given
+    /// this has been measured N times" without simulating N cycles.
     pub fn with_model(model: CostModel) -> Self {
         Self {
             model,
@@ -211,6 +210,7 @@ impl AdaptiveDriver {
         }
     }
 
+    /// What the model has learned, for the decision log.
     pub fn model(&self) -> &CostModel {
         &self.model
     }

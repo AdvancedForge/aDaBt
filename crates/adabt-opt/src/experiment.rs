@@ -10,8 +10,8 @@
 //! so advancing on a timer is safe and advancing too eagerly merely returns
 //! `Inconclusive` until the samples arrive.
 //!
-//! One rule here is not a stub and never will be: **any result divergence
-//! aborts the experiment.** Not "if it exceeds a threshold" — any. The
+//! One rule here is absolute: **any result divergence aborts the
+//! experiment.** Not "if it exceeds a threshold" — any. The
 //! rebuildability invariant means a derived representation disagreeing with the
 //! primary is always a bug, never a reconcilable difference, so tolerating even
 //! one would be tolerating silent corruption.

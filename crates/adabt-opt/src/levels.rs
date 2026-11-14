@@ -51,7 +51,6 @@ const fn entry(optimization: &'static str, params: &'static [(&'static str, i64)
 /// Cumulative preset for a level: everything this level and every lower level
 /// enables.
 ///
-/// Only optimizations that actually exist appear here. Page compression,
 /// A level names only what the engine actually does. Listing an unimplemented
 /// optimization would make a level claim something it does not deliver, and the
 /// benchmark matrix would then read "no improvement" where the truth is "not

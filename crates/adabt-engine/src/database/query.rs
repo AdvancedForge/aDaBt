@@ -191,9 +191,9 @@ impl Database {
     /// into the ordinary single-collection machinery, which requires that
     /// neither side contain a join of its own. Real multi-way join planning —
     /// choosing an execution order among the n! orderings of an n-way join —
-    /// is a cost-based search problem this project has no cost model for yet
-    /// outside `adabt-opt`'s representation-choice scoring, which answers a
-    /// different question. One join at a time is what "nested-loop and hash
+    /// is a cost-based search problem neither of this project's cost models
+    /// covers: `adabt_exec::cost` prices single access paths and `adabt-opt`'s
+    /// scoring ranks representations, which are different questions. One join at a time is what "nested-loop and hash
     /// join" in the plan text asks for; ordering among several is real,
     /// separable, future work.
     fn query_join(&mut self, logical: &LogicalPlan) -> Result<Vec<(RecordId, Record)>> {

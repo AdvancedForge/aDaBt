@@ -366,17 +366,16 @@ pub fn fetch_profile(rows: u64, reps: u32) {
 
 /// Is `Record`'s representation the cost, or is value parsing?
 ///
-/// `decode` costs ~250 ns/row and there are two candidates inside it: parsing
-/// bytes into `Value`s, and building the `BTreeMap<String, Value>` that holds
-/// them — which allocates a `String` per field per row and a tree node per
-/// field per row. Item 1 of the roadmap rewrites the second and leaves the
-/// first alone, so it is worth knowing which one it is before rewriting
-/// anything. Guessing this wrong is how the last two optimization attempts
-/// went.
+/// `decode` measured ~250 ns/row when `Record` was a `BTreeMap<String,
+/// Value>`, and there were two candidates inside it: parsing bytes into
+/// `Value`s, and building the map that holds them — which allocates a `String`
+/// per field per row and a tree node per field per row. Rewriting the container
+/// leaves parsing alone, so this measures which one the cost actually is
+/// rather than guessing.
 ///
-/// The comparison is the map against the shape that replaces it — field names
-/// shared from the schema rather than cloned, and a sorted `Vec` rather than a
-/// tree — with identical field names and identical values, so the only
+/// The comparison is the old map against the shape `Record` now has — field
+/// names shared from the schema rather than cloned, and a sorted `Vec` rather
+/// than a tree — with identical field names and identical values, so the only
 /// difference measured is the container.
 pub fn record_repr(rows: u64, reps: u32) {
     use std::collections::BTreeMap;
@@ -392,7 +391,7 @@ pub fn record_repr(rows: u64, reps: u32) {
 
     let n = rows.max(1) * reps as u64;
 
-    // What decode does today: clone the name, insert into a tree.
+    // What decode used to do: clone the name, insert into a tree.
     let t = Instant::now();
     let mut sink = 0usize;
     for _ in 0..n {
@@ -404,7 +403,7 @@ pub fn record_repr(rows: u64, reps: u32) {
     }
     let owned = t.elapsed().as_nanos() as u64 / n;
 
-    // What it would do instead: bump a refcount, push onto one Vec.
+    // What decode does now: bump a refcount, push onto one Vec.
     let t = Instant::now();
     for _ in 0..n {
         let mut v: Vec<(Arc<str>, adabt_core::value::Value)> = Vec::with_capacity(names.len());

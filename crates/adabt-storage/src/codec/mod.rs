@@ -17,8 +17,10 @@
 //!    `Error::Corruption`, not a crash: the whole point of a self-modifying
 //!    physical layer is that it can be wrong, and it must fail legibly when it
 //!    is.
-//! 2. **Every record carries an MVCC header**, reserved now even though nothing
-//!    reads it yet, so snapshot isolation is not a format break later.
+//! 2. **Every record carries a header with a transaction stamp**, reserved and
+//!    always zero: snapshot isolation is built from in-memory version chains
+//!    (`heap::mvcc`), and the bytes are kept so that an on-disk MVCC scheme
+//!    would not be a format break.
 //!
 //! # Layout of this module
 //!

@@ -1,9 +1,9 @@
 //! The differential runner.
 //!
 //! Drives the same operation sequence through two `LogicalStore`
-//! implementations and demands identical outcomes at every step. Once the
-//! engine exists, this is run once per optimization level: identical results at
-//! every level is the mechanised form of "optimization must never change
+//! implementations and demands identical outcomes at every step. Against the
+//! engine it is run once per optimization level: identical results at every
+//! level is the mechanised form of "optimization must never change
 //! logical semantics".
 //!
 //! A divergence report carries the seed and step index, so any failure replays

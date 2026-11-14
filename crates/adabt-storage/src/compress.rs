@@ -1,10 +1,10 @@
-//! Record compression: the first optimization that *reduces* resources.
+//! Record compression: an optimization that *reduces* resources.
 //!
-//! Every optimization built so far spends memory to buy latency. That left a
-//! `resources`-priority policy with nothing to select, which is a third of the
-//! project's premise going untested. This one trades the other way: CPU for
-//! storage, and — because smaller records mean more records per page — for I/O
-//! and buffer-pool residency too.
+//! Most optimizations spend memory to buy latency, and a `resources`-priority
+//! policy with only those to choose from would have nothing to select — a third
+//! of the project's premise going untested. This one trades the other way: CPU
+//! for storage, and — because smaller records mean more records per page — for
+//! I/O and buffer-pool residency too.
 //!
 //! Compression is applied per *record*, not per page. Slots are already
 //! variable-length, so a shorter record simply takes less of one; compressing

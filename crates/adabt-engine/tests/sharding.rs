@@ -515,9 +515,10 @@ fn a_batch_that_fails_on_one_shard_still_commits_the_others() {
 #[test]
 fn a_transaction_on_one_shard_is_invisible_to_a_reader_on_the_same_shard_until_committed() {
     // Transactions operate on one shard's `Database` directly, reached through
-    // `ShardedDatabase::shard`. Cross-shard transactions are out of scope for
-    // this milestone; this exercises the in-scope case: single-shard SI reached
-    // through the sharded wrapper rather than a bare `Database`.
+    // `ShardedDatabase::shard`. A `Transaction` never spans shards (a
+    // cross-shard write-set goes through `commit_coordinated`, tested in
+    // `cross_shard_atomic.rs`); this exercises single-shard SI reached through
+    // the sharded wrapper rather than a bare `Database`.
     let t = Tmp::new("txn-shard");
     let db = ShardedDatabase::open(t.path(), 3, Policy::manual(0)).unwrap();
     db.create_collection("users", schema()).unwrap();
@@ -539,7 +540,7 @@ fn a_transaction_on_one_shard_is_invisible_to_a_reader_on_the_same_shard_until_c
 
 #[test]
 fn shards_share_one_comparable_timestamp_space() {
-    // The groundwork for future cross-shard coordination: two shards' version
+    // The groundwork for any cross-shard reader: two shards' version
     // stamps must come from the same counter, or "when" a write on shard 0
     // happened relative to one on shard 1 is meaningless to ask.
     let t = Tmp::new("shared-clock");

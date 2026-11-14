@@ -1,5 +1,5 @@
 //! Optimization policy: what the user wants, expressed so that both the manual
-//! driver and the future adaptive driver can consume it.
+//! driver and the adaptive driver can consume it.
 //!
 //! Two rules here must never be softened, because the whole safety story of
 //! automatic physical change rests on them:

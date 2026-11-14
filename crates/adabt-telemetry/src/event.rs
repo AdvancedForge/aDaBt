@@ -3,9 +3,8 @@ use adabt_core::ids::RecordId;
 /// A structural hash of a logical plan with literals erased.
 ///
 /// This is the aggregation key for telemetry, the cache key for plans, the unit
-/// of compilation and the trigger for materialization. It is introduced now,
-/// well before the query IR exists, because retrofitting it later would touch
-/// every layer.
+/// of compilation and the trigger for materialization. It lives here, below
+/// the query IR, so that every layer can carry it without depending on the IR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct QueryShape(pub u64);
 

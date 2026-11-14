@@ -869,12 +869,8 @@ mod expression_completeness {
         assert_eq!(rows.len(), 10);
     }
 
-    // Join execution itself — including the "refuses" cases that belong to
-    // this milestone rather than expression evaluation — now has its own
-    // dedicated suite: see `tests/joins.rs`. A single `Join` reaching
-    // `Database::query` was refused outright until joins were implemented,
-    // so the tests asserting refusal moved rather than staying here asserting
-    // something no longer correct.
+    // Join execution itself — including the join shapes that are refused —
+    // has its own dedicated suite: see `tests/joins.rs`.
 }
 
 /// `Database::alter_schema` and `ShardedDatabase::alter_schema`: the public

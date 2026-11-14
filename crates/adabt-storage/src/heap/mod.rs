@@ -15,9 +15,10 @@
 //!
 //! # Recovery order
 //!
-//! Collection definitions are replayed from the whole log first, because the
-//! page scan that rebuilds the directory needs to know which collection each
-//! stored record belongs to. Only then are data operations replayed.
+//! Collection definitions come first — the persisted catalog, then whatever
+//! definitions the log holds past it — because the page scan that rebuilds the
+//! directory needs to know which collection each stored record belongs to.
+//! Only then are data operations replayed.
 //!
 //! # Layout of this module
 //!
@@ -187,10 +188,10 @@ impl HeapStore {
     /// Every shard of a sharded database opens through this with the *same*
     /// tracker, so a `TxnId` stamped by shard 0 and one stamped by shard 1 order
     /// against each other exactly as if they had come from one store. Nothing
-    /// today reads a timestamp across shards, so this changes nothing observable
-    /// yet — but retrofitting it once shards hold real data would mean
-    /// rewriting every timestamp already on disk, and doing it now costs one
-    /// shared `Arc` instead.
+    /// reads a timestamp across shards, so this changes nothing observable;
+    /// it costs one shared `Arc`, and it means a cross-shard reader could
+    /// compare "when" two shards' writes happened without first reconciling
+    /// two clocks.
     pub fn open_shared(
         dir: &Path,
         durability: Durability,

@@ -2,10 +2,10 @@
 //!
 //! Indexes are **derived representations**: everything here is rebuildable from
 //! the primary representation, and nothing in an index is the only copy of
-//! anything. That invariant is why they can live purely in memory at this
-//! milestone without risking data — losing an index costs a rebuild, never a
-//! record — and it is the same invariant that will later make it safe for the
-//! optimizer to create and drop them under a live workload.
+//! anything. That invariant is why they can live in memory without risking
+//! data — losing an index costs a rebuild, never a record — and it is the same
+//! invariant that makes it safe for the optimizer to create and drop them under
+//! a live workload.
 //!
 //! Two kinds, with genuinely different capabilities rather than two names for
 //! the same structure: a hash index answers equality faster and cannot answer

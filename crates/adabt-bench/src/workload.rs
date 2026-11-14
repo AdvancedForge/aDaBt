@@ -63,7 +63,7 @@ impl WorkloadKind {
 pub const COLLECTION: &str = "customers";
 
 /// The schema every workload uses: dense `u64` id, fixed width throughout, so
-/// that `DirectLookup` is legal against it once that optimization exists.
+/// that `DirectLookup` is legal against it.
 pub fn workload_schema() -> Schema {
     Schema::new(
         SchemaMode::Fixed,

@@ -6,8 +6,8 @@
 //!
 //! Only optimizations that are genuinely implemented are registered; anything
 //! named elsewhere but not built goes in `NOT_YET_IMPLEMENTED` (currently
-//! empty), and `Database::apply_action` refuses it rather than quietly
-//! succeeding. An optimization that reports success and does nothing is worse
+//! empty), and the controller rejects a decision naming it as "not registered"
+//! rather than quietly succeeding. An optimization that reports success and does nothing is worse
 //! than a missing one: it makes the benchmark matrix lie.
 //!
 //! The optimizations are grouped by what they change, one family per module:
@@ -149,8 +149,7 @@ mod tests {
     fn every_builtin_registers_and_orders() {
         let mut r = Registry::new();
         register_builtins(&mut r);
-        // Two more than the last revision: clustered_sort, delta_encoding and thread_per_core joined.
-        // Then join_order and data_partitioning joined.
+        // One per name in the module docs' list of families.
         assert_eq!(r.len(), 17);
         assert!(r.dependency_order().is_ok());
         for n in r.names() {
@@ -276,8 +275,10 @@ mod resource_axis_tests {
 
     /// The reason `record_compression` exists.
     ///
-    /// Every other optimization spends resources to buy latency. A policy of
-    /// `resources: 10, speed: 3` would have had nothing at all to select, which
+    /// Nearly every other optimization spends resources to buy latency (the one
+    /// other saver, `freeze_schema`, pays in freedom instead, which a policy may
+    /// forbid). A policy of `resources: 10, speed: 3` would otherwise have had
+    /// little or nothing to select, which
     /// means the three-axis premise was structurally untestable rather than
     /// merely untested.
     #[test]

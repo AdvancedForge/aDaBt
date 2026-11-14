@@ -6,7 +6,7 @@
 //! That indirection is what keeps `adabt-opt` free of any dependency on storage,
 //! indexes or execution — check its `Cargo.toml`, there is nothing physical in
 //! it. The payoff is that the same optimization definitions are usable by the
-//! manual driver and, later, by the adaptive one, against any engine that can
+//! manual driver and by the adaptive one, against any engine that can
 //! interpret an `Action`. It also makes every change trivially inspectable
 //! before it happens, which is what the decision log and dry-run rely on.
 

@@ -57,13 +57,12 @@ use crate::shadow::ShadowReport;
 /// and, worse, moved the baseline those queries were being measured against
 /// while an experiment elsewhere was running. Scoping the mask to the
 /// collection the experiment is actually about is both the fix and the
-/// precondition for ever running two experiments at once.
+/// precondition for running several experiments at once, which
+/// `Database::begin_experiment` allows as long as their scopes do not overlap.
 ///
 /// Every entry is tagged with the id of the experiment that built it.
-/// Without that, retiring one experiment cleared the whole mask and
-/// unmasked another experiment's unproven structure into live traffic —
-/// which is the difference between "concurrency is unimplemented" and
-/// "concurrency is unsafe".
+/// Without that, retiring one experiment would clear the whole mask and
+/// unmask another experiment's unproven structure into live traffic.
 #[derive(Debug, Default, Clone)]
 pub struct Candidates {
     indexes: Vec<(u64, String, String, IndexKind)>,

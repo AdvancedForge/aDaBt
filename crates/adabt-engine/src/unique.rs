@@ -17,9 +17,10 @@
 //! own index; nothing coordinates the check across shards, so two records with
 //! the same value can land on different shards and both be accepted. This is
 //! the same honest limitation `ShardedDatabase::insert_batch` documents for
-//! atomicity, for the same reason: cross-shard coordination is cross-shard
-//! transaction machinery, and that is its own milestone, not a detail of this
-//! one.
+//! atomicity, for a related reason: checking a value across shards needs a
+//! consistent read of every shard at commit time, and the one cross-shard
+//! write path, `ShardedDatabase::commit_coordinated`, makes writes durable
+//! together but reads nothing.
 
 use adabt_core::error::Result;
 use std::collections::BTreeSet;

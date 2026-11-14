@@ -1,8 +1,9 @@
 //! Persisting derived representations across a restart.
 //!
 //! Indexes are rebuildable from the primary, which is why they can be dropped
-//! and recreated at will — and why, until now, every restart rebuilt them by
-//! decoding every record in the heap. The cache removes that cost when it can.
+//! and recreated at will — and why, without a cache, every restart rebuilds
+//! them by decoding every record in the heap. The cache removes that cost when
+//! it can.
 //!
 //! The tests here are almost all about the cases where it *cannot*. A cache that
 //! is merely fast is worth little; a cache that is fast and can be wrong is

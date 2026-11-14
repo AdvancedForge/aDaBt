@@ -1,7 +1,9 @@
 //! Query intermediate representation.
 //!
 //! Pure: no storage, no execution, no engine. Both the planner and the
-//! telemetry layer depend on it, so it must stay free of either.
+//! optimizer depend on it, so it must stay free of either. (Telemetry does
+//! not: it carries its own `QueryShape` newtype, which the engine fills from
+//! this crate's hash.)
 
 pub mod expr;
 pub mod plan;

@@ -19,14 +19,16 @@
 //! *before* voting to commit, so that a crash after voting yes does not lose
 //! them while the coordinator is still deciding.
 //!
-//! There is no coordinator yet. Buffering in memory and committing atomically
-//! is not a shortcut on the way to that design — it is the correct design for
-//! what exists today, and a simpler one: a transaction that never reaches
-//! `commit` leaves no trace in the log to reason about, because it never wrote
-//! one. When cross-shard transactions arrive, a participant will need a durable
-//! "prepared" record before it can vote — a `WalOp::Prepare` variant added
-//! then, not a rewrite of what is here. Adding a WAL opcode is additive; this
-//! module does not need to anticipate it to avoid being broken by it.
+//! Nothing here votes. A `Transaction` lives on one `Database`, and the one
+//! cross-shard path — [`ShardedDatabase::commit_coordinated`](crate::sharded::ShardedDatabase::commit_coordinated)
+//! — journals its whole write-set before applying any of it, so it has no
+//! in-doubt state either. Buffering in memory and applying only at commit is
+//! therefore the correct design, not a shortcut, and a simpler one: a
+//! transaction that never reaches `commit` leaves no trace in the log to
+//! reason about, because it never wrote one. Should a voting protocol ever be
+//! needed, a participant's durable "prepared" record is an additional WAL
+//! opcode, not a rewrite of what is here; this module does not need to
+//! anticipate it to avoid being broken by it.
 //!
 //! # Why atomicity does not need a shared commit timestamp
 //!
@@ -81,8 +83,8 @@
 //! on its own terms. Folding it into transactional semantics would mean
 //! answering what a transaction that creates a collection *and* aborts should
 //! do to a collection other, concurrently-committed transactions may already
-//! be writing into — a real question, and not one this milestone needs to
-//! answer to deliver multi-statement data transactions.
+//! be writing into — a real question, and not one that needs answering to
+//! deliver multi-statement data transactions.
 //!
 //! # What this does not do
 //!
@@ -97,9 +99,16 @@
 //! Reads are recorded either way so the guarantee stays a choice made at the
 //! policy, not a fork in the transaction code path.
 //!
+//! What is recorded is the ids a transaction read, not the predicates it
+//! asked. So `Strict` closes write skew but not predicate phantoms: a scan
+//! that found no matching row does not conflict with a concurrent insert of
+//! one (`tests/serializable.rs` pins that limit).
+//!
 //! And nothing here reaches across shards. A `Transaction` is born from one
-//! `Database` and can only write to it; a transfer between two shards needs a
-//! coordinator neither `Transaction` nor `ShardedDatabase` has.
+//! `Database` and can only write to it. A write-set spanning shards goes
+//! through `ShardedDatabase::commit_coordinated` instead, which guarantees the
+//! writes survive a crash together but takes no snapshot and validates no
+//! reads, so it is not a cross-shard `Transaction`.
 
 use adabt_core::error::{Error, Result};
 use adabt_core::ids::{RecordId, TransactionId};

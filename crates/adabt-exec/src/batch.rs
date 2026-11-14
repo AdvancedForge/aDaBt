@@ -1,7 +1,7 @@
 //! Record batches.
 //!
-//! Operators pass batches, not single rows. The cost is a little complexity
-//! now; the reason is that every later specialisation depends on it. A column
+//! Operators pass batches, not single rows. The cost is a little complexity;
+//! the reason is that the specialisations depend on it. A column
 //! store hands back columns for a whole batch at once, a compiled hot path
 //! amortises its dispatch over a batch, and a vectorised filter evaluates a
 //! predicate across one. A scalar-at-a-time executor would have to be rewritten

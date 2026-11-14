@@ -1,5 +1,6 @@
 //! Optimizations that decide where records sit on pages: clustering by a
-//! range-filtered key, and partitioning hot key ranges onto separate pages.
+//! range-filtered key, and `data_partitioning`, which declares the same
+//! clustering for a range-skewed field (plus a flag nothing else reads).
 
 use adabt_core::policy::GuaranteeRequirements;
 use adabt_opt::action::{Action, ChangePlan};

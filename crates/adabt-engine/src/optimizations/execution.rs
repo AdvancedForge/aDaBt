@@ -1,5 +1,7 @@
 //! Optimizations that change how queries execute rather than how data is
-//! stored: per-core sharding and cardinality-based join ordering.
+//! stored: per-core pinning of a sharded database's scan workers, and
+//! `join_order`, which records a flag the planner does not consult — the
+//! executor's own join algorithm choice does not depend on it.
 
 use adabt_core::policy::GuaranteeRequirements;
 use adabt_opt::action::{Action, ChangePlan};

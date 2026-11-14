@@ -1,10 +1,11 @@
 //! Network server.
 //!
-//! Length-prefixed binary frames over TCP, a thread per connection, and one
-//! engine behind one lock. The engine remains an embedded library first — that
-//! is what keeps the network out of the measurement loop — and this is the seam
-//! where the Level 9 roadmap items land: zero-copy paths, `io_uring`, per-core
-//! accept. None of those exist yet, and [`server`] says plainly what does.
+//! Length-prefixed binary frames over TCP, a thread per connection, and a
+//! sharded engine whose partitions each have their own lock. The engine remains
+//! an embedded library first — that is what keeps the network out of the
+//! measurement loop — and this is the seam where the Level 9 transport items
+//! in the roadmap would go: zero-copy paths, `io_uring`, per-core accept. None
+//! of those exist, and [`server`] says plainly what does.
 //!
 //! The client is here too, deliberately. A protocol with one implementation is
 //! a protocol nobody has checked, and writing the reader against the writer is

@@ -7,9 +7,8 @@
 //! ask for bypasses the machinery the optimizer uses.
 //!
 //! `ManualDriver` (here) turns a level preset into decisions;
-//! `AdaptiveDriver` (`adaptive.rs`) derives them from telemetry. The seam came
-//! first, while the adaptive side was still a stub, so the symmetry was
-//! enforced by structure from the start rather than retrofitted.
+//! `AdaptiveDriver` (`adaptive.rs`) derives them from telemetry. The symmetry
+//! is enforced by the shared trait, not by convention.
 
 use adabt_core::policy::{Mode, Policy};
 use adabt_telemetry::Snapshot;
@@ -51,9 +50,9 @@ pub struct DriverInput<'a> {
     /// weigh at all. It is the same shape as the guarantees filter: not
     /// expensive, invisible.
     ///
-    /// Empty until unique constraints exist. It is here first so that the rule
-    /// is in place before the retraction logic gets more aggressive, rather than
-    /// being remembered afterwards.
+    /// The engine fills it with every unique constraint's backing index. The
+    /// exclusion lives here, in the driver, so it holds however aggressive the
+    /// retraction logic becomes, rather than having to be remembered by it.
     pub pinned: &'a [(&'static str, String)],
     /// `(optimization, scope)` currently being proved by an experiment.
     ///

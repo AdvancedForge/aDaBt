@@ -104,11 +104,10 @@ impl ShardedDatabase {
                 "a sharded database needs at least one shard".into(),
             ));
         }
-        // One clock across every shard, not one per shard. Nothing today reads
-        // a timestamp across shards, so this changes nothing observable yet —
-        // but it is what lets a future cross-shard reader compare "when" two
-        // shards' writes happened at all, and retrofitting it once shards hold
-        // real data would mean rewriting every timestamp already written.
+        // One clock across every shard, not one per shard. Nothing reads a
+        // timestamp across shards, so this changes nothing observable — but it
+        // is what would let a cross-shard reader compare "when" two shards'
+        // writes happened at all, and it costs one shared `Arc`.
         let versions = Arc::new(adabt_storage::version::VersionTracker::new());
         let mut out = Vec::with_capacity(shards);
         for i in 0..shards {
@@ -474,15 +473,15 @@ impl ShardedDatabase {
         // Checked before `pushdown` ever runs, not after: `pushdown` falls
         // back to `other.child().expect(...)` for anything it does not name
         // explicitly, and `LogicalOp::child()` panics outright on a `Join` —
-        // by design, the same design that makes this an actual panic today
-        // rather than a merely-unimplemented path. Two collections are each
-        // partitioned independently by `RecordId % shards`, so a matching
-        // join pair can land on different shards; joining across that split
-        // is real cross-shard execution (broadcast or shuffle), a
-        // substantially larger problem than the single-node join algorithm
-        // `Database::query` now has, and not one this milestone takes on. A
-        // caller wanting a join against sharded data reaches a single
-        // shard's own `Database` directly via `shard()`.
+        // by design, so code that assumes a chain fails loudly rather than
+        // silently reading one side. Two collections are each partitioned
+        // independently by `RecordId % shards`, so a matching join pair can
+        // land on different shards; joining across that split is real
+        // cross-shard execution (broadcast or shuffle), a substantially
+        // larger problem than the single-node join algorithm `Database::query`
+        // has, and not one taken on here. A caller wanting a join against
+        // sharded data reaches a single shard's own `Database` directly via
+        // `shard()`.
         if plan.root.contains_join() {
             return Err(Error::Unsupported(
                 "joins across a sharded database are not implemented yet; query a single shard's Database directly via ShardedDatabase::shard".into(),
@@ -779,9 +778,10 @@ impl ShardedDatabase {
     /// per record — the same saving [`Database::insert_batch`] makes, applied
     /// per partition. Atomicity holds *within* a shard, not across all of them:
     /// a batch spanning several shards can land on some and fail on others,
-    /// because there is no cross-shard transaction to make it indivisible. That
-    /// is a real limitation and not a hidden one — it is the reason cross-shard
-    /// transactions are their own milestone rather than a detail of this one.
+    /// because each shard commits its slice independently. That is a real
+    /// limitation and not a hidden one; a caller who needs the whole set to
+    /// survive together uses [`ShardedDatabase::commit_coordinated`], which
+    /// pays for a journal fsync to get it.
     ///
     /// Returns how many were written before any error, so a partial failure is
     /// visible rather than silently swallowed.

@@ -133,9 +133,9 @@ pub struct WalEntry {
     ///
     /// A log position answers "restore to entry 4,102,993". Only a clock reading
     /// answers "restore to 14:32", which is the question an operator actually
-    /// asks. It is written now, while the framing is being rewritten anyway,
-    /// because adding it once segments have been archived would mean a format
-    /// change reaching into files that are already somebody's backup.
+    /// asks. Every frame carries it, because adding it once segments have been
+    /// archived would mean a format change reaching into files that are
+    /// already somebody's backup.
     ///
     /// Not trusted for ordering — the LSN is the order. A clock that steps
     /// backwards makes point-in-time recovery approximate, never inconsistent.
@@ -417,8 +417,8 @@ pub struct Wal {
     ///
     /// Point-in-time recovery is the reason: a segment below the last checkpoint
     /// is redundant for *restart*, and is exactly what "restore to 14:32" needs.
-    /// The hook is here now so that turning archiving on later is a policy
-    /// change rather than a format change.
+    /// `None` deletes them; setting a directory (`set_log_archive`) is a
+    /// policy change rather than a format change.
     archive: Option<PathBuf>,
     durability: Durability,
     /// Entries appended since the last fsync, for group commit.

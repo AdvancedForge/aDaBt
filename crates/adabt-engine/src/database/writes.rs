@@ -34,6 +34,12 @@ impl Database {
     /// paths so reindexing, epoch bumps and telemetry all happen exactly as
     /// they would for a standalone write.
     ///
+    /// "Or none" holds against every check above, not against a crash: each
+    /// write in the second pass is logged and made durable on its own, and
+    /// there is no commit record, so a process killed partway through leaves
+    /// a prefix of the sorted write-set behind (`tests/commit_window_chaos.rs`
+    /// pins exactly that).
+    ///
     /// Keys are visited in sorted order, which has nothing to do with
     /// correctness and everything to do with reproducibility: `HashMap`
     /// iteration order is not something a test — or a person reading a

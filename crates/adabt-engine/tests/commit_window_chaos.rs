@@ -1,9 +1,9 @@
 //! The commit-window chaos matrix.
 //!
 //! `Database::commit` applies a transaction's writes one frame at a time,
-//! in sorted-key order — there is no atomic commit record yet (the module
-//! docs say plainly what providing one would take). So the honest contract
-//! for a crash *inside* the window is not all-or-nothing; it is this:
+//! in sorted-key order — there is no atomic commit record (`Database::commit`'s
+//! own docs say so). So the honest contract for a crash *inside* the window
+//! is not all-or-nothing; it is this:
 //!
 //! 1. **What survives is exactly a prefix of the sorted write-set** — the
 //!    first k writes, never an interleaving, never a gap. This is what

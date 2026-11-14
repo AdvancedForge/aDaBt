@@ -7,10 +7,9 @@
 //! address = base + id * stride
 //! ```
 //!
-//! This is deliberately built early, far out of level order. It is the extreme
-//! end of the design, and if the optimization framework could not express both
-//! a plan cache and *this* without special-casing, the abstraction would be
-//! wrong — better to find that out now than in year three.
+//! It is the extreme end of the design, and it goes through the same
+//! optimization framework as a plan cache does, with no special-casing; if
+//! the framework could not express both, the abstraction would be wrong.
 //!
 //! It is a **derived** representation. The heap remains authoritative, every
 //! byte here is reconstructible from it, and dropping it costs a rebuild rather

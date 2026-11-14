@@ -96,15 +96,16 @@ pub enum LogicalOp {
         group_by: Vec<String>,
         aggs: Vec<Agg>,
     },
-    /// **Reserved, not implemented.** The planner and executor return
-    /// `Error::Unsupported` for any plan containing one. It exists in the enum
-    /// now — ahead of the join algorithm that will fill it in — because
-    /// widening the IR from a chain to a tree is best done before anything is
-    /// frozen on a wire, and while the widening can be exercised by a small
-    /// number of match arms rather than by every arm the working feature will
-    /// eventually need. The equi-join key is a single field pair for now,
-    /// which every join algorithm this project would build first needs and
-    /// nothing more elaborate has to be threaded through yet.
+    /// An equi-join of two independent inputs, which is what makes the IR a
+    /// tree rather than a chain. The planner plans each side on its own and
+    /// the executor runs an indexed nested-loop join when the right side is a
+    /// bare scan with an index on its join field, and a hash join otherwise.
+    /// `Database::query` accepts at most one `Join` per plan and refuses a
+    /// self-join; a sharded database refuses joins altogether.
+    ///
+    /// The join key is a single field pair, which is all either join
+    /// algorithm needs and keeps anything more elaborate from having to be
+    /// threaded through every match arm.
     Join {
         left: Box<LogicalOp>,
         right: Box<LogicalOp>,

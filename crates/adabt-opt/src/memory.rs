@@ -9,7 +9,7 @@
 //! swings*, rediscovering each time a conclusion it already reached
 //! yesterday. Worse, the experiment loop's own caution makes this expensive
 //! by design: proving a change is safe takes shadow trials and canary
-//! traffic, and none of that work is reusable today.
+//! traffic, and without a memory none of that work is reusable.
 //!
 //! # What a fingerprint is, and what it deliberately is not
 //!

@@ -1,7 +1,7 @@
 //! The listener.
 //!
-//! Length-prefixed frames over TCP, one thread per connection, one engine behind
-//! a mutex.
+//! Length-prefixed frames over TCP, one thread per connection, one sharded
+//! engine shared by all of them.
 //!
 //! # There is no lock around the engine
 //!
@@ -11,11 +11,13 @@
 //! own — a hundred connections are a hundred threads that only queue behind each
 //! other when they want the same partition.
 //!
-//! That is genuine shared-nothing partitioning and not thread-per-core. There is
-//! still no core pinning, no run-to-completion scheduler, no `io_uring` and no
-//! zero-copy path; those are what the Level 9 roadmap means and they are a
-//! different piece of work built on this one. Running with `--shards 1` is the
-//! old behaviour exactly, which is the honest way to measure what the
+//! That is genuine shared-nothing partitioning and not thread-per-core.
+//! Connection threads are never pinned (only the engine's own per-shard scan
+//! workers are, and only when its `thread_per_core` optimization is on), and
+//! there is no run-to-completion scheduler, no `io_uring` and no zero-copy
+//! path; those are the rest of what the Level 9 roadmap means and they are a
+//! different piece of work built on this one. Running with `--shards 1` is one
+//! engine behind one lock, which is the honest way to measure what the
 //! partitioning is worth.
 //!
 //! # Reading a stream

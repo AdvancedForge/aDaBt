@@ -1,24 +1,24 @@
 //! Record versioning, for consistent read snapshots.
 //!
-//! Everything after this milestone needs two representations answering the same
-//! question against the *same state at the same time*. Shadow execution is the
-//! obvious case — comparing a candidate against a baseline is meaningless if
-//! the data moved between the two reads — but so is any consistent scan.
+//! Shadow execution, experiments and transactions all need two representations
+//! — or two reads — answering the same question against the *same state at the
+//! same time*. Comparing a candidate against a baseline is meaningless if the
+//! data moved between the two reads, and so is any scan that is meant to be
+//! consistent.
 //!
-//! Until now reads took `&mut self` and saw whatever the heap held at that
-//! instant. This adds the minimum needed to fix that: every write stamps a
-//! transaction id, superseded versions are retained while a snapshot might need
-//! them, and a reader at snapshot `T` sees the newest version stamped at or
-//! before `T`.
+//! So every write stamps a transaction id, superseded versions are retained
+//! while a snapshot might need them, and a reader at snapshot `T` sees the
+//! newest version stamped at or before `T`.
 //!
 //! # Why not full MVCC
 //!
-//! This is a version *chain per record*, not general multi-version concurrency
-//! control. There is no concurrent writer, no conflict detection, no isolation
-//! level negotiation. What it provides is the one property later milestones
-//! actually need — a stable read view — at a fraction of the cost, and it uses
-//! the `txn` field reserved in the record header from the first on-disk format
-//! precisely so that adding it now is not a format change.
+//! This is a version *chain per record* plus an id counter, not a
+//! concurrency-control protocol: nothing here detects conflicts or negotiates
+//! isolation levels. Transactions build first-committer-wins validation on top
+//! of these stamps in the engine. What this layer provides is the one property
+//! everything above it needs — a stable read view — at a fraction of the cost.
+//! The chains live in memory (`heap::mvcc`); the `txn` field in the on-disk
+//! record header stays reserved and unused.
 
 use adabt_core::ids::TxnId;
 /// Under the loom feature every atomic and thread primitive here is loom's,

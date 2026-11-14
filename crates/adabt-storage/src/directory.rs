@@ -2,9 +2,9 @@
 //!
 //! Opening a database means knowing where every record lives. That map is
 //! derived — it can always be rebuilt by reading every page and looking at the
-//! collection and record ids in each slot prefix — and until now it always was.
-//! Which means opening a database cost a full pass over the heap, whatever else
-//! had or had not changed.
+//! collection and record ids in each slot prefix — but rebuilding it means
+//! opening a database costs a full pass over the heap, whatever else had or had
+//! not changed.
 //!
 //! That pass is measurable and it dominates: on 200,000 records it is 801ms,
 //! against 817ms for rebuilding three indexes and essentially nothing for
@@ -13,7 +13,7 @@
 //!
 //! Like [`crate::derived`], nothing here is authoritative and every failure to
 //! read is reported as "no cache". A directory that cannot be loaded costs a
-//! scan, which is what used to happen every time anyway.
+//! scan, which is exactly what opening without this file costs.
 //!
 //! # Why this stamp is different
 //!
