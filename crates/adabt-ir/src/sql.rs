@@ -292,14 +292,34 @@ fn reserved(w: &str) -> bool {
 /// outside that set is an error naming the construct, never a silent
 /// approximation.
 pub fn parse_select(sql: &str) -> R<LogicalPlan> {
+    let mut p = statement_parser(sql)?;
+    reject_unsupported_statement(&p)?;
+    p.expect_word("select")?;
+    let select_list = parse_select_list(&mut p)?;
+    let root = parse_from(&mut p)?;
+    let root = parse_where(&mut p, root)?;
+    let group_by = parse_group_by(&mut p)?;
+    let root = apply_select_list(root, select_list, group_by)?;
+    let root = parse_order_by(&mut p, root)?;
+    let root = parse_limit(&mut p, root)?;
+    expect_end(&p)?;
+    Ok(LogicalPlan::new(root))
+}
+
+/// Tokenize `sql` into a parser, refusing a statement with no tokens at all.
+fn statement_parser(sql: &str) -> R<Parser> {
     let toks = Lexer::new(sql).tokens()?;
     if toks.is_empty() {
         return Err(SqlError::new("empty statement"));
     }
-    let mut p = Parser { toks, pos: 0 };
+    Ok(Parser { toks, pos: 0 })
+}
 
-    // Reject the statements this front-end deliberately does not implement,
-    // by name, before anything else confuses the error message.
+/// Refuse, by name, the statements this front-end deliberately does not implement.
+///
+/// This runs before anything else so the error names the statement rather
+/// than complaining about a missing `SELECT`.
+fn reject_unsupported_statement(p: &Parser) -> R<()> {
     for kw in [
         "insert", "update", "delete", "create", "drop", "alter", "with",
     ] {
@@ -313,45 +333,67 @@ pub fn parse_select(sql: &str) -> R<LogicalPlan> {
             ));
         }
     }
-    p.expect_word("select")?;
+    Ok(())
+}
 
-    // -- projection / aggregates
-    let mut projection: Vec<String> = Vec::new();
-    let mut aggs: Vec<Agg> = Vec::new();
-    let mut star = false;
+/// Items `item` parses, separated by commas: `a, b, c`. At least one is required.
+fn comma_separated<T>(p: &mut Parser, mut item: impl FnMut(&mut Parser) -> R<T>) -> R<Vec<T>> {
+    let mut items = Vec::new();
     loop {
-        if p.eat_sym('*') {
-            star = true;
-        } else if let Some(agg) = parse_aggregate(&mut p)? {
-            aggs.push(agg);
-        } else {
-            projection.push(p.column()?);
-        }
+        items.push(item(p)?);
         if !p.eat_sym(',') {
-            break;
+            return Ok(items);
         }
     }
+}
 
+/// One entry of a `SELECT` list.
+enum SelectItem {
+    Star,
+    Aggregate(Agg),
+    Column(String),
+}
+
+/// What a `SELECT` list asked for, split by kind.
+#[derive(Default)]
+struct SelectList {
+    columns: Vec<String>,
+    aggs: Vec<Agg>,
+    star: bool,
+}
+
+/// The projection list between `SELECT` and `FROM`: `*`, aggregates and columns.
+fn parse_select_list(p: &mut Parser) -> R<SelectList> {
+    let items = comma_separated(p, parse_select_item)?;
+    let mut list = SelectList::default();
+    for item in items {
+        match item {
+            SelectItem::Star => list.star = true,
+            SelectItem::Aggregate(agg) => list.aggs.push(agg),
+            SelectItem::Column(column) => list.columns.push(column),
+        }
+    }
+    Ok(list)
+}
+
+/// A single `SELECT` list entry: `*`, an aggregate call, or a column.
+fn parse_select_item(p: &mut Parser) -> R<SelectItem> {
+    if p.eat_sym('*') {
+        return Ok(SelectItem::Star);
+    }
+    if let Some(agg) = parse_aggregate(p)? {
+        return Ok(SelectItem::Aggregate(agg));
+    }
+    Ok(SelectItem::Column(p.column()?))
+}
+
+/// `FROM table` followed by at most one join, matching the engine's own limit.
+fn parse_from(p: &mut Parser) -> R<LogicalOp> {
     p.expect_word("from")?;
     let base = p.identifier()?;
     let mut root = LogicalOp::scan(&base);
-
-    // -- join (at most one, matching the engine's own limit)
     let mut joined = false;
-    loop {
-        let kind = if p.eat_word("left") {
-            let _ = p.eat_word("outer");
-            p.expect_word("join")?;
-            Some(JoinKind::Left)
-        } else if p.eat_word("inner") || p.peek_word("join") {
-            // `INNER JOIN` and a bare `JOIN` mean the same thing; the
-            // optional INNER has already been consumed if it was there.
-            p.expect_word("join")?;
-            Some(JoinKind::Inner)
-        } else {
-            None
-        };
-        let Some(kind) = kind else { break };
+    while let Some(kind) = parse_join_kind(p)? {
         if joined {
             return Err(SqlError::at(
                 "only one JOIN per query is supported",
@@ -359,79 +401,114 @@ pub fn parse_select(sql: &str) -> R<LogicalPlan> {
             ));
         }
         joined = true;
-        let right = p.identifier()?;
-        p.expect_word("on")?;
-        let l = p.column()?;
-        p.expect_sym('=')?;
-        let r = p.column()?;
-        // The engine's join takes bare field names per side; a qualified
-        // name in SQL names the same field.
-        let strip = |s: &str| s.rsplit('.').next().unwrap_or(s).to_string();
-        root = root.join(LogicalOp::scan(&right), kind, (strip(&l), strip(&r)));
+        root = parse_join_target(p, root, kind)?;
     }
+    Ok(root)
+}
 
-    // -- where
-    if p.eat_word("where") {
-        let pred = parse_or(&mut p)?;
-        root = root.filter(pred);
+/// The join keyword(s) — `LEFT [OUTER] JOIN`, `INNER JOIN` or `JOIN` — if one is next.
+fn parse_join_kind(p: &mut Parser) -> R<Option<JoinKind>> {
+    if p.eat_word("left") {
+        let _ = p.eat_word("outer");
+        p.expect_word("join")?;
+        Ok(Some(JoinKind::Left))
+    } else if p.eat_word("inner") || p.peek_word("join") {
+        // `INNER JOIN` and a bare `JOIN` mean the same thing; the
+        // optional INNER has already been consumed if it was there.
+        p.expect_word("join")?;
+        Ok(Some(JoinKind::Inner))
+    } else {
+        Ok(None)
     }
+}
 
-    // -- group by
-    let mut group_by: Vec<String> = Vec::new();
-    if p.eat_word("group") {
-        p.expect_word("by")?;
-        loop {
-            group_by.push(p.column()?);
-            if !p.eat_sym(',') {
-                break;
-            }
-        }
+/// `table ON left = right` after the join keyword, joined onto `root`.
+fn parse_join_target(p: &mut Parser, root: LogicalOp, kind: JoinKind) -> R<LogicalOp> {
+    let right = p.identifier()?;
+    p.expect_word("on")?;
+    let l = p.column()?;
+    p.expect_sym('=')?;
+    let r = p.column()?;
+    // The engine's join takes bare field names per side; a qualified
+    // name in SQL names the same field.
+    let strip = |s: &str| s.rsplit('.').next().unwrap_or(s).to_string();
+    Ok(root.join(LogicalOp::scan(&right), kind, (strip(&l), strip(&r))))
+}
+
+/// An optional `WHERE predicate`, applied to `root` as a filter.
+fn parse_where(p: &mut Parser, root: LogicalOp) -> R<LogicalOp> {
+    if !p.eat_word("where") {
+        return Ok(root);
     }
+    Ok(root.filter(parse_or(p)?))
+}
 
-    if !aggs.is_empty() || !group_by.is_empty() {
-        if aggs.is_empty() {
+/// An optional `GROUP BY a, b`; empty when the clause is absent.
+fn parse_group_by(p: &mut Parser) -> R<Vec<String>> {
+    if !p.eat_word("group") {
+        return Ok(Vec::new());
+    }
+    p.expect_word("by")?;
+    comma_separated(p, Parser::column)
+}
+
+/// Apply the `SELECT` list to `root`: an aggregate when grouping or
+/// aggregating, a projection when columns were named, otherwise nothing.
+fn apply_select_list(root: LogicalOp, list: SelectList, group_by: Vec<String>) -> R<LogicalOp> {
+    if !list.aggs.is_empty() || !group_by.is_empty() {
+        if list.aggs.is_empty() {
             return Err(SqlError::new(
                 "GROUP BY without an aggregate has no meaning here; add COUNT/SUM/MIN/MAX/AVG",
             ));
         }
-        root = root.aggregate(group_by.clone(), aggs);
-    } else if !star && !projection.is_empty() {
-        root = root.project(projection.clone());
+        return Ok(root.aggregate(group_by, list.aggs));
     }
-
-    // -- order by
-    if p.eat_word("order") {
-        p.expect_word("by")?;
-        let mut keys = Vec::new();
-        loop {
-            let field = p.column()?;
-            let descending = if p.eat_word("desc") {
-                true
-            } else {
-                let _ = p.eat_word("asc");
-                false
-            };
-            keys.push(SortKey { field, descending });
-            if !p.eat_sym(',') {
-                break;
-            }
-        }
-        root = root.sort(keys);
+    if !list.star && !list.columns.is_empty() {
+        return Ok(root.project(list.columns));
     }
+    Ok(root)
+}
 
-    // -- limit
-    if p.eat_word("limit") {
-        let at = p.offset();
-        match p.next() {
-            Some(Tok::Int(n)) if n >= 0 => root = root.limit(n as usize),
-            _ => return Err(SqlError::at("LIMIT needs a non-negative integer", at)),
-        }
+/// An optional `ORDER BY a [ASC|DESC], ...`, applied to `root` as a sort.
+fn parse_order_by(p: &mut Parser, root: LogicalOp) -> R<LogicalOp> {
+    if !p.eat_word("order") {
+        return Ok(root);
     }
+    p.expect_word("by")?;
+    let keys = comma_separated(p, parse_sort_key)?;
+    Ok(root.sort(keys))
+}
 
+/// One `ORDER BY` key: a column and an optional direction, ascending by default.
+fn parse_sort_key(p: &mut Parser) -> R<SortKey> {
+    let field = p.column()?;
+    let descending = if p.eat_word("desc") {
+        true
+    } else {
+        let _ = p.eat_word("asc");
+        false
+    };
+    Ok(SortKey { field, descending })
+}
+
+/// An optional `LIMIT n` with a non-negative integer, applied to `root`.
+fn parse_limit(p: &mut Parser, root: LogicalOp) -> R<LogicalOp> {
+    if !p.eat_word("limit") {
+        return Ok(root);
+    }
+    let at = p.offset();
+    match p.next() {
+        Some(Tok::Int(n)) if n >= 0 => Ok(root.limit(n as usize)),
+        _ => Err(SqlError::at("LIMIT needs a non-negative integer", at)),
+    }
+}
+
+/// Refuse anything left over once the statement is complete.
+fn expect_end(p: &Parser) -> R<()> {
     if p.pos < p.toks.len() {
         return Err(SqlError::at("unexpected trailing input", p.offset()));
     }
-    Ok(LogicalPlan::new(root))
+    Ok(())
 }
 
 fn parse_aggregate(p: &mut Parser) -> R<Option<Agg>> {
