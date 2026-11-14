@@ -100,7 +100,7 @@ impl OptimizationDriver for ManualDriver {
         let diff = current.diff(&target);
 
         let mut out = enable_decisions(diff.added, &target, registry, ctx, *level);
-        out.extend(disable_decisions(diff.removed, registry, *level));
+        out.extend(disable_decisions(diff.removed, &target, registry, *level));
         out.extend(retune_decisions(diff.retuned, &target, registry, *level));
         out
     }
@@ -191,6 +191,7 @@ fn enable_decisions(
 /// A disable for everything enabled now that the target leaves out.
 fn disable_decisions(
     removed: Vec<(String, String)>,
+    target: &OptimizationConfig,
     registry: &Registry,
     level: u8,
 ) -> Vec<Decision> {
@@ -199,6 +200,14 @@ fn disable_decisions(
         let Some(meta) = registry.meta(&name) else {
             continue;
         };
+        // A scoped entry of a non-`Global` optimization is how an unscoped
+        // `"global"` request is carried out (see `enable_decisions`). While
+        // the target still asks for it globally, that scope is part of the
+        // target, not something to remove; otherwise every second
+        // `optimize()` would undo what the first one built.
+        if meta.scope_kind != ScopeKind::Global && target.is_enabled(&name, "global") {
+            continue;
+        }
         out.push(Decision {
             optimization: meta.name,
             scope,

@@ -5,6 +5,9 @@
 A correctness and code-quality pass. No on-disk format change.
 
 ### Fixed
+- **Manual mode undid its own work:** a second `optimize()` at the same
+  level disabled the per-field indexes the level had created, because the
+  level's unscoped request was diffed against its own scoped expansion.
 - **Transaction commits and `insert_batch` are crash-atomic.** The write-set
   is logged as frames tagged with a transaction id plus one `Commit` record,
   made durable once, and applied to pages only after; recovery applies a

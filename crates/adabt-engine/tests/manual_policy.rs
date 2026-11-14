@@ -258,3 +258,42 @@ fn a_disabled_scoped_override_still_leaves_the_database_usable() {
     db.optimize().unwrap();
     assert_eq!(db.count("users").unwrap(), 1200);
 }
+
+/// A level preset's per-field index must survive a second `optimize()` with
+/// nothing changed: re-running manual optimization is idempotent.
+#[test]
+fn a_second_optimize_keeps_what_the_level_built() {
+    let tmp = Tmp::new("idempotent");
+    let mut db = Database::open(tmp.path(), Policy::manual(2)).unwrap();
+    db.create_collection("users", Schema::dynamic()).unwrap();
+    let batch: Vec<(RecordId, Record)> = (0..5_000u64)
+        .map(|i| {
+            (
+                RecordId(i),
+                Record::new().with("country", ["NO", "SE", "DK", "FI"][(i % 4) as usize]),
+            )
+        })
+        .collect();
+    db.insert_batch("users", batch).unwrap();
+    let plan = LogicalPlan::new(LogicalOp::scan("users").filter(Expr::eq("country", "NO")));
+    for _ in 0..50 {
+        db.query(&plan).unwrap();
+    }
+    db.optimize().unwrap();
+    assert!(
+        db.has_index("users", "country"),
+        "level 2 should index a filtered field"
+    );
+    db.optimize().unwrap();
+    assert!(
+        db.has_index("users", "country"),
+        "a second optimize() dropped the index"
+    );
+
+    // Leaving the level that asked for it still removes it.
+    db.set_level(0).unwrap();
+    assert!(
+        !db.has_index("users", "country"),
+        "level 0 kept a level-2 index"
+    );
+}
