@@ -8,7 +8,7 @@
 //! Run with: cargo run -p adabt-engine --example watch_it_optimize
 
 use adabt_core::ids::RecordId;
-use adabt_core::policy::{Durability, Policy};
+use adabt_core::policy::{Durability, Mode, Override, Policy};
 use adabt_core::record::Record;
 use adabt_core::schema::Schema;
 use adabt_core::store::LogicalStore;
@@ -20,9 +20,14 @@ fn main() {
     let mut dir = std::env::temp_dir();
     dir.push(format!("adabt-watch-{}", std::process::id()));
 
-    // Level 6 permits the workload-aware proposals: indexes chosen from what
-    // the traffic does rather than from the schema.
+    // Level 6 permits the workload-aware proposals: structures chosen from
+    // what the traffic does rather than from the schema. The result cache is
+    // switched off so the timings below measure answering the query, not
+    // replaying a cached answer.
     let mut policy = Policy::manual(6);
+    if let Mode::Manual { overrides, .. } = &mut policy.mode {
+        overrides.push(Override::toggle("result_cache", false));
+    }
     policy.guarantees.durability = Durability::Relaxed;
     let mut db = Database::open(&dir, policy).expect("open");
     db.create_collection("events", Schema::dynamic()).unwrap();
@@ -73,7 +78,9 @@ fn main() {
     let tuned = t.elapsed();
     println!("\nafter optimize():  {} groups in {tuned:?}", after.len());
     println!("{}", db.plan(&by_region).explain());
-    println!("\n{}", db.explain_materialized_views());
+    // The plan above is what a cache miss would run; a maintained view
+    // answers this shape before planning is reached at all.
+    println!("\nmaintained views:\n{}", db.explain_materialized_views());
 
     assert_eq!(before, after, "optimization changed the answer");
     if tuned < plain {
