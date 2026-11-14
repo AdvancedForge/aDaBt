@@ -110,7 +110,7 @@ pub fn write(dir: &Path, constraints: &UniqueConstraints) -> Result<()> {
 
 /// Read the constraint set. Absent, damaged or foreign-version files all read
 /// as "no constraints" — there is nowhere else this data lives, so unlike the
-/// derived and directory caches there is no fallback to rebuild from, and a
+/// derived-structure cache there is nothing to rebuild it from, and a
 /// caller that cannot read this file has genuinely lost the declarations. It
 /// has not, however, lost any data: every record already written still
 /// satisfies whatever constraints were in force when it was written, and the
