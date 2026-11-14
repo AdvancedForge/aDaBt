@@ -4,4 +4,4 @@
 
 **Disk semver:** `MAJOR` bumps on `superblock` format change; `MINOR` on `catalog` extension (v3→v4 backward-compatible: v3 catalog accepted, flags default `true`/`false`). WAL `FORMAT_VERSION` independent. Record codec `FORMAT_VERSION=1` stable; new field types add `FieldType` variants with `fixed_width` handling, never reinterpret existing bytes.
 
-**Check gate:** `cargo test --workspace` (run by `scripts/check.sh`, locally and in CI) includes `catalog_persistence`, `superblock` refusal, and `migrate` proof. A format-breaking change fails the gate unless `superblock` version gate and migration land together (`catalog_upgrade.rs` and the superblock refusal tests enforce this).
+**Check gate:** `cargo test --workspace` (run by `scripts/check.sh`) includes `catalog_persistence`, `superblock` refusal, and `migrate` proof. A format-breaking change fails the gate unless `superblock` version gate and migration land together (`catalog_upgrade.rs` and the superblock refusal tests enforce this).

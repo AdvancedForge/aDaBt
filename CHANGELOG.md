@@ -26,9 +26,8 @@ A correctness and code-quality pass. No on-disk format change.
 ### Changed
 - **Minimum supported Rust is 1.88**, the version the dependency tree has
   actually required; 1.82 was never buildable.
-- **CI restored** (GitHub Actions): the same gate as local, an MSRV check and
-  the soak test. The gate now also covers the telemetry feature flags, the
-  comparison workspace, and rustdoc warnings.
+- **The check gate** (`scripts/check.sh`) now also covers the telemetry
+  feature flags, the comparison workspace, and rustdoc warnings.
 - **Structure:** `Database` (3,700 lines, 32 fields) is now a facade composed
   of seven cohesive parts across responsibility modules; the executor's
   430-line `run` is a dispatcher over per-operator functions; the heap, codec

@@ -87,6 +87,9 @@ throughout: evidence first, then what it unblocks.
   must preserve that.
 
 ### 6. Toward beta
+- Hosted CI running `scripts/check.sh`, an MSRV check and the soak test. The
+  workflow is written (local branch `ci-workflow`); publishing it needs a token
+  with the `workflow` scope.
 - Freeze `LogicalStore` and the wire protocol, and extend
   [`semver.md`](semver.md) from the disk format to the API.
 

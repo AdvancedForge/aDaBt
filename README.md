@@ -1,6 +1,5 @@
 # aDaBt
 
-[![ci](https://github.com/AdvancedForge/adabt/actions/workflows/ci.yml/badge.svg)](https://github.com/AdvancedForge/adabt/actions/workflows/ci.yml)
 ![msrv](https://img.shields.io/badge/rust-1.88%2B-blue)
 ![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 
@@ -81,8 +80,8 @@ optimization level ladder.
 sequences against a reference model at every optimization level, and every
 query is checked at every level before and after each specialisation. The soak
 test drives the adaptive engine through a workload that changes underneath it
-while a level-0 database answers the same queries; any divergence fails it, and
-CI runs it. Crash tests truncate the write-ahead log at a matrix of byte offsets
+while a level-0 database answers the same queries; any divergence fails it.
+Crash tests truncate the write-ahead log at a matrix of byte offsets
 through a workload and require exact recovery, and `Database::verify()` checks
 every derived structure against the heap.
 
@@ -175,7 +174,7 @@ dev-dependency only). `adabt-core` depends on nothing in the workspace.
 Requires a C linker and Rust 1.88+.
 
 ```sh
-bash scripts/check.sh   # the gate CI runs: fmt, clippy, tests, loom, docs
+bash scripts/check.sh   # the gate: fmt, clippy, tests, loom, docs
 ```
 
 Benchmarks:

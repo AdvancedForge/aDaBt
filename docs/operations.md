@@ -2,7 +2,7 @@
 
 ## Build & verify
 
-`scripts/check.sh` is the gate, run identically by CI (`.github/workflows/ci.yml`) and locally:
+`scripts/check.sh` is the gate (enable it as a pre-push hook with `git config core.hooksPath .githooks`):
 
 ```sh
 bash scripts/check.sh          # fmt --check + clippy -D warnings + test --workspace + loom subset + comparison sanity + doc
