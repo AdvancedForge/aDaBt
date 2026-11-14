@@ -64,7 +64,7 @@ impl TemperatureSketch {
             self.counts[s] = self.counts[s].saturating_add(1);
         }
         self.observations += 1;
-        if self.observations % self.decay_interval == 0 {
+        if self.observations.is_multiple_of(self.decay_interval) {
             self.decay();
         }
     }

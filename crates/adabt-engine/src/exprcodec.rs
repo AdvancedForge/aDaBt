@@ -330,7 +330,7 @@ pub fn encode_expr_hex(e: &Expr) -> Result<String> {
 
 /// Inverse of [`encode_expr_hex`].
 pub fn decode_expr_hex(s: &str) -> Result<Expr> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(Error::Corruption(
             "condition hex has an odd number of digits".into(),
         ));
