@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased
+
+A correctness and code-quality pass. No on-disk format change.
+
+### Fixed
+- **Two optimizations that did nothing were removed.** `join_order` and
+  `data_partitioning` were registered, enabled at level 6 and reported as
+  applied, but only set flags nothing read. 17 optimizations are now 15; real
+  join ordering is on the roadmap. `thread_per_core` no longer claims
+  run-to-completion scheduling.
+- **C ABI:** an engine panic is reported as `ADABT_INTERNAL` instead of
+  aborting the host process. The `raw` declarations, which let safe Rust pass
+  arbitrary pointers, are now `unsafe`.
+- **Command lines:** `adabt-server`, `adabt-cli`, `adabt-bench` and the
+  comparison harness refuse malformed values (`--level abc`, `--shards x`)
+  with exit status 2 instead of silently using a default. The server
+  validates its whole configuration before touching disk or network.
+- **`watch_it_optimize`** timed result-cache hits and reported "not faster";
+  it now measures queries (~63 ms → ~7 µs, identical rows).
+- **`scripts/check.sh`** could never pass: its loom step ran ordinary tests
+  under loom, and `tail` hid the failures. It now runs exactly the loom
+  models and shows full failure output.
+
+### Changed
+- **Minimum supported Rust is 1.88**, the version the dependency tree has
+  actually required; 1.82 was never buildable.
+- **CI restored** (GitHub Actions): the same gate as local, an MSRV check and
+  the soak test. The gate now also covers the telemetry feature flags, the
+  comparison workspace, and rustdoc warnings.
+- **Structure:** `Database` (3,700 lines, 32 fields) is now a facade composed
+  of seven cohesive parts across responsibility modules; the executor's
+  430-line `run` is a dispatcher over per-operator functions; the heap, codec
+  and optimization library are split by responsibility.
+- **Documentation:** every comment and document was checked against the code;
+  about 70 claims that described an earlier state were corrected, and
+  internal milestone codes were replaced with plain explanations. The roadmap
+  states an honest status per goal; its stage-by-stage history moved to
+  `docs/history/`. Limitations now include that commits are not crash-atomic.
+
 ## 0.1.0-alpha.1 — 2026-08-26
 
 Initial public alpha release. Experimental, RAM-resident, single-node Rust database with adaptive physical optimization (`docs/getting-started.md`). Not production-ready (`docs/limitations.md`).
