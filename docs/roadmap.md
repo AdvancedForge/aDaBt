@@ -7,7 +7,7 @@ when the goal is met, as opposed to a list of features.
 |---|---|---|
 | **Usable** | you could ship on it | Met, for a single node with sharding as the growth story |
 | **Manually optimal** | the engine's ceiling is the hardware's ceiling | Met against SQLite; not yet measured against memory bandwidth or core count |
-| **Automatically optimal** | an expert tuning by hand adds nothing | Not met: adaptive matches the expert on 3 of 5 soak phases at 5k rows and 1 of 5 at 20k (was 1 and 0), and is 1.35–1.8× behind on the rest (was up to ~1,000×) ([`benchmarks/expert-vs-adaptive.md`](benchmarks/expert-vs-adaptive.md)) |
+| **Automatically optimal** | an expert tuning by hand adds nothing | Not met: adaptive matches the expert on 3 of 5 soak phases at 5k rows and effectively 1 of 5 at 20k, and is 1.1–2.0× behind on the rest (was up to ~1,000×). Record compression is no longer carried at 20k; the 20k identity phases are 1.3–1.5× behind on the expert's own configuration ([`benchmarks/expert-vs-adaptive.md`](benchmarks/expert-vs-adaptive.md)) |
 | **Good** | there is a workload where it is demonstrably the right answer | Met: 4 of 8 workloads won against SQLite, losses published alongside |
 
 "Met" means the finish line as defined here. It does not mean production-ready;
@@ -61,14 +61,19 @@ throughout: evidence first, then what it unblocks.
 ### 3. Attack the published losses
 - **Adaptive behind the expert** ([`benchmarks/expert-vs-adaptive.md`](benchmarks/expert-vs-adaptive.md)):
   - Fixed in the 2026-11-14 re-run: the result cache is admitted on its
-    measured hit rate (point filters now match at both sizes), direct lookup
+    measured hit rate (point filters matched at both sizes; the second
+    re-run measured 1.12× at 20k on a noisy cell), direct lookup
     is chosen at 20k rows, and structures from ended phases are retracted.
-  - **Record compression's estimate** claims a fixed 64 bytes a row, more
-    than the 20k-row soak's records occupy, so it scores as freeing the whole
-    database and is enabled in every phase at 20k rows. It is the one
-    configuration difference on the identity phases (1.36–1.41× behind). The
-    estimate needs the uncompressed size of what is stored.
-  - **Aggregate** (1.35–1.68×) and **range filter** (1.55–1.77×): adaptive
+  - Fixed in the second 2026-11-14 re-run: record compression's estimate
+    is sized from the stored records' uncompressed bytes and measured
+    compression ratio, so it is no longer enabled where records do not
+    compress. That did not close the 20k identity gaps.
+  - **Identity at 20k rows** (1.34–1.50×) with the same configuration as
+    the expert (direct lookup alone): the difference is the adaptive
+    database's history or its decision cycles, not its choices. Next step:
+    measure adaptive's final configuration applied manually to a database
+    that has run the same soak.
+  - **Aggregate** (1.40–1.99×) and **range filter** (1.44–1.74×): adaptive
     has the expert's core structures; the plan cache (still a workload-blind
     5% prior) and the remaining preset structures are not yet separated.
 

@@ -6,6 +6,20 @@ A correctness and code-quality pass. The existing formats are unchanged; two
 files are new (`base.adabt`, `superseded-log/`).
 
 ### Fixed
+- **Record compression's estimate claimed to free more than the database
+  held.** It assumed a fixed 64 bytes saved a row. The expert comparison's
+  records are about 43 bytes, below the size the store compresses at all,
+  so adaptive carried compression through every phase at 20k rows. The
+  estimate now claims the stored records' uncompressed bytes times
+  (1 − the compression ratio measured on a sample of them)
+  (`HeapStore::record_footprint`, `OptContext::record_bytes`). Both figures
+  read the same with compression on or off, so the claim does not shrink
+  once made. Decode CPU and latency are charged in proportion to the reads
+  that reach stored records (`WorkloadMix::record_reads`). Adaptive no
+  longer enables compression where records do not compress. The 20k
+  identity gaps (1.34–1.50×) remain with the same configuration as the
+  expert, so compression was not their cause
+  (`docs/benchmarks/expert-vs-adaptive.md`).
 - **The adaptive driver scores on evidence instead of fixed priors.** The
   result cache is judged on its measured or ghost hit rate and resident
   bytes; scan-, grouping-, lookup- and range-helping optimizations claim
@@ -18,7 +32,7 @@ files are new (`base.adabt`, `superseded-log/`).
   20k (was 1 and 0), and the point-filter and aggregate gaps fell from
   ~1,000× to at most 1.7× (`docs/benchmarks/expert-vs-adaptive.md`).
   Structures from ended phases are now retracted. Record compression's
-  over-claiming estimate is the known remaining cause at 20k rows.
+  over-claiming estimate, suspected next, is fixed above.
 - **Crash recovery brought deleted records back and could return an
   overwritten record's old version.** Version reclamation is lazy, so a
   checkpoint can flush the slots of records deleted or overwritten before

@@ -3,7 +3,14 @@
 The "automatically optimal" goal says an expert tuning by hand adds nothing
 over the adaptive engine. This is the measurement of that claim.
 
-**Result (latest, 2026-11-14 re-run): the claim does not hold yet, but the
+**Latest (2026-11-14, second re-run): record compression is fixed and was
+not the cause.** Its estimate now sizes the saving from the stored records,
+adaptive no longer enables it at any size, and the 20,000-row gaps remain:
+3 of 5 phases match at 5,000 rows, 1 of 5 at 20,000, with the identity
+phases behind on the same configuration as the expert. See
+[the second re-run](#re-run-2026-11-14-record-compression-sized-from-the-records).
+
+**Result (2026-11-14 re-run): the claim does not hold yet, but the
 gaps are now small.** After the scoring fixes described in
 [the re-run section](#re-run-2026-11-14-scoring-on-evidence), adaptive
 matches the expert on three of five phases at 5,000 rows and one of five at
@@ -317,3 +324,110 @@ Still **not met**: 3 of 5 phases at 5,000 rows, 1 of 5 at 20,000. The
 1,000×-class failures were scoring, and they are fixed. The remaining
 1.35–1.8× gaps have a named first suspect (record compression's estimate)
 and two unexplained ones (the plan cache and the aggregate hit path).
+
+## Re-run 2026-11-14: record compression sized from the records
+
+The re-run above named record compression's estimate as the first suspect
+at 20,000 rows. It claimed a fixed 64 bytes saved a row. These records
+occupy about 56 bytes stored, 43 of them record, which is under the 64-byte
+minimum below which the store keeps a record raw. Compression could save
+nothing here, and the estimate claimed it would free the whole database.
+
+| commit | change |
+|---|---|
+| `4f193b8` | `HeapStore::record_footprint` reports each collection's uncompressed record bytes (read from slot framing) and the ratio compression would store them at (measured on up to 256 evenly spaced records). Both read the same whether compression is on or off. |
+| `b59edeb` | `WorkloadMix` counts the reads that reach stored records: every read the result cache did not answer. |
+| `0133cca` | `OptContext::record_bytes` carries those figures, filled in by `opt_inputs`. |
+| `9426486` | The estimate claims uncompressed bytes × (1 − measured ratio), split 3:1 between storage and residency so the saving is counted once. The claim does not depend on the current setting, so it cannot retract and re-add itself. Decode CPU and latency scale with the share of record reads. |
+
+Same command, contestants and noise rules as above. The binary was built
+from `9426486`. **Load:** the machine was shared. The one-minute load
+average, sampled every 30 s, was 2.0–6.9 (median 3.1) during the 5,000-row
+run and 1.3–7.6 (median 1.9) during the 20,000-row run. Wall time was 23 and
+78 minutes. Every manual cell's sampled answers matched level 0 (6,426
+checks per size), and the adaptive soaks checked theirs: **no
+divergences**.
+
+### 5,000 rows
+
+| phase | expert p50 (range) | adaptive p50 before → after | adaptive / expert before → after | verdict before → after | adaptive ended with |
+|---|---|---|---|---|---|
+| identity | 196 ns (189–202) | 197 ns → 195 ns (193–212) | 0.97× → 0.99× | matches → **matches** | direct_lookup |
+| point filter | 1.79 µs (1.71–1.87) | 1.74 µs → 1.73 µs (1.73–1.74) | 0.99× → 0.97× | matches → **matches** | auto_index[country], result_cache |
+| range filter | 115 µs (105–137) | 182 µs → 166 µs (166–168) | 1.55× → 1.44× | behind → behind | auto_index[age], clustered_sort[age], result_cache |
+| aggregate | 930 ns (920–936) | 1.25 µs → 1.30 µs (1.26–1.32) | 1.35× → 1.40× | behind → behind | auto_index[age], clustered_sort[age], result_cache |
+| identity again | 192 ns (189–295) | 200 ns → 209 ns (200–217) | 1.05× → 1.09× | matches → **matches** | direct_lookup |
+
+p99 (median of repeats), expert / adaptive: identity 260 / 303 ns; point
+filter 454 / 333 µs; range filter 230 / 299 µs; aggregate 0.69 / 2.52 ms;
+identity again 376 / 354 ns.
+
+### 20,000 rows
+
+| phase | expert p50 (range) | adaptive p50 before → after | adaptive / expert before → after | verdict before → after | adaptive ended with |
+|---|---|---|---|---|---|
+| identity | 202 ns (195–419) | 263 ns → 271 ns (270–284) | 1.36× → 1.34× | behind → matches* | direct_lookup |
+| point filter | 1.73 µs (1.71–1.74) | 1.75 µs → 1.94 µs (1.89–2.20) | 1.01× → 1.12× | matches → behind | auto_index[country], result_cache |
+| range filter | 393 µs (391–405) | 721 µs → 686 µs (685–728) | 1.77× → 1.74× | behind → behind | auto_index[age], clustered_sort[age], result_cache |
+| aggregate | 960 ns (950–966) | 1.61 µs → 1.91 µs (1.69–2.65) | 1.68× → 1.99× | behind → behind | auto_index[age], clustered_sort[age], result_cache |
+| identity again | 196 ns (195–200) | 279 ns → 294 ns (293–359) | 1.41× → 1.50× | behind → behind | direct_lookup |
+
+\* Only because one expert repeat took 419 ns (spread 111%). The other two
+were about 200 ns, so this is not a real match.
+
+p99 (median of repeats), expert / adaptive: identity 337 / 435 ns; point
+filter 1.27 / 1.72 ms; range filter 466 / 1,020 µs; aggregate 2.75 / 9.69 ms;
+identity again 336 / 604 ns.
+
+("Before" is the previous re-run. The expert is re-measured each run. The
+20,000-row identity expert is now `direct lookup` alone, the same
+configuration adaptive ends the phase with.)
+
+### Reading the second re-run
+
+**Compression is gone, and the gaps did not close.** Adaptive no longer ends
+any phase with record compression at either size. A separate 20,000-row soak
+with the decision log on made 16 decisions and never proposed compression:
+with a measured ratio of 1.0 the estimate claims no saving, which never pays
+for the CPU. On the identity phases at 20,000 rows, adaptive and the expert
+now have **the same configuration** (direct lookup, nothing else), and
+adaptive is still 1.34× and 1.50× behind. Compression was a real
+over-claim, but it was not what cost those phases. The previous section's
+"most likely accounts for the 1.36–1.41×" was wrong.
+
+**What is still behind, and why (as far as this run shows):**
+
+- **Identity at 20,000 rows, 1.34–1.50×, same configuration.** The only
+  difference left is history. The adaptive database built direct lookup
+  while it was serving traffic. It runs a decision cycle every 500
+  operations and a telemetry decay with it, including inside the measured
+  window. In the last phase, it also carries pages and versions written by
+  three earlier phases. The expert gets a fresh database with its
+  configuration applied after 1,000 warm-up operations. At 5,000 rows the
+  same comparison matches, so whatever it is grows with size. This run does
+  not separate these causes. The next measurement is adaptive's final
+  configuration applied manually to a database that has been through the
+  same soak. That would separate configuration from history.
+- **Point filter at 20,000 rows, 1.01× → 1.12×.** The configuration is the
+  previous run's minus compression. Adaptive's range (1.89–2.20 µs, 16%
+  spread) is wider than in any other point-filter cell, and load peaked at
+  7.6 during this run. This reads as noise rather than a regression from
+  the change, but the verdict is "behind" and is reported as such.
+- **Aggregate, 1.40× and 1.99×**, and **range filter, 1.44× and 1.74×.** The
+  configurations are unchanged from the previous run apart from
+  compression, which is now absent. The expert's aggregate configuration is
+  plan cache, result cache, column store and views. Adaptive's is an `age`
+  index with clustering plus the result cache. The range winners are the
+  level 10/11 presets. The 20,000-row aggregate cell's 50% spread
+  (1.69–2.65 µs) makes its ratio unreliable in either direction.
+
+## What the second re-run means for the goal
+
+Still **not met**: 3 of 5 phases at 5,000 rows and 1 of 5 at 20,000 (the
+20,000-row identity match is an artifact of one slow expert repeat).
+Record compression's estimate is now sound and no longer chosen where it
+cannot save anything. The 20,000-row identity gaps survive with identical
+configurations, so the next suspect there is the adaptive database's state
+and its decision cycles, not its choices. The aggregate and range gaps
+still have the plan cache and the aggregate hit path as their unseparated
+suspects.
