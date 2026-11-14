@@ -71,7 +71,7 @@ impl Optimization for AutoIndexOpt {
         if Self::candidates(ctx).is_empty() {
             let best = ctx.filtered_fields.iter().max_by_key(|(_, _, n)| *n);
             let detail = match best {
-                Some((c, f, n)) if ctx.has_index(c, f) => {
+                Some((c, f, _)) if ctx.has_index(c, f) => {
                     format!("{c}.{f} is already indexed")
                 }
                 Some((c, f, n)) if *n < MIN_QUERIES_FOR_INDEX => format!(

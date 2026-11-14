@@ -132,7 +132,7 @@ fn expect_intact(rec: &Record, id: RecordId) {
             adabt_core::value::Value::Str(s) => Some(s.as_str()),
             _ => None,
         }),
-        Some(if i % 2 == 0 { "open" } else { "shut" }),
+        Some(if i.is_multiple_of(2) { "open" } else { "shut" }),
         "status of {i}"
     );
 }

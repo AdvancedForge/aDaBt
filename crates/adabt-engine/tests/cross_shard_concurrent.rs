@@ -93,10 +93,10 @@ fn coordinator_soaks_under_concurrent_readers_and_writers() {
             while !stop.load(Ordering::Relaxed) {
                 let id = RecordId((tick % 100) as u64);
                 db.get("kvs", id).unwrap();
-                if tick % 3 == 0 {
+                if tick.is_multiple_of(3) {
                     db.count("kvs").unwrap();
                 }
-                if tick % 10 == 0 {
+                if tick.is_multiple_of(10) {
                     let scan = db.scan("kvs").unwrap();
                     // scan must be sorted and contain at least the seeded ids
                     assert!(scan.len() >= 100);

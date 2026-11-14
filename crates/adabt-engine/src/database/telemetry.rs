@@ -155,7 +155,7 @@ impl Telemetry {
         const STRIDE: u32 = 16;
         let n = self.touch_sample.get().wrapping_add(1);
         self.touch_sample.set(n);
-        if n % STRIDE == 0 {
+        if n.is_multiple_of(STRIDE) {
             self.probe.record(Event::Touch { collection, id });
         }
     }

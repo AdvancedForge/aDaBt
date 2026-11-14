@@ -54,7 +54,7 @@ fn rec(i: u64) -> Record {
         .with("country", COUNTRIES[(i % 5) as usize])
         .with("tier", ((i % 3) as i64).to_string());
     // Every third record has no email, so COUNT(email) differs from COUNT(*).
-    if i % 3 != 0 {
+    if !i.is_multiple_of(3) {
         r = r.with("email", format!("u{i}@example.com"));
     }
     r
