@@ -13,6 +13,12 @@
 //! id already present becomes an overwrite — so it does not matter how much of
 //! the heap had already reached disk.
 //!
+//! A group of writes — a transaction, or a batch insert — is logged as one
+//! unit under a single commit record, and none of it touches a page until that
+//! record is in the log; recovery applies the group whole or not at all. The
+//! `commit` module explains why that is correct even though the buffer pool
+//! may write a dirty page to disk at any time.
+//!
 //! # Recovery order
 //!
 //! Collection definitions come first — the persisted catalog, then whatever
@@ -24,7 +30,8 @@
 //!
 //! The types and opening a store live here. Each child module adds one
 //! responsibility to [`HeapStore`]: `recovery` (rebuilding state on open),
-//! `write` (the logged physical write path), `placement` (which page a
+//! `write` (the logged physical write path), `commit` (crash-atomic groups
+//! of writes), `placement` (which page a
 //! payload lands on), `mvcc` (version chains and snapshot reads), `reclaim`
 //! (returning space), `migration` (schema changes), `checkpoint` (durability,
 //! backup and restore), `definitions` (index and clustering declarations),
@@ -50,6 +57,7 @@ use crate::version::VersionTracker;
 use crate::wal::Wal;
 
 mod checkpoint;
+mod commit;
 mod definitions;
 mod diagnostics;
 mod logical_store;
@@ -61,6 +69,7 @@ mod recovery;
 mod tuning;
 mod write;
 
+pub use commit::TxnWrite;
 use mvcc::VersionChain;
 use placement::{ClusterState, FreeSpaceMap};
 

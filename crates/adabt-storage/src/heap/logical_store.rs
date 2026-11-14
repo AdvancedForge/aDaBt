@@ -93,6 +93,7 @@ impl LogicalStore for HeapStore {
             return Err(Error::RecordExists(id));
         }
         let bytes = c.codec.encode(&rec)?;
+        self.check_fits(&bytes)?;
         self.log(WalOp::Insert {
             collection: collection.to_string(),
             id,
@@ -116,6 +117,7 @@ impl LogicalStore for HeapStore {
             return Err(Error::RecordExists(id));
         }
         let bytes = c.codec.encode(&rec)?;
+        self.check_fits(&bytes)?;
         // The log carries the same op either way: clustering is placement, not
         // content, so replay reproduces the bytes exactly and re-derives (or
         // forgets, which is equally correct) the locality.
@@ -214,6 +216,7 @@ impl LogicalStore for HeapStore {
         c.codec.schema().validate_record(&rec)?;
         let existed = c.directory.get(&id).is_some_and(|v| !v.is_absent());
         let bytes = c.codec.encode(&rec)?;
+        self.check_fits(&bytes)?;
         self.log(WalOp::Update {
             collection: collection.to_string(),
             id,

@@ -3,6 +3,7 @@
 
 use adabt_core::error::{Error, Result};
 use adabt_core::ids::{CollectionId, Lsn, RecordId, TxnId};
+use std::collections::HashMap;
 
 use super::definitions::store_has;
 use super::migration::is_migration_name;
@@ -178,34 +179,63 @@ impl HeapStore {
     }
 
     /// Replay the record writes logged after `flushed_lsn`.
+    ///
+    /// An autocommit frame (`TxnId(0)`) is applied as it is read. A frame
+    /// tagged with a transaction is held back until that transaction's
+    /// `Commit`, and dropped if the log ends first — which is the whole of
+    /// what makes a transaction all-or-nothing under a crash, and equally
+    /// what keeps a point-in-time target between a transaction's first frame
+    /// and its commit from exposing part of it.
+    ///
+    /// No checkpoint can fall inside a transaction (both need exclusive access
+    /// to the store, and a transaction's frames are logged in one call), so a
+    /// committed transaction's frames are either all at or below
+    /// `flushed_lsn`, and already in the pages, or all above it.
     fn replay_records(&mut self, entries: &[WalEntry], flushed_lsn: Lsn) -> Result<()> {
+        let mut open: HashMap<TxnId, Vec<&WalEntry>> = HashMap::new();
         for e in entries {
             if e.lsn.0 <= flushed_lsn.0 {
                 continue;
             }
-            match &e.op {
-                WalOp::Insert {
-                    collection,
-                    id,
-                    bytes,
+            match (&e.op, e.txn) {
+                (WalOp::Commit { txn }, _) => {
+                    let frames = open.remove(txn).unwrap_or_default();
+                    check_complete(*txn, &frames, e.lsn)?;
+                    for frame in frames {
+                        self.replay_record(&frame.op)?;
+                    }
                 }
-                | WalOp::Update {
-                    collection,
-                    id,
-                    bytes,
-                } => {
-                    // Replay is idempotent by construction: an insert of an id
-                    // already present is applied as an overwrite, so it does not
-                    // matter how far the heap had got before the crash.
-                    self.apply_put(collection, *id, bytes)?;
-                }
-                WalOp::Delete { collection, id } => {
-                    self.apply_delete(collection, *id)?;
-                }
-                _ => {}
+                (_, TxnId(0)) => self.replay_record(&e.op)?,
+                (_, txn) => open.entry(txn).or_default().push(e),
             }
         }
+        // Whatever is still in `open` never reached its commit record: it was
+        // cut off by a crash or by a restore target, and is discarded unseen.
         Ok(())
+    }
+
+    /// Apply one logged record write. Anything else is not a record write and
+    /// was handled, or deliberately deferred, by another pass.
+    fn replay_record(&mut self, op: &WalOp) -> Result<()> {
+        match op {
+            WalOp::Insert {
+                collection,
+                id,
+                bytes,
+            }
+            | WalOp::Update {
+                collection,
+                id,
+                bytes,
+            } => {
+                // Replay is idempotent by construction: an insert of an id
+                // already present is applied as an overwrite, so it does not
+                // matter how far the heap had got before the crash.
+                self.apply_put(collection, *id, bytes)
+            }
+            WalOp::Delete { collection, id } => self.apply_delete(collection, *id).map(|_| ()),
+            _ => Ok(()),
+        }
     }
 
     /// Execute every committed migration adoption, in log order.
@@ -350,4 +380,30 @@ fn last_checkpoint(entries: &[WalEntry]) -> Lsn {
             _ => None,
         })
         .unwrap_or(Lsn(0))
+}
+
+/// Refuse to apply a transaction unless the log holds every one of its frames.
+///
+/// The writer uses the first frame's LSN as the transaction id and appends the
+/// frames back to back, so a complete transaction is exactly the frames at
+/// LSNs `txn..commit`. Anything else means frames vanished from the middle of
+/// a log whose commit record survived — damage, not a crash, since a crash
+/// only ever removes a suffix — and applying what is left would be precisely
+/// the partial transaction this mechanism exists to rule out.
+fn check_complete(txn: TxnId, frames: &[&WalEntry], commit: Lsn) -> Result<()> {
+    let contiguous = frames
+        .iter()
+        .enumerate()
+        .all(|(i, f)| f.lsn.0 == txn.0 + i as u64);
+    if contiguous && txn.0 + frames.len() as u64 == commit.0 {
+        return Ok(());
+    }
+    Err(Error::Corruption(format!(
+        "transaction {} commits at lsn {} but the log does not hold the {} \
+         contiguous frames before it (found {})",
+        txn.0,
+        commit.0,
+        commit.0.saturating_sub(txn.0),
+        frames.len()
+    )))
 }

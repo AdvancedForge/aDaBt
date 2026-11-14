@@ -77,6 +77,16 @@ pub enum WalOp {
         collection: String,
         field: Option<String>,
     },
+    /// The end of a transaction: every `Insert`, `Update` and `Delete` frame
+    /// tagged with `txn` takes effect together, at this entry, or — if the
+    /// log ends before it — not at all.
+    ///
+    /// Frames tagged `TxnId(0)` are autocommit: each takes effect on its own,
+    /// which is how every log written before transactional frames existed
+    /// reads. The writer (`HeapStore`'s atomic commit) appends a
+    /// transaction's frames back to back and uses the LSN of the first one as
+    /// `txn`, so a complete transaction occupies exactly the LSNs
+    /// `txn..=commit` — which recovery checks rather than assumes.
     Commit {
         txn: TxnId,
     },
@@ -140,6 +150,8 @@ pub struct WalEntry {
     /// Not trusted for ordering — the LSN is the order. A clock that steps
     /// backwards makes point-in-time recovery approximate, never inconsistent.
     pub nanos: u64,
+    /// The transaction this frame belongs to, or `TxnId(0)` for autocommit.
+    /// See [`WalOp::Commit`].
     pub txn: TxnId,
     pub op: WalOp,
 }
@@ -762,6 +774,20 @@ impl Wal {
             }
             Durability::Relaxed => Ok(()),
         }
+    }
+
+    /// Hand everything appended so far to the operating system, without
+    /// waiting for it to reach the disk.
+    ///
+    /// Enough to survive the *process* dying, which is what lets a caller
+    /// promise that nothing it does to a heap page afterwards can be visible
+    /// to recovery while the log entry describing it is not: a page evicted
+    /// to the heap file is also only handed to the operating system, so once
+    /// the log has been handed over first, a process crash cannot keep the
+    /// page and lose the entry.
+    pub fn flush(&mut self) -> Result<()> {
+        self.writer.flush()?;
+        Ok(())
     }
 
     /// Unconditionally flush and fsync, whatever the policy.

@@ -38,10 +38,7 @@ impl HeapStore {
         let cid = c.id;
         let payload = Self::build_payload(cid, id, bytes, self.compress);
         if payload.len() > MAX_PAYLOAD {
-            return Err(Error::Corruption(format!(
-                "record of {} bytes exceeds the {MAX_RECORD_BYTES}-byte page limit",
-                bytes.len()
-            )));
+            return Err(too_large(bytes.len()));
         }
 
         let txn = self.versions.begin_write();
@@ -77,10 +74,7 @@ impl HeapStore {
         let cid = c.id;
         let payload = Self::build_payload(cid, id, bytes, self.compress);
         if payload.len() > MAX_PAYLOAD {
-            return Err(Error::Corruption(format!(
-                "record of {} bytes exceeds the {MAX_RECORD_BYTES}-byte page limit",
-                bytes.len()
-            )));
+            return Err(too_large(bytes.len()));
         }
 
         let txn = self.versions.begin_write();
@@ -116,6 +110,7 @@ impl HeapStore {
         Ok(true)
     }
 
+    /// Log one autocommit operation and make it durable per policy.
     pub(super) fn log(&mut self, op: WalOp) -> Result<()> {
         if self.replaying {
             return Ok(());
@@ -124,15 +119,25 @@ impl HeapStore {
         self.wal.commit()
     }
 
-    /// Append without making it durable yet. Paired with a single
-    /// [`Wal::commit`](crate::wal::Wal::commit) after every entry in a batch,
-    /// so `Strict` pays for one fsync instead of one per row.
-    fn log_uncommitted(&mut self, op: WalOp) -> Result<()> {
-        if self.replaying {
+    /// Refuse an encoded record that could never be placed in a page.
+    ///
+    /// Checked before the record is logged, never only when it is placed: a
+    /// logged write is one recovery will replay, and one that cannot be placed
+    /// would then fail every open of the database, not just the call that
+    /// wrote it.
+    pub(super) fn check_fits(&self, bytes: &[u8]) -> Result<()> {
+        if SLOT_PREFIX + bytes.len() <= MAX_PAYLOAD {
             return Ok(());
         }
-        self.wal.append(TxnId(0), op)?;
-        Ok(())
+        // Too big raw, but compression decides what is actually stored —
+        // exactly as `build_payload` will.
+        if self.compress {
+            let (_, body) = crate::compress::maybe_compress(bytes);
+            if SLOT_PREFIX + body.len() <= MAX_PAYLOAD {
+                return Ok(());
+            }
+        }
+        Err(too_large(bytes.len()))
     }
 
     /// Insert many records into `collection` in one call.
@@ -144,6 +149,11 @@ impl HeapStore {
     /// calling `insert` in a loop and stopping at the first error would leave
     /// the earlier calls in place, except here there are no earlier calls to
     /// leave in place.
+    ///
+    /// All-or-nothing holds against a crash too. The batch is logged as one
+    /// transaction — tagged frames and a single commit record, see
+    /// `heap::commit` — before any row reaches a page, so recovery replays
+    /// every row of it or none.
     ///
     /// The durability saving is the point: under `Strict`, inserting a hundred
     /// thousand rows one at a time is a hundred thousand fsyncs. Loading a
@@ -167,22 +177,25 @@ impl HeapStore {
                 return Err(Error::RecordExists(id));
             }
             let bytes = c.codec.encode(&rec)?;
+            self.check_fits(&bytes)?;
             prepared.push((id, bytes));
         }
 
-        for (id, bytes) in &prepared {
-            self.log_uncommitted(WalOp::Insert {
-                collection: collection.to_string(),
-                id: *id,
-                bytes: bytes.clone(),
-            })?;
-        }
-        if !self.replaying {
-            self.wal.commit()?;
-        }
+        self.log_atomically(prepared.iter().map(|(id, bytes)| WalOp::Insert {
+            collection: collection.to_string(),
+            id: *id,
+            bytes: bytes.clone(),
+        }))?;
         for (id, bytes) in &prepared {
             self.apply_put(collection, *id, bytes)?;
         }
         Ok(prepared.len())
     }
+}
+
+/// The refusal for a record that cannot fit in a page.
+fn too_large(len: usize) -> Error {
+    Error::Corruption(format!(
+        "record of {len} bytes exceeds the {MAX_RECORD_BYTES}-byte page limit"
+    ))
 }
