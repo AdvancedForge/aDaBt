@@ -11,9 +11,7 @@ cargo run -p adabt-engine --example quickstart          # open, batch insert, qu
 cargo run -p adabt-engine --example watch_it_optimize   # same queries before and after; the plan changes, answers don't
 ```
 
-The sources are in `crates/adabt-engine/examples/` (`examples/quickstart.rs`
-at the repo root is a copy for browsing; it is not built). The core of the
-quickstart:
+The sources are in `crates/adabt-engine/examples/`. The core of the quickstart:
 
 ```rust
 let mut policy = Policy::manual(0);                    // level 0: conventional, nothing specialised
