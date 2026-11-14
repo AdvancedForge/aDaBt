@@ -66,7 +66,7 @@ ratios within each row and never against another row's absolute values.
 | top-20 sort | ns/query | 512.1 ms | **4.72 ms** | 13.31 ms | **2.8× FASTER than SQLite** after tuning |
 | single-row inserts | ns/row | 31,250 | – | 15,087 | **2.1× slower** |
 
-**At its best configuration aDaBt wins 5 of 8 and loses 3.** One loss,
+**At its best configuration aDaBt wins 4 of 8 clearly, is at parity to slightly ahead on indexed range (about 1.0–1.3× against SQLite's steadier timings; the raw spread is wider), and loses 3.** One loss,
 indexed equality, is per-row materialization cost on a shape that already
 answers through a purpose-built structure; the other two (the write paths)
 are the price of the durability-and-exactness posture this project will not
