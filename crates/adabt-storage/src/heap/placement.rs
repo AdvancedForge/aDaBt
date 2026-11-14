@@ -21,6 +21,13 @@ pub(super) struct ClusterState {
     ranges: HashMap<PageId, (i64, i64)>,
 }
 
+impl ClusterState {
+    /// Forget the ranges of pages at or past `end`, which no longer exist.
+    pub(super) fn forget_from(&mut self, end: PageId) {
+        self.ranges.retain(|page, _| *page < end);
+    }
+}
+
 /// Pages bucketed by how much free space they have.
 ///
 /// A linear scan for a page with room is O(pages) per insert, which dominates

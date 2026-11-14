@@ -6,6 +6,42 @@ A correctness and code-quality pass. The existing formats are unchanged; two
 files are new (`base.adabt`, `superseded-log/`).
 
 ### Fixed
+- **Crash recovery brought deleted records back and could return an
+  overwritten record's old version.** Version reclamation is lazy, so a
+  checkpoint can flush the slots of records deleted or overwritten before
+  it, and the buffer pool can write copies of later writes to the heap file
+  before a crash. Recovery used the checkpoint's page-directory snapshot only
+  while the heap file was the length it recorded; once a page had been
+  allocated since (any insert-heavy stretch), it rebuilt the directory by
+  scanning pages, which cannot tell those slots from live records. In the
+  reproduction (10 rows, delete id 3, checkpoint, 190 more inserts, crash) id
+  3 came back as row 200; with the update's new version in an earlier slot
+  than its old one, the old version came back instead. Recovery now always
+  starts from the newest directory snapshot, whatever the heap file went
+  through since, and replays the log over it; it never scans pages. That is
+  exact because every change to where a record lives is logged, and a
+  record the log rewrites has its snapshot slot dropped, and freed only if
+  it still holds that record, before replay places anything for it
+  (`crates/adabt-storage/src/heap/recovery.rs` gives the argument). Pages
+  allocated after the snapshot are truncated away on recovery; a database
+  never checkpointed is rebuilt from its complete log over an empty heap.
+  Related changes on the same path:
+  - **Behaviour change:** a checkpointed database whose `directory.adabt`
+    is missing, damaged or from another database is refused with
+    `Corruption`, as a missing catalog already is, instead of being opened
+    from a page scan that could invent data. A checkpoint that cannot write
+    the directory now fails instead of carrying on without it.
+  - `vacuum` logs every move as an `Update` of the record's own bytes and
+    makes the log durable before freeing the old copy; a crash after a
+    vacuum and before the next checkpoint used to make the database
+    unopenable. Vacuum also frees slots nothing refers to (left by a crash)
+    and no longer truncates a page an open snapshot still reads.
+  - a checkpoint reclaims every version no snapshot can read before it
+    flushes, and makes the log durable before the heap file.
+  - every autocommit write is handed to the operating system before the
+    page change it describes, under `Relaxed` too, so a page the pool writes
+    can never outlive its log entry in a process crash.
+  The on-disk formats are unchanged.
 - **Point-in-time recovery could show writes from after its target.**
   `open_at` replayed the log up to the target over the heap file as it
   stood, but the buffer pool writes dirty pages to that file whenever it

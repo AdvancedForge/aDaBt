@@ -1,41 +1,52 @@
-//! An on-disk copy of the page directory.
+//! The page directory as of a checkpoint: where every live record was.
 //!
-//! Opening a database means knowing where every record lives. That map is
-//! derived — it can always be rebuilt by reading every page and looking at the
-//! collection and record ids in each slot prefix — but rebuilding it means
-//! opening a database costs a full pass over the heap, whatever else had or had
-//! not changed.
+//! # Why this is part of the durable state
 //!
-//! That pass is measurable and it dominates: on 200,000 records it is 801ms,
-//! against 817ms for rebuilding three indexes and essentially nothing for
-//! everything else. Once the derived-representation cache removed the index
-//! rebuild, this became the whole of the remaining cost.
+//! A heap file is not self-describing. Its pages hold, beside every live
+//! record, slots no reader will ever be shown again:
 //!
-//! Like [`crate::derived`], every failure to read is reported as "no cache",
-//! and for ordinary recovery a directory that cannot be loaded costs a scan,
-//! which is exactly what opening without this file costs.
+//! - the previous version of an overwritten record, and the last version of a
+//!   deleted one, until version reclamation frees them. Reclamation waits for
+//!   the in-process snapshots that may still read them, so a checkpoint can
+//!   flush such slots to disk;
+//! - writes from after the last checkpoint that the buffer pool stole to disk
+//!   early, possibly several copies of the same record. Replay places those
+//!   writes afresh, so the stolen copies are never referenced again.
 //!
-//! The one exception is a base image ([`crate::base_image`]), which a
-//! point-in-time restore starts from. There the snapshot is part of the state
-//! rather than a shortcut to it: a heap file at a checkpoint can still hold the
-//! slots of records deleted or overwritten before it, which a page scan cannot
-//! tell from live ones. A restore refuses a base image without its snapshot,
-//! and the snapshot is fsynced so that a base image does not outlive it.
+//! Each carries a well-formed slot prefix naming a collection and a record id.
+//! A directory rebuilt by reading every page cannot tell any of them from a
+//! live record, and a scan that met two slots for one id would keep whichever
+//! came last on disk. That is how an older recovery brought deleted records
+//! back and returned an overwritten version instead of the newest one.
 //!
-//! # Why this stamp is different
+//! So recovery never rebuilds the directory from the pages. It starts from
+//! this file — the newest version's location of every record, written by each
+//! checkpoint once its pages are on disk — and replays the log from the LSN in
+//! its stamp ([`crate::heap`] states the invariant that makes that sound). A
+//! checkpoint that cannot write it fails, and a database whose log no longer
+//! reaches back to the start refuses to open without it, exactly as it does
+//! without its catalog.
 //!
-//! The derived cache is validated *after* recovery, against the state recovery
-//! produced. This one has to be validated *before* it, because its whole purpose
-//! is to replace a step of recovery — so it can only be checked against facts
-//! available before a single page has been read: the database identity, the log
-//! position of the last checkpoint, and the length of the heap file.
+//! It also keeps opening a database cheap: loading it reads no pages, where
+//! reading every page cost 801ms on 200,000 records.
 //!
-//! That is enough, and it is enough for a specific reason. A checkpoint flushes
-//! every dirty page and *then* records the log position at which it did so. The
-//! directory written at that moment describes exactly the heap the checkpoint
-//! left behind, and everything after it is in the log and gets replayed as
-//! usual. So the cache does not have to describe the current state — it has to
-//! describe the checkpoint, and replay carries it the rest of the way.
+//! # The stamp
+//!
+//! The stamp is what recovery can check before reading a single page: the
+//! database identity, the LSN the checkpoint flushed up to, and the length of
+//! the heap file it left behind.
+//!
+//! - The identity keeps a directory copied in from another database out.
+//! - The LSN is where replay starts. Any checkpoint's directory is a valid
+//!   starting point for as long as the log reaches back to it, whatever the
+//!   heap file went through afterwards.
+//! - The length says which pages existed at the checkpoint. Any page past it
+//!   was allocated later and holds nothing replay does not write again.
+//!
+//! A point-in-time restore asks more — the heap file must be exactly as that
+//! checkpoint left it ([`crate::base_image`]) — and so matches the whole stamp
+//! against the current file with [`read`]. Crash recovery takes the newest
+//! directory there is with [`read_latest`].
 
 use crate::page::{PageId, RecordLocation, SlotId};
 use adabt_core::error::Result;
@@ -59,11 +70,11 @@ pub struct Stamp {
 pub struct Snapshot {
     /// Live records per collection, **by collection id, not by name**.
     ///
-    /// The id is what a record's slot prefix carries, so it is what a page scan
-    /// recovers, so it is what this has to reproduce. Keying by name looks
-    /// equivalent and is not: a schema migration hands one collection's records
-    /// to another under a *different* id while keeping the name, and a cache
-    /// keyed by name puts those records back under the wrong id. Recovery then
+    /// The id is what a record's slot prefix carries, so it is what this has to
+    /// reproduce. Keying by name looks equivalent and is not: a schema migration
+    /// hands one collection's records to another under a *different* id while
+    /// keeping the name, and a directory keyed by name puts those records back
+    /// under the wrong id. Recovery then
     /// completes the migration by freeing the old collection's pages — which are
     /// now the ones holding all the data.
     ///
@@ -118,6 +129,14 @@ pub fn write(dir: &Path, stamp: &Stamp, snapshot: &Snapshot) -> Result<()> {
 
 /// Read the directory, if one describes this exact checkpoint.
 pub fn read(dir: &Path, stamp: &Stamp) -> Option<Snapshot> {
+    read_latest(dir, stamp.identity)
+        .filter(|(found, _)| found == stamp)
+        .map(|(_, snapshot)| snapshot)
+}
+
+/// Read the directory and the stamp it was written under, if it is intact and
+/// belongs to the database `identity` names.
+pub fn read_latest(dir: &Path, identity: u128) -> Option<(Stamp, Snapshot)> {
     let bytes = std::fs::read(path(dir)).ok()?;
     if bytes.len() < MAGIC.len() + 8 {
         return None;
@@ -130,12 +149,12 @@ pub fn read(dir: &Path, stamp: &Stamp) -> Option<Snapshot> {
     if r.take(MAGIC.len())? != MAGIC || r.u32()? != FORMAT_VERSION {
         return None;
     }
-    let found = Stamp {
+    let stamp = Stamp {
         identity: u128::from_le_bytes(r.take(16)?.try_into().ok()?),
         checkpoint_lsn: r.u64()?,
         heap_bytes: r.u64()?,
     };
-    if found != *stamp {
+    if stamp.identity != identity {
         return None;
     }
 
@@ -158,16 +177,12 @@ pub fn read(dir: &Path, stamp: &Stamp) -> Option<Snapshot> {
         let page = PageId(r.u32()?);
         snapshot.free_space.push((page, r.u32()?));
     }
-    // Trailing bytes mean the two sides disagree about the format. Rebuilding is
-    // always available and always right, so there is no reason to guess.
+    // Trailing bytes mean the two sides disagree about the format, and a
+    // directory read wrongly is worse than none.
     if r.pos != body.len() {
         return None;
     }
-    Some(snapshot)
-}
-
-pub fn discard(dir: &Path) {
-    let _ = std::fs::remove_file(path(dir));
+    Some((stamp, snapshot))
 }
 
 fn checksum(bytes: &[u8]) -> u64 {
@@ -283,6 +298,17 @@ mod tests {
             mutate(&mut other);
             assert_eq!(read(&t.0, &other), None);
         }
+    }
+
+    #[test]
+    fn the_latest_directory_is_read_with_its_stamp_for_its_own_database_only() {
+        let t = Tmp::new("latest");
+        write(&t.0, &stamp(), &snapshot()).unwrap();
+        assert_eq!(
+            read_latest(&t.0, stamp().identity),
+            Some((stamp(), snapshot()))
+        );
+        assert_eq!(read_latest(&t.0, stamp().identity ^ 1), None);
     }
 
     #[test]

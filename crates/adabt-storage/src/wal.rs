@@ -692,7 +692,7 @@ impl Wal {
     ///
     /// The caller must have made everything up to `through` durable elsewhere
     /// first. In practice that is a checkpoint: pages flushed, the checkpoint
-    /// entry logged and synced, the directory cache and the catalog written.
+    /// entry logged and synced, the directory snapshot and the catalog written.
     /// Discarding before the catalog is durable would remove the only remaining
     /// record of which collection each page belongs to.
     pub fn discard_below(&mut self, through: Lsn) -> Result<usize> {

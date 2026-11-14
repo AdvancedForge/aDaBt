@@ -8,10 +8,24 @@
 //! # Durability
 //!
 //! Every mutation is written to the WAL and made durable per policy *before* it
-//! touches a page. Pages are flushed lazily. A crash is repaired by replaying
-//! the log from the last checkpoint, and replay is idempotent — an insert of an
-//! id already present becomes an overwrite — so it does not matter how much of
-//! the heap had already reached disk.
+//! touches a page, and handed to the operating system before any page carrying
+//! it can be. Pages are flushed lazily, and the buffer pool steals: it writes a
+//! dirty page to the heap file whenever it needs the frame.
+//!
+//! A crash is repaired from the page directory the last checkpoint recorded,
+//! by replaying the log after it. Replay is idempotent — an insert of an id
+//! already present becomes an overwrite — so it does not matter how much of
+//! the heap had already reached disk. What makes that exact, whatever the heap
+//! file went through since the checkpoint, is one invariant every write path
+//! keeps: **every change to where a record's newest version lives is logged.**
+//! Vacuum's moves included. `recovery` gives the argument; the short form is
+//! that a record the log does not mention after the checkpoint is still where
+//! the directory says, and one it does mention is rewritten by replay.
+//!
+//! The directory is never rebuilt by scanning pages. A heap file holds slots
+//! of deleted and superseded versions that reclamation had not yet freed, and
+//! copies of writes the pool stole before a crash, and a scan cannot tell any
+//! of them from a live record (`crate::directory`).
 //!
 //! A group of writes — a transaction, or a batch insert — is logged as one
 //! unit under a single commit record, and none of it touches a page until that
@@ -22,9 +36,10 @@
 //! # Recovery order
 //!
 //! Collection definitions come first — the persisted catalog, then whatever
-//! definitions the log holds past it — because the page scan that rebuilds the
-//! directory needs to know which collection each stored record belongs to.
-//! Only then are data operations replayed.
+//! definitions the log holds past it — because the directory snapshot files
+//! records under collection ids, which mean nothing until the definitions are
+//! known. Then the directory is loaded, and only then are data operations
+//! replayed.
 //!
 //! # Layout of this module
 //!
@@ -74,8 +89,10 @@ use mvcc::VersionChain;
 use placement::{ClusterState, FreeSpaceMap};
 
 /// `collection_id: u32 | record_id: u64 | encoding: u8` prefixed to every stored
-/// payload, so a page scan can rebuild the directory without consulting any
-/// other structure.
+/// payload, so a slot says whose it is. That is what lets a slot be freed only
+/// while it still holds the record it is freed for (`reclaim::Release`). It is
+/// not enough to rebuild the directory from: a slot of a deleted or superseded
+/// version carries a prefix just as well-formed (see `crate::directory`).
 ///
 /// The encoding byte lives *outside* the record, not in the record header's
 /// reserved flags, because a compressed record's header cannot be read until it

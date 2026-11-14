@@ -25,6 +25,28 @@ impl HeapStore {
         payload
     }
 
+    /// The collection and record a stored payload's prefix names.
+    pub(super) fn payload_owner(payload: &[u8]) -> Option<(CollectionId, RecordId)> {
+        let cid = payload.get(0..4)?.try_into().ok()?;
+        let id = payload.get(4..12)?.try_into().ok()?;
+        Some((
+            CollectionId(u32::from_le_bytes(cid)),
+            RecordId(u64::from_le_bytes(id)),
+        ))
+    }
+
+    /// The record bytes a stored payload holds, decompressed: what
+    /// [`WalOp::Update`] logs for it.
+    pub(super) fn payload_record(payload: &[u8]) -> Result<Vec<u8>> {
+        if payload.len() < SLOT_PREFIX {
+            return Err(Error::Corruption(
+                "stored slot is shorter than its prefix".into(),
+            ));
+        }
+        let encoding = crate::compress::Encoding::from_bit(payload[SLOT_PREFIX - 1])?;
+        Ok(crate::compress::decompress(encoding, &payload[SLOT_PREFIX..])?.into_owned())
+    }
+
     /// Insert or overwrite. The single physical write path, so insert, update
     /// and replay cannot drift apart.
     /// Write a new version. Never updates in place: a superseded version may
@@ -114,12 +136,20 @@ impl HeapStore {
     }
 
     /// Log one autocommit operation and make it durable per policy.
+    ///
+    /// Whatever the policy, the entry is also handed to the operating system
+    /// before this returns, ahead of the page change it describes. The buffer
+    /// pool may write that page to the heap file at any moment, and recovery
+    /// trusts the directory snapshot's location for every record the log does
+    /// not mention; a page that reached the file while its log entry was still
+    /// in this process's buffer would break that the moment the process died.
     pub(super) fn log(&mut self, op: WalOp) -> Result<()> {
         if self.replaying {
             return Ok(());
         }
         self.wal.append(TxnId(0), op)?;
-        self.wal.commit()
+        self.wal.commit()?;
+        self.wal.flush()
     }
 
     /// Refuse an encoded record that could never be placed in a page.

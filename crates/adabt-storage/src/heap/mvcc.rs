@@ -13,6 +13,15 @@ use super::HeapStore;
 use crate::page::RecordLocation;
 use crate::version::Snapshot;
 
+/// The stamp of a version recovery loaded from a checkpoint's directory
+/// snapshot, rather than wrote itself.
+///
+/// Older than every write this process stamps (those start at 1), which is
+/// what it is: a version from before the restart. It also marks the one kind
+/// of version whose slot cannot be taken on trust once the log says the record
+/// changed after that checkpoint — see `HeapStore::retire_recovered`.
+pub(super) const RECOVERED: TxnId = TxnId(0);
+
 /// Every version of one record, oldest first.
 ///
 /// `None` marks a delete: a reader whose snapshot falls after it must see the
@@ -53,12 +62,30 @@ impl VersionChain {
         self.versions.push((txn, loc));
     }
 
-    /// Drop versions no snapshot can reach, returning the freed locations.
+    /// A chain holding only the version recovery loaded from the directory
+    /// snapshot.
+    pub(super) fn recovered(loc: RecordLocation) -> Self {
+        Self {
+            versions: vec![(RECOVERED, Some(loc))],
+        }
+    }
+
+    /// The loaded version's location, while that is all this chain holds:
+    /// nothing since the restart has written the record.
+    pub(super) fn only_recovered(&self) -> Option<RecordLocation> {
+        match self.versions.as_slice() {
+            [(RECOVERED, loc)] => *loc,
+            _ => None,
+        }
+    }
+
+    /// Drop versions no snapshot can reach, returning the stamp and location
+    /// of each one that occupied a slot.
     ///
     /// Keeps the newest version at or before the horizon: that one is still the
     /// answer for any reader at the horizon, and dropping it would make the
     /// record vanish.
-    pub(super) fn reclaim_to(&mut self, horizon: TxnId) -> Vec<RecordLocation> {
+    pub(super) fn reclaim_to(&mut self, horizon: TxnId) -> Vec<(TxnId, RecordLocation)> {
         let keep_from = match self
             .versions
             .iter()
@@ -67,9 +94,9 @@ impl VersionChain {
             Some(i) => i,
             None => return Vec::new(),
         };
-        let freed: Vec<RecordLocation> = self.versions[..keep_from]
+        let freed = self.versions[..keep_from]
             .iter()
-            .filter_map(|(_, loc)| *loc)
+            .filter_map(|(txn, loc)| loc.map(|l| (*txn, l)))
             .collect();
         self.versions.drain(..keep_from);
         freed

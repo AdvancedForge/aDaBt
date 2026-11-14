@@ -1,14 +1,12 @@
-//! Opening a database without reading every page.
+//! The page directory a checkpoint records, and recovery from it.
 //!
-//! The directory is derived: it can always be rebuilt by scanning the heap, and
-//! before this cache existed it always was. The cache replaces that scan when it
-//! can prove it describes the same checkpoint.
-//!
-//! Which makes the interesting tests the ones where it cannot prove it. A stale
-//! directory does not produce an error or a crash — it produces a database that
+//! Recovery starts from the directory and replays the log over it; it never
+//! rebuilds the directory by reading pages, because a page cannot tell a live
+//! record from a deleted or superseded one. That makes a wrong directory the
+//! dangerous case: it does not produce a crash, it produces a database that
 //! looks fine and has lost records, or points at the wrong bytes. So most of
-//! what follows arranges for the cache to be wrong and checks that it is
-//! ignored.
+//! what follows arranges for the directory to be wrong, missing or foreign and
+//! checks that it is refused rather than used or guessed around.
 
 use adabt_core::ids::RecordId;
 use adabt_core::policy::Durability;
@@ -68,9 +66,24 @@ fn contents(h: &mut HeapStore) -> Vec<(RecordId, Record)> {
     h.scan("c").unwrap()
 }
 
+/// Open `dir`, expecting a refusal that names the page directory.
+fn assert_refused(dir: &Path, why: &str) {
+    match HeapStore::open(dir, Durability::Strict, 64) {
+        Ok(_) => panic!("{why}: opened without a usable directory"),
+        Err(e) => assert!(
+            e.to_string().contains("page directory"),
+            "{why}: refused for the wrong reason: {e}"
+        ),
+    }
+}
+
 #[test]
-fn a_loaded_directory_and_a_scanned_one_describe_the_same_database() {
-    let t = Tmp::new("same");
+fn a_checkpointed_database_without_its_directory_is_refused_not_scanned() {
+    // A scan would open it, and would bring back every record deleted before
+    // the checkpoint whose slot had not been reclaimed. Refusing is the only
+    // answer that does not invent data, and it changes nothing on disk: put the
+    // directory back and the database opens as it was.
+    let t = Tmp::new("missing");
     let expected = {
         let mut h = filled(t.path());
         contents(&mut h)
@@ -79,18 +92,42 @@ fn a_loaded_directory_and_a_scanned_one_describe_the_same_database() {
         cache(t.path()).exists(),
         "the checkpoint wrote no directory"
     );
-
-    let mut loaded = HeapStore::open(t.path(), Durability::Strict, 64).unwrap();
-    assert_eq!(contents(&mut loaded), expected);
-    drop(loaded);
+    let saved = std::fs::read(cache(t.path())).unwrap();
 
     std::fs::remove_file(cache(t.path())).unwrap();
-    let mut scanned = HeapStore::open(t.path(), Durability::Strict, 64).unwrap();
-    assert_eq!(
-        contents(&mut scanned),
-        expected,
-        "loading and scanning disagree"
-    );
+    assert_refused(t.path(), "directory removed");
+
+    std::fs::write(cache(t.path()), &saved).unwrap();
+    let mut h = HeapStore::open(t.path(), Durability::Strict, 64).unwrap();
+    assert_eq!(contents(&mut h), expected);
+}
+
+#[test]
+fn a_database_never_checkpointed_is_rebuilt_from_its_log_alone() {
+    // No checkpoint means no catalog and a log that holds every write, so
+    // replay over an empty heap rebuilds it exactly — whatever pages the
+    // two-page pool stole into the heap file along the way.
+    let t = Tmp::new("never");
+    let expected = {
+        let mut h = HeapStore::open(t.path(), Durability::Strict, 2).unwrap();
+        h.create_collection("c", Schema::dynamic()).unwrap();
+        for i in 0..N {
+            h.insert("c", RecordId(i), rec(i)).unwrap();
+        }
+        for i in (0..N).step_by(3) {
+            h.delete("c", RecordId(i)).unwrap();
+        }
+        for i in (1..N).step_by(3) {
+            h.update("c", RecordId(i), rec(i).with("balance", -1i64))
+                .unwrap();
+        }
+        contents(&mut h)
+    };
+    assert!(!cache(t.path()).exists());
+    for _ in 0..2 {
+        let mut h = HeapStore::open(t.path(), Durability::Strict, 2).unwrap();
+        assert_eq!(contents(&mut h), expected);
+    }
 }
 
 #[test]
@@ -134,7 +171,7 @@ fn writes_after_the_checkpoint_are_recovered_on_top_of_the_cache() {
 }
 
 #[test]
-fn a_damaged_directory_costs_a_scan_and_nothing_else() {
+fn a_damaged_directory_is_refused_and_changes_nothing() {
     let t = Tmp::new("damaged");
     let expected = {
         let mut h = filled(t.path());
@@ -145,13 +182,11 @@ fn a_damaged_directory_costs_a_scan_and_nothing_else() {
         let mut damaged = good.clone();
         damaged[at] ^= 0xff;
         std::fs::write(cache(t.path()), &damaged).unwrap();
-        let mut h = HeapStore::open(t.path(), Durability::Strict, 64).unwrap();
-        assert_eq!(
-            contents(&mut h),
-            expected,
-            "damage at {at} changed the data"
-        );
+        assert_refused(t.path(), &format!("damage at {at}"));
     }
+    std::fs::write(cache(t.path()), &good).unwrap();
+    let mut h = HeapStore::open(t.path(), Durability::Strict, 64).unwrap();
+    assert_eq!(contents(&mut h), expected);
 }
 
 #[test]
@@ -160,10 +195,7 @@ fn a_directory_from_another_database_is_not_adopted() {
     // identical heap sizes. Only the database identity separates them, and if it
     // did not, one would silently adopt the other's map of where records live.
     let (a, b) = (Tmp::new("ident-a"), Tmp::new("ident-b"));
-    let expected = {
-        let mut h = filled(a.path());
-        contents(&mut h)
-    };
+    drop(filled(a.path()));
     {
         let mut h = HeapStore::open(b.path(), Durability::Strict, 64).unwrap();
         h.create_collection("c", Schema::dynamic()).unwrap();
@@ -176,12 +208,7 @@ fn a_directory_from_another_database_is_not_adopted() {
         h.checkpoint().unwrap();
     }
     std::fs::copy(cache(b.path()), cache(a.path())).unwrap();
-    let mut h = HeapStore::open(a.path(), Durability::Strict, 64).unwrap();
-    assert_eq!(
-        contents(&mut h),
-        expected,
-        "another database's directory was adopted"
-    );
+    assert_refused(a.path(), "another database's directory");
 }
 
 #[test]
@@ -254,33 +281,22 @@ fn a_collection_dropped_after_the_checkpoint_stays_dropped() {
 
 #[test]
 fn loading_a_directory_reads_no_pages_at_all() {
-    // The cache exists to avoid reading every page, so that is what is measured
-    // — not elapsed time. A wall-clock assertion here was flaky under parallel
-    // test load and, worse, was measuring a gap that narrowed the moment the
-    // catalog removed the log walk that used to sit alongside the page scan. The
-    // page count is the thing the cache actually changes, and it changes it to
-    // zero.
+    // Opening costs what has happened since the checkpoint, not the size of the
+    // heap, so that is what is measured — not elapsed time, which was flaky
+    // under parallel test load. With nothing to replay, no page is read.
     let t = Tmp::new("reads");
     drop(filled(t.path()));
-    let saved = std::fs::read(cache(t.path())).unwrap();
 
-    let reads_on_open = |dir: &Path| {
-        let h = HeapStore::open(dir, Durability::Strict, 64).unwrap();
-        h.pool_stats().reads
-    };
-
-    std::fs::write(cache(t.path()), &saved).unwrap();
-    let loaded = reads_on_open(t.path());
-    std::fs::remove_file(cache(t.path())).unwrap();
-    let scanned = reads_on_open(t.path());
-
-    assert_eq!(
-        loaded, 0,
-        "recovery read {loaded} pages despite a valid directory"
-    );
+    let h = HeapStore::open(t.path(), Durability::Strict, 64).unwrap();
     assert!(
-        scanned > 10,
-        "the scan path read only {scanned} pages, so this proves nothing"
+        h.page_count() > 10,
+        "the heap has only {} pages, so this proves nothing",
+        h.page_count()
+    );
+    let reads = h.pool_stats().reads;
+    assert_eq!(
+        reads, 0,
+        "recovery read {reads} pages despite a valid directory"
     );
 }
 

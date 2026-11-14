@@ -1,14 +1,66 @@
-//! Rebuilding in-memory state on open: adopt the persisted catalog, load or
-//! rebuild the page directory, then replay the log over it.
+//! Rebuilding in-memory state on open: adopt the persisted catalog, load the
+//! page directory a checkpoint recorded, then replay the log over it.
 //!
 //! Crash recovery and a point-in-time restore run the same passes and differ
-//! in one input: the LSN the heap file is taken to reflect, which replay
-//! starts after. Crash recovery takes the last checkpoint and replays to the
-//! end of the log. A restore takes the heap's base image and replays only to
-//! its target, which is sound only because a base image holds nothing after
-//! its LSN — see [`crate::base_image`] for why a heap the buffer pool has
-//! written to since cannot be restored from, and `restore_base` for what is
-//! checked before a restore replays anything.
+//! in one input: the heap state replay starts from. Crash recovery starts from
+//! the newest directory snapshot and replays to the end of the log. A restore
+//! starts from the heap's base image and replays only to its target, which is
+//! sound only because a base image holds nothing after its LSN — see
+//! [`crate::base_image`] for why a heap the buffer pool has written to since
+//! cannot be restored from, and `restore_base` for what is checked before a
+//! restore replays anything.
+//!
+//! # Never from the pages alone
+//!
+//! The directory is never rebuilt by reading the pages: a heap file holds
+//! slots no reader may see again, and a page scan cannot tell them from live
+//! records (see [`crate::directory`]). Recovery starts from one of exactly two
+//! states it can read faithfully:
+//!
+//! - a directory snapshot, which names the newest version's location of every
+//!   record as of its checkpoint, whatever else the heap file holds; or
+//! - an empty heap, when the database has never completed a checkpoint and the
+//!   log still holds every write from the first, so replay alone rebuilds it.
+//!
+//! Anything else — a log that no longer reaches back to the start, and no
+//! directory snapshot it does reach back to — is refused rather than guessed
+//! at, as a missing catalog is.
+//!
+//! # Why a directory snapshot is enough, whatever happened to the heap file
+//!
+//! Between the checkpoint at `F` that wrote the snapshot and the crash, the
+//! buffer pool may have written any page to the heap file, allocated new
+//! pages, and freed and reused slots. Replaying `F+1..` over the snapshot is
+//! still exact, because of one invariant the write paths keep:
+//!
+//! > **Every change to where a record's newest version lives is logged before
+//! > any page carrying it can reach the heap file.**
+//!
+//! Inserts, updates, deletes, transactions, schema migrations and vacuum's
+//! moves all go through the log (vacuum's as an `Update` of the record's own
+//! bytes). So every record falls in one of two cases:
+//!
+//! - **The log after `F` never mentions it.** Its slot was not freed after
+//!   `F` — freeing a newest version takes a later version, which is logged —
+//!   so the slot the snapshot names still holds it, on whatever page image
+//!   reached the file.
+//! - **The log after `F` writes it.** Replay rewrites it, and its last
+//!   replayed write decides what it is: a put places the record afresh, a
+//!   delete leaves it absent. The slot the snapshot names is untrustworthy —
+//!   it may still hold the old version, or have been freed, or reused by
+//!   another record — so before the first replayed write the loaded version
+//!   is dropped and its slot freed only if it still holds this record
+//!   (`retire_recovered`).
+//!
+//! What the pages hold besides — stolen copies of writes that replay places
+//! again, versions a reader was holding at the checkpoint — is never named by
+//! any version, and is never read. `vacuum` frees it. Pages allocated after
+//! `F` hold nothing else, so recovery truncates the file back to the length
+//! the snapshot recorded before it replays.
+//!
+//! Recovery writes nothing to the log, so a second crash, at any point, is
+//! recovered from the same snapshot and the same log, and reaches the same
+//! state.
 
 use adabt_core::error::{Error, Result};
 use adabt_core::ids::{CollectionId, Lsn, RecordId, TxnId};
@@ -16,10 +68,23 @@ use std::collections::HashMap;
 
 use super::definitions::store_has;
 use super::migration::is_migration_name;
-use super::{HeapStore, RecoverTarget, VersionChain, SLOT_PREFIX};
+use super::mvcc::RECOVERED;
+use super::reclaim::Release;
+use super::{HeapStore, RecoverTarget, VersionChain};
 use crate::catalog::decode_schema;
-use crate::page::{PageId, RecordLocation, SlotId};
+use crate::directory::{Snapshot, Stamp};
+use crate::page::PAGE_SIZE;
 use crate::wal::{WalEntry, WalOp};
+
+/// The heap state replay starts from.
+enum Base {
+    /// The directory snapshot a checkpoint wrote, and the stamp it was
+    /// written under: replay starts after `stamp.checkpoint_lsn`.
+    Snapshot(Stamp, Snapshot),
+    /// Nothing: the log holds every write ever made, and replays from the
+    /// first over an empty heap.
+    Empty,
+}
 
 impl HeapStore {
     pub(super) fn recover(&mut self) -> Result<()> {
@@ -29,66 +94,174 @@ impl HeapStore {
         let entries = self.read_log(from_lsn)?;
         let entries = &entries[..];
 
-        // The checkpoint the heap file is known to reflect, which replay starts
-        // after. For crash recovery that is the last checkpoint: the heap holds
-        // at least everything up to it, possibly more, and replaying to the end
-        // of the log corrects the "more". A restore stops short of the end and
-        // so cannot correct it; it starts from a heap holding exactly the state
-        // at a known checkpoint, and nothing later. `None` — never
-        // checkpointed — means the heap may hold anything and only the log
-        // knows what.
+        // The heap state replay starts from. Crash recovery takes the newest
+        // directory snapshot: replay to the end of the log carries it forward
+        // whatever the heap file went through since. A restore stops short of
+        // the end, so it starts from a heap holding exactly the state at a
+        // known checkpoint, and nothing later.
         //
-        // A base image outranks the log's last checkpoint even when replaying
-        // to the end. In a live directory the two agree. In a restored backup
-        // handed later log they do not: that log records the source's later
+        // The snapshot, not the log's last checkpoint entry, decides where
+        // replay starts. In a live directory the two agree, or the snapshot is
+        // older — a crash between a checkpoint's log entry and its snapshot —
+        // and replaying from it is still exact. In a restored backup handed
+        // later log they do not: that log records the source's later
         // checkpoints, whose pages this heap file never received.
-        let heap_lsn = match self.recover_target {
-            RecoverTarget::Latest => self.base_image(from_lsn).or(last_checkpoint(entries)),
+        let base = match self.recover_target {
+            RecoverTarget::Latest => self.latest_base(from_lsn)?,
             RecoverTarget::Lsn(target) => {
                 let base = self.restore_base(entries, from_lsn, target)?;
                 self.end_log_at(target)?;
-                Some(base)
+                base
             }
         };
 
         // Pass 1: collection definitions, for whatever the catalog did not
-        // already cover. The page scan below cannot interpret a stored record
-        // without knowing its schema.
+        // already cover. The snapshot's records are filed under collection
+        // ids, which only mean something once the definitions are known.
         self.replay_definitions(entries, from_lsn)?;
 
-        // Pass 2: the page directory and free-space map, as of `heap_lsn`.
-        // Loaded from the snapshot when one describes that exact checkpoint,
-        // and otherwise — crash recovery only — rebuilt by reading every page.
-        //
-        // A restore never scans. A scan cannot tell a live record's slot from
-        // one that was deleted or overwritten before the checkpoint and not yet
-        // reclaimed, and `restore_base` has already established that the
-        // snapshot is there.
-        let loaded = match heap_lsn {
-            Some(lsn) => self.load_directory(lsn)?,
-            None => false,
-        };
-        if !loaded {
-            if let (RecoverTarget::Lsn(target), Some(base)) = (self.recover_target, heap_lsn) {
-                return Err(self.no_directory_snapshot(target, base));
-            }
-            self.scan_pages()?;
-        }
+        // Pass 2: the page directory and free-space map, as of the base.
+        let replay_after = self.load_base(base)?;
 
-        // Pass 3: replay everything the heap file might not yet contain.
-        self.replay_records(entries, heap_lsn.unwrap_or(Lsn(0)))?;
+        // Pass 3: replay everything the base does not contain.
+        self.replay_records(entries, replay_after)?;
 
         // Pass 4: schema migrations that reached their commit entry, in log
         // order. Deferred to here because an adoption hands over records, and
         // the records only exist once passes 2 and 3 have placed them.
         self.replay_adoptions(entries)?;
         self.discard_unfinished_migrations()?;
+        self.check_recovered_locations()?;
 
-        // Replay appends a version onto chains the page scan already built. No
+        // Replay appends a version onto chains the snapshot already built. No
         // snapshot can span a restart, so collapsing them is both safe and
         // necessary: otherwise every restart doubles the retained history.
         self.reclaim()?;
         self.retained = 0;
+        Ok(())
+    }
+
+    /// The base crash recovery starts from.
+    fn latest_base(&self, from_lsn: u64) -> Result<Base> {
+        match crate::directory::read_latest(&self.dir, self.identity) {
+            // A snapshot older than the catalog predates definitions pass 1
+            // will not replay, so it cannot be brought forward. Every
+            // checkpoint writes its snapshot before its catalog, so this
+            // happens only to a damaged or foreign file.
+            Some((stamp, snapshot)) if stamp.checkpoint_lsn >= from_lsn => {
+                let start = self.wal.start_lsn().0;
+                if start > stamp.checkpoint_lsn + 1 {
+                    return Err(Error::Corruption(format!(
+                        "the page directory in {} was recorded at lsn {}, but the log \
+                         now begins at lsn {start}, so the writes in between cannot be \
+                         replayed. Recover from a backup",
+                        self.dir.display(),
+                        stamp.checkpoint_lsn
+                    )));
+                }
+                Ok(Base::Snapshot(stamp, snapshot))
+            }
+            // Never checkpointed: no catalog, and `adopt_persisted_catalog`
+            // has established that the log is complete.
+            _ if from_lsn == 0 => Ok(Base::Empty),
+            _ => Err(Error::Corruption(format!(
+                "the page directory in {} is missing, damaged or from another database. \
+                 The database has been checkpointed, so its log cannot rebuild it alone, \
+                 and the heap file cannot be read without the directory: a page cannot \
+                 tell a live record from a deleted or superseded one. Restore the \
+                 directory file or recover from a backup",
+                self.dir.display()
+            ))),
+        }
+    }
+
+    /// Install `base` as the starting state: the page directory and free-space
+    /// map, and a heap file holding nothing the base does not account for.
+    /// Returns the LSN replay starts after.
+    fn load_base(&mut self, base: Base) -> Result<Lsn> {
+        let (stamp, snapshot) = match base {
+            Base::Empty => {
+                // Whatever the pool wrote here is replayed again from the log.
+                self.pool.truncate_to(0)?;
+                return Ok(Lsn(0));
+            }
+            Base::Snapshot(stamp, snapshot) => (stamp, snapshot),
+        };
+        // Pages past the length the checkpoint left were allocated after it,
+        // and hold only writes that replay places again.
+        self.pool
+            .truncate_to((stamp.heap_bytes / PAGE_SIZE as u64) as u32)?;
+        let pages = self.pool.page_count();
+        for (cid, records) in snapshot.collections {
+            // A collection the log no longer defines was dropped after the
+            // checkpoint; replay will not resurrect it and neither should this.
+            let Some(name) = self.by_id.get(&CollectionId(cid)).cloned() else {
+                continue;
+            };
+            let Some(c) = self.collections.get_mut(&name) else {
+                continue;
+            };
+            for (id, loc) in records {
+                c.directory.insert(id, VersionChain::recovered(loc));
+            }
+        }
+        // A page vacuum truncated after the checkpoint is gone, and must not
+        // be offered for placement.
+        for (page, free) in snapshot.free_space {
+            if page.0 < pages {
+                self.fsm.set(page, free as usize);
+            }
+        }
+        Ok(Lsn(stamp.checkpoint_lsn))
+    }
+
+    /// Drop the version recovery loaded for `id`, if that is still all its
+    /// chain holds, ahead of the first replayed write to it.
+    ///
+    /// The log says the record changed after the checkpoint, so the slot the
+    /// snapshot names may no longer be its own. A freed slot can have been
+    /// reused by another record, by a stolen write or by replay itself, and
+    /// keeping the loaded version until reclamation would then free that
+    /// record's slot instead. So it goes now, before replay places anything
+    /// for this record, and its slot is freed only if it still holds this
+    /// record — in which case it holds nothing replay will keep. Afterwards
+    /// the replayed writes decide what the record is, as they would for one
+    /// the snapshot had never heard of.
+    fn retire_recovered(&mut self, collection: &str, id: RecordId) -> Result<()> {
+        let Some(c) = self.collections.get_mut(collection) else {
+            return Ok(());
+        };
+        let Some(loc) = c.directory.get(&id).and_then(VersionChain::only_recovered) else {
+            return Ok(());
+        };
+        c.directory.remove(&id);
+        let release = Release::of(c.id, id, RECOVERED, loc);
+        self.release(vec![release]).map(|_| ())
+    }
+
+    /// Refuse a recovered directory that names a page the heap file does not
+    /// have.
+    ///
+    /// Every loaded version still standing is one the log never touched after
+    /// the checkpoint, and the invariant in the module documentation says its
+    /// slot is intact. A page missing from under it means that invariant was
+    /// broken somewhere, and reading on would return an error per record at
+    /// best.
+    fn check_recovered_locations(&self) -> Result<()> {
+        let pages = self.pool.page_count();
+        for (name, c) in &self.collections {
+            for (id, chain) in &c.directory {
+                if let Some(loc) = chain.only_recovered() {
+                    if loc.page.0 >= pages {
+                        return Err(Error::Corruption(format!(
+                            "record {} of {name} is recorded on page {}, but the heap file \
+                             has {pages} pages",
+                            id.0, loc.page.0
+                        )));
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -143,13 +316,14 @@ impl HeapStore {
     /// 1. The heap file is a base image ([`crate::base_image`]) at least as
     ///    new as the catalog. Without that, pages written after `target` may
     ///    be in the heap file, and replay cannot take them back out.
-    /// 2. The base image's directory snapshot is there. Without it the heap
-    ///    file cannot be read faithfully (see `crate::base_image`).
+    /// 2. The base image's directory snapshot is there, describing exactly
+    ///    this heap file. Without it the heap file cannot be read faithfully
+    ///    (see `crate::directory`).
     /// 3. The base image is at or before `target`. Replay only runs forward.
     /// 4. The log holds every entry from the base image to `target`. Replay
     ///    skips nothing it is not given, so a missing segment would otherwise
     ///    produce a state that never existed, under the target's name.
-    fn restore_base(&self, entries: &[WalEntry], from_lsn: u64, target: Lsn) -> Result<Lsn> {
+    fn restore_base(&self, entries: &[WalEntry], from_lsn: u64, target: Lsn) -> Result<Base> {
         let Some(base) = self.base_image(from_lsn) else {
             return Err(Error::InvalidRestore(format!(
                 "cannot restore {} to lsn {}: its heap file is not a base image. Pages \
@@ -162,9 +336,10 @@ impl HeapStore {
                 target.0
             )));
         };
-        if crate::directory::read(&self.dir, &self.directory_stamp(base)).is_none() {
+        let stamp = self.directory_stamp(base);
+        let Some(snapshot) = crate::directory::read(&self.dir, &stamp) else {
             return Err(self.no_directory_snapshot(target, base));
-        }
+        };
         if target < base {
             return Err(Error::RestoreTargetUnreachable {
                 requested: target.0,
@@ -200,11 +375,11 @@ impl HeapStore {
                 reached
             )));
         }
-        Ok(base)
+        Ok(Base::Snapshot(stamp, snapshot))
     }
 
     /// The LSN this directory's heap file is a base image as of, if it is one
-    /// recovery can start from: at least as new as the catalog it adopted,
+    /// a restore can start from: at least as new as the catalog it adopted,
     /// since replay never revisits what the catalog already reflects.
     fn base_image(&self, from_lsn: u64) -> Option<Lsn> {
         crate::base_image::read(&self.dir, self.identity).filter(|base| base.0 >= from_lsn)
@@ -331,7 +506,8 @@ impl HeapStore {
         Ok(())
     }
 
-    /// Replay the record writes logged after `flushed_lsn`.
+    /// Replay the record writes logged after `flushed_lsn`, the LSN the base
+    /// reflects.
     ///
     /// An autocommit frame (`TxnId(0)`) is applied as it is read. A frame
     /// tagged with a transaction is held back until that transaction's
@@ -384,9 +560,13 @@ impl HeapStore {
                 // Replay is idempotent by construction: an insert of an id
                 // already present is applied as an overwrite, so it does not
                 // matter how far the heap had got before the crash.
+                self.retire_recovered(collection, *id)?;
                 self.apply_put(collection, *id, bytes)
             }
-            WalOp::Delete { collection, id } => self.apply_delete(collection, *id).map(|_| ()),
+            WalOp::Delete { collection, id } => {
+                self.retire_recovered(collection, *id)?;
+                self.apply_delete(collection, *id).map(|_| ())
+            }
             _ => Ok(()),
         }
     }
@@ -449,81 +629,6 @@ impl HeapStore {
             .collect();
         Ok(())
     }
-
-    /// Load the directory as of the last checkpoint. Returns whether it worked.
-    fn load_directory(&mut self, flushed_lsn: Lsn) -> Result<bool> {
-        let stamp = self.directory_stamp(flushed_lsn);
-        let Some(snapshot) = crate::directory::read(&self.dir, &stamp) else {
-            return Ok(false);
-        };
-        for (cid, records) in snapshot.collections {
-            // Records go back under the collection *id* their slots carry, which
-            // is what a page scan would have done. A collection the log no
-            // longer defines was dropped after the checkpoint; replay will not
-            // resurrect it and neither should this.
-            let Some(name) = self.by_id.get(&CollectionId(cid)).cloned() else {
-                continue;
-            };
-            let Some(c) = self.collections.get_mut(&name) else {
-                continue;
-            };
-            for (id, loc) in records {
-                let mut chain = VersionChain::default();
-                chain.push(TxnId(0), Some(loc));
-                c.directory.insert(id, chain);
-            }
-        }
-        for (page, free) in snapshot.free_space {
-            self.fsm.set(page, free as usize);
-        }
-        Ok(true)
-    }
-
-    fn scan_pages(&mut self) -> Result<()> {
-        let count = self.pool.page_count();
-        for i in 0..count {
-            let pid = PageId(i);
-            let page = self.pool.get(pid)?;
-            let free = page.free_space();
-            let mut found: Vec<(CollectionId, RecordId, SlotId)> = Vec::new();
-            for slot in page.slots() {
-                let payload = page.get(slot)?;
-                if payload.len() < SLOT_PREFIX {
-                    return Err(Error::Corruption(format!(
-                        "slot {} on page {i} is shorter than its prefix",
-                        slot.0
-                    )));
-                }
-                let cid = CollectionId(u32::from_le_bytes([
-                    payload[0], payload[1], payload[2], payload[3],
-                ]));
-                let mut rid = [0u8; 8];
-                rid.copy_from_slice(&payload[4..12]);
-                found.push((cid, RecordId(u64::from_le_bytes(rid)), slot));
-            }
-            for (cid, rid, slot) in found {
-                // A record whose collection was dropped is an orphan; leave it
-                // in place rather than pretending it belongs somewhere.
-                if let Some(name) = self.by_id.get(&cid).cloned() {
-                    if let Some(c) = self.collections.get_mut(&name) {
-                        let mut chain = VersionChain::default();
-                        chain.push(TxnId(0), Some(RecordLocation { page: pid, slot }));
-                        c.directory.insert(rid, chain);
-                    }
-                }
-            }
-            self.fsm.set(pid, free);
-        }
-        Ok(())
-    }
-}
-
-/// The flushed LSN named by the last checkpoint in `entries`, if any.
-fn last_checkpoint(entries: &[WalEntry]) -> Option<Lsn> {
-    entries.iter().rev().find_map(|e| match e.op {
-        WalOp::Checkpoint { flushed_lsn } => Some(flushed_lsn),
-        _ => None,
-    })
 }
 
 /// Refuse to apply a transaction unless the log holds every one of its frames.

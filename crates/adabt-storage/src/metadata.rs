@@ -8,8 +8,9 @@
 //! # Why this has to exist before the log can be truncated
 //!
 //! `register_collection` assigns `CollectionId(next_collection_id)` in **write-
-//! ahead log replay order**, and `scan_pages` reads that id back out of the
-//! first four bytes of every heap slot. So the name-to-id binding is physically
+//! ahead log replay order**, and every heap slot carries that id in its first
+//! four bytes, as does the directory snapshot recovery files records under
+//! (`crate::directory`). So the name-to-id binding is physically
 //! embedded in every page and logically derived from replaying the log from byte
 //! zero.
 //!

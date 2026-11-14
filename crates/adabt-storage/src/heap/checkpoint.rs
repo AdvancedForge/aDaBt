@@ -60,11 +60,11 @@ impl HeapStore {
         }
     }
 
-    /// The stamp a cached directory must match to be usable.
+    /// The stamp of a directory snapshot describing the heap file as it is now,
+    /// as of `flushed_lsn`.
     ///
     /// Everything in it is available before a single page has been read, which
-    /// is the constraint: this cache replaces a step of recovery, so it cannot
-    /// be validated against anything recovery produces.
+    /// is the constraint: recovery checks it before it reads anything.
     pub(super) fn directory_stamp(&self, flushed_lsn: Lsn) -> crate::directory::Stamp {
         crate::directory::Stamp {
             identity: self.identity,
@@ -106,6 +106,16 @@ impl HeapStore {
 
     /// [`Self::checkpoint`], returning the LSN the heap file now reflects.
     fn checkpoint_at(&mut self) -> Result<Lsn> {
+        // Versions no snapshot can reach go first, so the pages flushed below
+        // do not carry their slots. Recovery would not be misled by them — it
+        // reads the directory snapshot, never the slots — but after a restart
+        // nothing would refer to them, and only a vacuum would get the space
+        // back.
+        self.reclaim()?;
+        // Write-ahead: the log must be durable through every change the pages
+        // are about to carry before the pages are, or a power loss between the
+        // two would leave the heap file holding changes no log entry describes.
+        self.wal.sync()?;
         self.pool.checkpoint()?;
         // Ordering matters: the pages must be on disk before the log claims they
         // are, or a crash between the two would skip replaying live changes.
@@ -117,23 +127,17 @@ impl HeapStore {
             },
         )?;
         self.wal.sync()?;
-        // The directory describing the heap this checkpoint just left behind.
-        // Written after the log entry, so its stamp names the checkpoint it
-        // belongs to. A failure here is not a failure of the checkpoint — the
-        // database is durable either way and a missing cache costs a scan — so
-        // the stale file is removed rather than the error propagated. All it
-        // costs beyond a scan is this checkpoint's standing as a base image,
-        // which needs the snapshot (see below).
+        // The directory describing the heap this checkpoint just left behind:
+        // the location of every record as of `flushed`, which is where
+        // recovery starts (see `crate::directory`). A failure is the
+        // checkpoint's failure. The previous directory is replaced atomically,
+        // so it is still there, and still a valid start, because nothing below
+        // has yet discarded the log it needs.
         let flushed_lsn = flushed;
         let stamp = self.directory_stamp(flushed);
-        let directory_written =
-            crate::directory::write(&self.dir, &stamp, &self.directory_snapshot()).is_ok();
-        if !directory_written {
-            crate::directory::discard(&self.dir);
-        }
-        // The catalog, unlike the directory, is authoritative: a failure to
-        // write it is propagated rather than swallowed. Discarding it and
-        // carrying on would leave a database whose name-to-id binding exists
+        crate::directory::write(&self.dir, &stamp, &self.directory_snapshot())?;
+        // The catalog is authoritative for the same reason: carrying on
+        // without it would leave a database whose name-to-id binding exists
         // only in a log that is about to become discardable.
         let catalog = self.catalog_snapshot(flushed.0);
         crate::metadata::write(&self.dir, self.identity, &catalog)?;
@@ -153,15 +157,9 @@ impl HeapStore {
         // Last of all: the heap file is now exactly what this checkpoint left,
         // and everything that describes it is durable. Until the heap file
         // next changes, this directory is a valid starting point for a restore
-        // to any later target its log reaches. Without its directory snapshot
-        // it is not one, and any marker an earlier checkpoint left must go too:
-        // it would name a snapshot that has just been replaced.
-        if directory_written {
-            crate::base_image::write(&self.dir, self.identity, flushed)?;
-            self.pool.guard_base_image(self.dir.clone());
-        } else {
-            crate::base_image::discard(&self.dir)?;
-        }
+        // to any later target its log reaches.
+        crate::base_image::write(&self.dir, self.identity, flushed)?;
+        self.pool.guard_base_image(self.dir.clone());
         Ok(flushed)
     }
 
@@ -174,12 +172,9 @@ impl HeapStore {
     /// cache of the engine's derived structures, which a restored database
     /// rebuilds exactly as any other reopen would.
     ///
-    /// The page directory is not optional here, although ordinary recovery
-    /// treats it as a cache. A checkpointed heap can still hold the slots of
-    /// records deleted or overwritten before the checkpoint — version
-    /// reclamation is lazy — and a directory rebuilt by scanning pages would
-    /// bring them back. The snapshot names the one live location of each
-    /// record, so a backup without it is not a faithful copy.
+    /// The page directory is part of the copy, not a convenience: a heap file
+    /// is not self-describing (see `crate::directory`), and recovery reads the
+    /// heap through the directory snapshot it starts from.
     ///
     /// Checkpointing first is what makes the copy meaningful: without it,
     /// `dest` would need every log segment back to the last one, rather than

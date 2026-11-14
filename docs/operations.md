@@ -69,6 +69,8 @@ If `open_at` fails or is interrupted partway through replay, restore the backup 
 
 Catalog v4 (`delta_encoding`/`thread_per_core`) is authoritative; loss rebuilds from WAL if log is complete, otherwise `Corruption` with `log_start_lsn`.
 
+The page directory (`directory.adabt`, rewritten by every checkpoint) is authoritative too: crash recovery starts from it and replays the log, because the heap file alone cannot tell a live record from a deleted or superseded one. A checkpointed database whose directory is missing, damaged or copied from another database refuses to open with `Corruption` naming the page directory, and nothing is changed; put the file back or recover from a backup.
+
 ## Tuning
 
 `Policy::manual(level)`, or `policy.mode = Mode::Adaptive`. Levels are cumulative presets (`adabt-opt/src/levels.rs`): 0 conventional → 11 maximum. `adabt-engine/src/optimizations/` 15 optimizations, all level-reachable (`every_registered_optimization_is_reachable_from_some_level`). `explain_optimizations()` / decision log + `to_prometheus_text`.

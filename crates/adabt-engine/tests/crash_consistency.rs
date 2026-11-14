@@ -29,6 +29,7 @@ use adabt_core::schema::Schema;
 use adabt_core::store::LogicalStore;
 use adabt_engine::Database;
 use adabt_storage::heap::HeapStore;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 struct Tmp(PathBuf);
@@ -238,4 +239,172 @@ fn every_truncation_point_recovers_to_a_consistent_database() {
         "chaos matrix: {opened_cleanly} recovered cleanly, {refused} refused outright, \
          fewest survivors {min_rows}/{N}"
     );
+}
+
+/// A small deterministic generator, so a failure names a seed that replays it.
+struct Rng(u64);
+impl Rng {
+    fn below(&mut self, n: u64) -> u64 {
+        // xorshift64*
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) % n
+    }
+}
+
+/// A row that says which write produced it, sized so rows move between
+/// pages and the heap file keeps growing.
+fn mixed_row(id: u64, generation: u64, rng: &mut Rng) -> Record {
+    let pad = if rng.below(10) == 0 {
+        1_500 + rng.below(1_500)
+    } else {
+        rng.below(300)
+    };
+    Record::new()
+        .with("id", id)
+        .with("bucket", (generation % 17) as i64)
+        .with("generation", generation)
+        .with("pad", "x".repeat(pad as usize))
+}
+
+/// Any id `model` holds, or `None` when it is empty.
+fn any_id(rng: &mut Rng, model: &BTreeMap<u64, Record>) -> Option<u64> {
+    let n = rng.below(model.len().max(1) as u64) as usize;
+    model.keys().nth(n).copied()
+}
+
+/// Kill the process now, recover from what it left on disk, twice, and
+/// demand exactly `model` with indexes that agree with it.
+fn assert_crash_recovers(live: &Path, model: &BTreeMap<u64, Record>, step: u64) {
+    let image = Tmp::new(&format!("mixed-crash-{step}"));
+    copy_dir(live, image.path());
+    for open in ["first", "second"] {
+        let mut db = Database::open(image.path(), Policy::manual(4))
+            .unwrap_or_else(|e| panic!("crash after step {step}: {open} open refused: {e}"));
+        let got: BTreeMap<u64, Record> = db
+            .scan("c")
+            .unwrap()
+            .into_iter()
+            .map(|(id, r)| (id.0, r))
+            .collect();
+        if &got != model {
+            let back: Vec<u64> = got
+                .keys()
+                .copied()
+                .filter(|k| !model.contains_key(k))
+                .collect();
+            let lost: Vec<u64> = model
+                .keys()
+                .copied()
+                .filter(|k| !got.contains_key(k))
+                .collect();
+            panic!(
+                "crash after step {step}, {open} open: came back {back:?}, lost {lost:?}, \
+                 or a stale version"
+            );
+        }
+        let report = db.verify().unwrap();
+        assert!(
+            report.problems.is_empty(),
+            "crash after step {step}, {open} open:\n{}",
+            report.problems.join("\n")
+        );
+    }
+}
+
+#[test]
+fn every_crash_point_of_a_mixed_workload_recovers_the_committed_state() {
+    // Deletes and overwrites before a checkpoint, the heap file growing after
+    // it, transactions, a transaction held open across a checkpoint (so the
+    // checkpoint flushes versions it cannot reclaim), and a three-page pool
+    // that steals constantly. The process is killed every few writes; each
+    // crash must recover exactly the committed rows, with indexes that agree
+    // with them, and recover the same way twice.
+    let live = Tmp::new("mixed");
+    let mut db = Database::open(live.path(), Policy::manual(4)).unwrap();
+    db.set_pool_capacity(3).unwrap();
+    db.create_collection("c", Schema::dynamic()).unwrap();
+    db.create_index("c", "bucket", adabt_core::index_kind::IndexKind::Hash)
+        .unwrap();
+    let mut rng = Rng(0x5eed);
+    let mut model: BTreeMap<u64, Record> = BTreeMap::new();
+    let (mut next_id, mut generation) = (0u64, 0u64);
+    let mut held = None;
+    let mut crashes = 0;
+
+    for step in 0..360u64 {
+        generation += 1;
+        match rng.below(100) {
+            0..=34 => {
+                let rec = mixed_row(next_id, generation, &mut rng);
+                db.insert("c", RecordId(next_id), rec.clone()).unwrap();
+                model.insert(next_id, rec);
+                next_id += 1;
+            }
+            35..=54 => {
+                if let Some(id) = any_id(&mut rng, &model) {
+                    let rec = mixed_row(id, generation, &mut rng);
+                    db.update("c", RecordId(id), rec.clone()).unwrap();
+                    model.insert(id, rec);
+                }
+            }
+            55..=71 => {
+                if let Some(id) = any_id(&mut rng, &model) {
+                    db.delete("c", RecordId(id)).unwrap();
+                    model.remove(&id);
+                }
+            }
+            72..=89 => {
+                let mut txn = db.begin();
+                let mut writes = BTreeMap::new();
+                for _ in 0..1 + rng.below(5) {
+                    let pick = any_id(&mut rng, &model).filter(|_| rng.below(3) != 0);
+                    match pick {
+                        Some(id) if writes.contains_key(&id) => {}
+                        Some(id) if rng.below(2) == 0 => {
+                            txn.delete(&mut db, "c", RecordId(id)).unwrap();
+                            writes.insert(id, None);
+                        }
+                        Some(id) => {
+                            let rec = mixed_row(id, generation, &mut rng);
+                            txn.update(&mut db, "c", RecordId(id), rec.clone()).unwrap();
+                            writes.insert(id, Some(rec));
+                        }
+                        None => {
+                            let rec = mixed_row(next_id, generation, &mut rng);
+                            txn.insert(&mut db, "c", RecordId(next_id), rec.clone())
+                                .unwrap();
+                            writes.insert(next_id, Some(rec));
+                            next_id += 1;
+                        }
+                    }
+                }
+                db.commit(txn).unwrap();
+                for (id, rec) in writes {
+                    match rec {
+                        Some(rec) => model.insert(id, rec),
+                        None => model.remove(&id),
+                    };
+                }
+            }
+            90..=95 => db.checkpoint().unwrap(),
+            _ => {
+                // Open or close a long-running reader.
+                held = match held.take() {
+                    Some(txn) => {
+                        db.commit(txn).unwrap();
+                        None
+                    }
+                    None => Some(db.begin()),
+                };
+            }
+        }
+        if step % 9 == 8 {
+            assert_crash_recovers(live.path(), &model, step);
+            crashes += 1;
+        }
+    }
+    assert!(crashes >= 40);
+    drop(held);
 }

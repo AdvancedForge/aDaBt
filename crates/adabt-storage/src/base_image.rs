@@ -7,12 +7,12 @@
 //! Crash recovery and point-in-time recovery replay the same log, but they
 //! ask different things of the heap file underneath it.
 //!
-//! Crash recovery replays *everything* after the last checkpoint. The buffer
-//! pool steals — it writes a dirty page to the heap file whenever it needs the
-//! frame — so the heap may already hold changes from after that checkpoint.
-//! That is harmless when replay runs to the end of the log: replay is
-//! idempotent, and any record the heap holds that the final state does not is
-//! deleted again by an entry replay reaches.
+//! Crash recovery replays *everything* after the checkpoint its directory
+//! snapshot describes. The buffer pool steals — it writes a dirty page to the
+//! heap file whenever it needs the frame — so the heap may already hold
+//! changes from after that checkpoint. That is harmless when replay runs to
+//! the end of the log: every record such a change touched is rewritten by an
+//! entry replay reaches (`crate::heap` has the invariant behind that).
 //!
 //! Point-in-time recovery stops at a target `T`. A change from after `T` that a
 //! stolen page carried into the heap file is never undone, because the entry
@@ -25,15 +25,11 @@
 //!
 //! # Why the page directory is part of it
 //!
-//! A heap file at a checkpoint is not self-describing. A deleted record, or
-//! the previous version of an updated one, keeps its slot until version
-//! reclamation gets to it, and reclamation is lazy, so the checkpoint can flush
-//! those slots to disk. Rebuilding the directory by scanning the pages cannot
-//! tell them from live records. The directory snapshot the checkpoint writes
-//! (`crate::directory`) can: it names the one live location of every record.
-//! For ordinary recovery that snapshot is a cache; for a base image it is part
-//! of the state, and a restore refuses a base image whose snapshot is missing
-//! rather than falling back to a scan.
+//! A heap file is not self-describing: it can hold slots of deleted and
+//! superseded versions that a page scan cannot tell from live records
+//! (`crate::directory`). The directory snapshot the checkpoint writes names
+//! the one live location of every record, and every recovery starts from one;
+//! a restore refuses a base image whose snapshot is missing.
 //!
 //! # The invariant
 //!
@@ -52,8 +48,9 @@
 //! marker, never a false one. Losing the marker costs only the ability to use
 //! that directory as a base until the next checkpoint; it never costs data.
 //!
-//! Because the file is unchanged, the directory snapshot's own staleness check
-//! (which compares the heap file's length) passes exactly when it should.
+//! Because the file is unchanged, the directory snapshot's whole stamp —
+//! checkpoint LSN and heap file length — matches it exactly, which is what a
+//! restore checks.
 
 use adabt_core::error::Result;
 use adabt_core::ids::Lsn;
