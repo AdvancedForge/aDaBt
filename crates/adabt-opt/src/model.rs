@@ -1,6 +1,6 @@
 //! A cost model calibrated from observed outcomes.
 //!
-//! M8 ended with the driver arguing with itself: it dropped an index on
+//! An earlier driver argued with itself: it dropped an index on
 //! evidence that the planner never chose it, then re-added it three cycles
 //! later on an estimate claiming a 70% latency improvement, forever. A
 //! fifty-cycle cooldown stopped the flapping without addressing the cause,
@@ -18,9 +18,9 @@
 //! and by widening confidence only as observations accumulate and agree.
 //!
 //! Controlled attribution needs the candidate and the baseline running against
-//! the same state at the same time, which is shadow execution — M11. Until
-//! then this is a bias correction, not an experiment, and it is deliberately
-//! weighted as one.
+//! the same state at the same time, which is shadow execution. Without it this
+//! is a bias correction, not an experiment, and it is deliberately weighted as
+//! one.
 
 use std::collections::HashMap;
 
@@ -192,7 +192,8 @@ mod tests {
     }
 
     fn optimistic() -> CostEstimate {
-        // The estimate that caused the M8 oscillation: claims a large win.
+        // The estimate that caused the add/drop oscillation: claims a large
+        // win.
         CostEstimate::faster(0.3, 0.25).with_confidence(0.6)
     }
 
@@ -207,7 +208,7 @@ mod tests {
 
     #[test]
     fn measurements_pull_an_optimistic_estimate_toward_what_happened() {
-        // The M8 failure, repaired: an index that measurably did nothing must
+        // The oscillation, repaired: an index that measurably did nothing must
         // stop claiming it will halve latency.
         let mut m = CostModel::new();
         for _ in 0..8 {

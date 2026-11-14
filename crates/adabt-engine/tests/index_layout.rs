@@ -1,4 +1,4 @@
-//! M25's index/layout additions.
+//! Index and layout additions (see `docs/history/m25-notes.md`).
 //!
 //! **Bitmap indexes.** A third `IndexKind`, alongside `Hash` and `BTree`:
 //! same `Index` trait, same equality semantics, a bitmap instead of a
@@ -15,7 +15,7 @@
 //! already does it for low-cardinality text columns (`column.rs`), and
 //! already has its own passing test
 //! (`dictionary_encoding_collapses_a_low_cardinality_column`). Nothing in
-//! this file duplicates that; it is named in the M25 notes as already
+//! this file duplicates that; it is named in those notes as already
 //! satisfied, not rebuilt.
 
 use adabt_core::ids::RecordId;
@@ -210,9 +210,9 @@ fn a_bitmap_index_stays_correct_under_updates_and_deletes() {
 
 #[test]
 fn a_dictionary_encoded_column_store_answers_exactly_as_the_heap_does() {
-    // Per-column dictionary encoding is one of M25's six named features and
-    // it already existed (`column.rs`'s `Column::Dict`), so this is
-    // confirmation, not new coverage. But it has to actually confirm
+    // Per-column dictionary encoding is one of the six named index/layout
+    // features and it already existed (`column.rs`'s `Column::Dict`), so this
+    // is confirmation, not new coverage. But it has to actually confirm
     // something: an earlier version of this test computed a result, called
     // `optimize()`, recomputed it, and asserted the two were equal — which
     // passes whether or not the column store engages at all, and would pass

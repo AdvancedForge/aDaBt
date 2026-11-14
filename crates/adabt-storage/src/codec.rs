@@ -977,12 +977,12 @@ impl RecordCodec {
 
     /// Decode exactly one field of an encoded record, borrowing the buffer.
     ///
-    /// This is the seed of the borrowed view M27 named: a fetch that needs
-    /// two of twenty fields should not pay for a `Record` — the map, the
-    /// name refcounts, the reserve — to throw the other eighteen away. It
-    /// walks only what the requested field needs: the header, its presence
-    /// bit, and (for variable fields) one offset-table entry. Everything else
-    /// in the buffer is untouched bytes.
+    /// This is the seed of the borrowed record view the zero-copy read path
+    /// called for: a fetch that needs two of twenty fields should not pay for a
+    /// `Record` — the map, the name refcounts, the reserve — to throw the other
+    /// eighteen away. It walks only what the requested field needs: the header,
+    /// its presence bit, and (for variable fields) one offset-table entry.
+    /// Everything else in the buffer is untouched bytes.
     ///
     /// The returned `Value` is still owned — strings copy out of the buffer,
     /// because lending slices tied to an encoded page's lifetime is the

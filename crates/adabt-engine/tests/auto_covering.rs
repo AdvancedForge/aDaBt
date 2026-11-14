@@ -2,14 +2,14 @@
 //!
 //! A covering index removes the fetch from a lookup, and the fetch is the
 //! measured majority of what a lookup costs here — so the structure matters
-//! more than in most engines. It existed since M25 and nothing proposed it,
-//! which is the shipped-but-unreachable pattern again: per-field filter
-//! counts cannot show that the queries filtering `country` keep asking for
-//! the same projection, any more than they could show that two fields were
-//! filtered *together*. The signal is co-occurrence of a filtered field with
-//! a stable projection; these tests pin that the proposal fires on stable
-//! evidence, refuses unstable evidence, and that what it builds is the real
-//! structure the planner already knows how to serve.
+//! more than in most engines. It existed for a long time and nothing proposed
+//! it, which is the shipped-but-unreachable pattern again: per-field filter
+//! counts cannot show that the queries filtering `country` keep asking for the
+//! same projection, any more than they could show that two fields were filtered
+//! *together*. The signal is co-occurrence of a filtered field with a stable
+//! projection; these tests pin that the proposal fires on stable evidence,
+//! refuses unstable evidence, and that what it builds is the real structure the
+//! planner already knows how to serve.
 
 use adabt_core::ids::RecordId;
 use adabt_core::policy::{Durability, Policy};

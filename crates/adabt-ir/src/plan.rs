@@ -98,7 +98,7 @@ pub enum LogicalOp {
     },
     /// **Reserved, not implemented.** The planner and executor return
     /// `Error::Unsupported` for any plan containing one. It exists in the enum
-    /// now — ahead of the algorithm that will fill it in at M23 — because
+    /// now — ahead of the join algorithm that will fill it in — because
     /// widening the IR from a chain to a tree is best done before anything is
     /// frozen on a wire, and while the widening can be exercised by a small
     /// number of match arms rather than by every arm the working feature will

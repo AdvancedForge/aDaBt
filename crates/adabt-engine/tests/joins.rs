@@ -531,9 +531,9 @@ fn a_join_result_is_a_normal_row_set_ready_for_further_operators() {
 
 #[test]
 fn joins_do_not_diverge_across_repeated_runs() {
-    // A cheap stand-in for the differential runner this milestone
-    // deliberately does not extend (see the M23 notes): running the same
-    // join twice must produce the same fingerprint both times.
+    // A cheap stand-in for the differential runner, which join support
+    // deliberately did not extend: running the same join twice must produce
+    // the same fingerprint both times.
     let t = Tmp::new("repeat");
     let mut db = seeded(t.path());
     let a = fingerprint(&db.query(&join_plan(JoinKind::Left)).unwrap());

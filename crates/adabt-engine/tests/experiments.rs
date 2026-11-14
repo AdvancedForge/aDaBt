@@ -137,7 +137,8 @@ fn shadow_execution_confirms_a_real_index_agrees_and_is_faster() {
 #[test]
 fn shadow_execution_shows_a_useless_index_is_no_faster() {
     // A hash index cannot serve a range, so the candidate is correct but
-    // pointless — exactly the case that cost the M7 matrix memory for nothing.
+    // pointless — exactly the case that cost the level-matrix benchmark memory
+    // for nothing.
     let (a, b) = (Tmp::new("useless-a"), Tmp::new("useless-b"));
     let mut pair = candidate_pair(&a, &b, 4_000, "age", IndexKind::Hash);
     let mut report = ShadowReport::default();
@@ -286,8 +287,8 @@ fn a_confirmed_candidate_ramps_through_shadow_to_promotion() {
 
 #[test]
 fn shadow_reads_are_taken_against_a_stable_snapshot() {
-    // The property M10 existed to provide: a scan under a snapshot returns the
-    // same rows however much the data churns, so a divergence means the
+    // The property snapshots exist to provide: a scan under a snapshot returns
+    // the same rows however much the data churns, so a divergence means the
     // candidate is wrong rather than that the data moved.
     let t = Tmp::new("stable");
     let mut db = seeded(t.path(), 500);

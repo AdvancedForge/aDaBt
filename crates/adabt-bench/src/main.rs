@@ -281,10 +281,11 @@ fn main() {
                     .map(|s| WorkloadKind::parse(s.trim()).unwrap_or_else(|| usage()))
                     .collect(),
             };
-            // Levels are accepted but not yet meaningful: the optimization
-            // framework lands in M3. Reject anything but 0 rather than emitting
-            // identical rows under different labels, which would read as
-            // "optimization made no difference" instead of "not built yet".
+            // Levels mean something only for the `engine` backend, the one
+            // the optimization framework drives. Reject anything but 0 for the
+            // others rather than emitting identical rows under different
+            // labels, which would read as "optimization made no difference"
+            // instead of "does not apply".
             let levels: Vec<u8> = arg(&args, "--levels")
                 .map(|l| l.split(',').filter_map(|s| s.trim().parse().ok()).collect())
                 .unwrap_or_else(|| vec![0]);

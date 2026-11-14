@@ -1,9 +1,9 @@
 //! Shadow execution: comparing a candidate representation against the baseline.
 //!
-//! The M9 cost model corrects estimates from a before-and-after on a live
-//! system, which confounds the change with everything else that moved. This is
-//! the controlled version: both paths answer the *same query* against the
-//! *same snapshot*, so a difference between them is attributable to the change
+//! The calibrated cost model corrects estimates from a before-and-after on a
+//! live system, which confounds the change with everything else that moved.
+//! This is the controlled version: both paths answer the *same query* against
+//! the *same snapshot*, so a difference between them is attributable to the change
 //! and nothing else.
 //!
 //! # Divergence is fatal, not tolerated

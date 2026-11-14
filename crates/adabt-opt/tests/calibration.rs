@@ -1,5 +1,5 @@
-//! The M8 → M9 repair: an estimate that measurement refutes must stop arguing
-//! for itself, rather than being held off by a cooldown.
+//! The calibration repair: an estimate that measurement refutes must stop
+//! arguing for itself, rather than being held off by a cooldown.
 
 use adabt_core::policy::{GuaranteeRequirements, Policy, Priorities};
 use adabt_opt::action::{Action, ChangePlan};
@@ -16,7 +16,7 @@ use adabt_telemetry::event::{Event, OpKind, QueryShape};
 use adabt_telemetry::{CollectingProbe, Probe, Snapshot};
 
 /// Claims a large latency win it will not deliver — the shape of estimate that
-/// caused the M8 oscillation.
+/// caused the driver's add/drop oscillation.
 struct Optimistic;
 
 const META: OptMeta = OptMeta {
@@ -135,9 +135,9 @@ fn an_uncalibrated_driver_proposes_the_optimistic_change() {
 
 #[test]
 fn measurement_stops_a_refuted_estimate_from_being_proposed_again() {
-    // The repair. In M8 this optimization would be proposed forever, because
-    // the estimate never learned it was wrong and only a fifty-cycle cooldown
-    // held it off.
+    // The repair. Before calibration this optimization would be proposed
+    // forever, because the estimate never learned it was wrong and only a
+    // fifty-cycle cooldown held it off.
     let mut model = CostModel::new();
     let flat = Metrics {
         p50_nanos: 1_000,
@@ -348,7 +348,7 @@ fn a_pinned_scope_is_never_retracted_however_it_scores() {
     }
 }
 
-/// M31: retraction became arithmetic against the policy's weights instead of
+/// Retraction became arithmetic against the policy's weights instead of
 /// a bare "was it used at all".
 ///
 /// The gap this closes: telemetry measured only the *benefit* of an index

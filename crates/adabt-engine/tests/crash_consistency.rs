@@ -142,7 +142,7 @@ fn every_truncation_point_recovers_to_a_consistent_database() {
     let src = Tmp::new("src");
     seeded(src.path());
 
-    // The WAL is a directory of bounded segments (M17). Only the *last* one
+    // The WAL is a directory of bounded segments. Only the *last* one
     // can carry a torn tail — every earlier segment was sealed and synced
     // before the next was created — so a killed process's damage lives here,
     // and this is the file the matrix cuts.

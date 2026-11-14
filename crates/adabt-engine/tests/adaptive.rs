@@ -306,9 +306,10 @@ fn every_adaptive_decision_is_explained() {
 
 #[test]
 fn the_driver_drops_indexes_it_created_once_the_planner_stops_choosing_them() {
-    // The M7 finding, made actionable: an index the planner never picks costs
-    // write maintenance and memory for nothing, and watching queries arrive
-    // cannot reveal that — only watching which access paths get chosen can.
+    // The level-matrix finding, made actionable: an index the planner never
+    // picks costs write maintenance and memory for nothing, and watching
+    // queries arrive cannot reveal that — only watching which access paths get
+    // chosen can.
     let t = Tmp::new("unused-index");
     let mut db = Database::open(
         t.path(),
@@ -363,7 +364,8 @@ fn the_driver_drops_indexes_it_created_once_the_planner_stops_choosing_them() {
     );
 
     // And the field the workload now filters on gets a structure that can serve
-    // it. Proposing a hash index for a range predicate was the M7 loss.
+    // it. Proposing a hash index for a range predicate was the level-matrix
+    // loss.
     if let Some(age) = specs.iter().find(|s| s.field == "age") {
         assert_eq!(
             age.kind,

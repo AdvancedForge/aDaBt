@@ -4,10 +4,9 @@
 //!
 //! The plan is explicit about it, and the reason is worth restating: built
 //! earlier, this would have been a parser onto a moving target. The IR has
-//! since grown a tree shape (M20), joins (M23), arithmetic, `IN` and `LIKE`
-//! (M20), and a compiled evaluator (M26). A SQL layer written before any of
-//! that would have been rewritten three times, and each rewrite is a chance
-//! to introduce a difference between what SQL means and what the IR does.
+//! since grown a tree shape, joins, arithmetic, `IN` and `LIKE`, and a
+//! compiled evaluator. A SQL layer written before any of that would have been
+//! rewritten three times, and each rewrite is a chance to introduce a difference between what SQL means and what the IR does.
 //!
 //! # What this is not
 //!

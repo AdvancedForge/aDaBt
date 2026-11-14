@@ -1,14 +1,14 @@
 //! The adaptive driver.
 //!
 //! Observes, proposes, and — the part that matters — *retracts*. An optimizer
-//! that only ever adds is a ratchet, and the M7 matrix showed what that costs:
-//! a level built an index the planner never chose, paying memory and write
-//! maintenance for it forever, and no threshold on "was this field filtered"
-//! could have noticed.
+//! that only ever adds is a ratchet, and the level-matrix benchmark showed what
+//! that costs: a level built an index the planner never chose, paying memory
+//! and write maintenance for it forever, and no threshold on "was this field
+//! filtered" could have noticed.
 //!
 //! # Evidence, estimate, and the argument between them
 //!
-//! M8 ended with the driver contradicting itself: it dropped an unused index on
+//! An earlier driver contradicted itself: it dropped an unused index on
 //! evidence, then re-added it on an estimate claiming a 70% win, forever. Two
 //! mechanisms settle that now, in order of preference:
 //!
@@ -88,9 +88,9 @@ const MIN_SCORE: f64 = 0.5;
 /// never re-examined.
 ///
 /// The bar to keep is therefore the bar to admit, less a hysteresis margin. The
-/// margin is what stops the two rules arguing with each other — the failure mode
-/// M8 already found once, where the driver dropped a thing on evidence and
-/// re-added it on estimate forever.
+/// margin is what stops the two rules arguing with each other — the failure
+/// mode an earlier driver already hit once, where the driver dropped a thing on
+/// evidence and re-added it on estimate forever.
 ///
 /// This is the cheap half of the fix. The complete answer is to *re-prove* an
 /// applied change by turning it off in shadow and measuring, which needs the
@@ -661,10 +661,10 @@ impl AdaptiveDriver {
 /// The wiring tests: memory and joint search have to *change what the driver
 /// does*, not merely exist and pass their own unit tests.
 ///
-/// These exist because the first version of M33/M34 shipped both modules
-/// fully tested in isolation and called from nowhere — the same
-/// shipped-but-unreachable shape an audit had just caught elsewhere in this
-/// codebase. A module with green tests and no call site is not a feature.
+/// These exist because the first version of outcome memory and joint search
+/// shipped both modules fully tested in isolation and called from nowhere — the
+/// same shipped-but-unreachable shape an audit had just caught elsewhere in
+/// this codebase. A module with green tests and no call site is not a feature.
 #[cfg(test)]
 mod wiring {
     use super::*;

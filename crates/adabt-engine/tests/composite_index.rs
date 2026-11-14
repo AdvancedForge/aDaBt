@@ -267,7 +267,7 @@ fn it_survives_a_restart() {
 
 // -- automatic selection ----------------------------------------------------
 
-/// The composite index shipped in M25 and *nothing chose it*: it was reachable
+/// The composite index shipped and *nothing chose it*: it was reachable
 /// only by naming it explicitly. The reason was not a missing heuristic — it
 /// was a missing signal. Telemetry recorded how often each field was filtered
 /// and never which fields were filtered *together*, and no amount of reasoning

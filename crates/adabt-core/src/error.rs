@@ -15,8 +15,8 @@ pub enum Error {
 
     /// A logically valid request this build does not implement yet — as
     /// opposed to an error in the request itself. `Join` is reserved in the
-    /// query IR and returns this from the planner and executor until M23
-    /// builds a real join algorithm over it; every other error variant here
+    /// query IR and returns this from the planner and executor until a real
+    /// join algorithm is built over it; every other error variant here
     /// means "this is wrong," and this one alone means "this is right, and not
     /// yet built."
     #[error("not yet implemented: {0}")]

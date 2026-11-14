@@ -746,7 +746,7 @@ mod unique_constraints {
 
     #[test]
     fn the_backing_index_is_never_retracted_while_the_constraint_stands() {
-        // The property M16's pinned-scope rule exists to guarantee: dropping the
+        // The property the pinned-scope rule exists to guarantee: dropping the
         // index would not merely slow queries down, it would let the very
         // violation the constraint exists to prevent happen silently.
         let t = Tmp::new("uniq-pinned");
@@ -872,9 +872,9 @@ mod expression_completeness {
     // Join execution itself — including the "refuses" cases that belong to
     // this milestone rather than expression evaluation — now has its own
     // dedicated suite: see `tests/joins.rs`. A single `Join` reaching
-    // `Database::query` was refused outright through M20-M22; M23 is where
-    // that stopped being true, so the tests asserting refusal moved rather
-    // than staying here asserting something no longer correct.
+    // `Database::query` was refused outright until joins were implemented,
+    // so the tests asserting refusal moved rather than staying here asserting
+    // something no longer correct.
 }
 
 /// `Database::alter_schema` and `ShardedDatabase::alter_schema`: the public

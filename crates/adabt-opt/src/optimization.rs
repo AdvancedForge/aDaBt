@@ -173,10 +173,10 @@ pub trait Optimization: Send + Sync {
     /// The scopes this optimization could be applied to, independently.
     ///
     /// A global optimization has one. `auto_index` has one per field worth
-    /// indexing, which is the point: M8 operated everything at `"global"`, so
-    /// retracting `auto_index` dropped *every* index rather than the one not
-    /// earning its keep, and it could only retract when all of them were
-    /// useless at once.
+    /// indexing, which is the point: an earlier driver operated everything at
+    /// `"global"`, so retracting `auto_index` dropped *every* index rather than
+    /// the one not earning its keep, and it could only retract when all of them
+    /// were useless at once.
     fn candidate_scopes(&self, _ctx: &OptContext<'_>) -> Vec<String> {
         vec!["global".to_string()]
     }

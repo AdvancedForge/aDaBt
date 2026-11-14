@@ -1,11 +1,11 @@
 //! Schema inference: moving a collection up the rigidity spectrum.
 //!
-//! `Dynamic → Declared → Strict → Fixed` has been a declared dial since M0.
-//! This is the machinery that lets the database *move along it* by observing
-//! what the data actually looks like, which is the transition the whole design
-//! exists to make possible: a collection that started schemaless and settled
-//! into a stable shape can become directly addressable without its API
-//! changing.
+//! `Dynamic → Declared → Strict → Fixed` has been a declared dial from the
+//! start. This is the machinery that lets the database *move along it* by
+//! observing what the data actually looks like, which is the transition the
+//! whole design exists to make possible: a collection that started schemaless
+//! and settled into a stable shape can become directly addressable without its
+//! API changing.
 //!
 //! # Freezing costs freedom, and says so
 //!

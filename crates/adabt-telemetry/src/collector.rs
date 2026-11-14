@@ -1,9 +1,10 @@
 //! Workload observation.
 //!
 //! Sharded rather than a single lock. The first version was one mutex around
-//! one `HashMap`, which was honest for M0 and useless on a real hot path:
-//! every operation on every thread serialised on it. Telemetry that perturbs
-//! the workload cannot be used to decide how to optimize that workload.
+//! one `HashMap`, which was honest for a prototype and useless on a real hot
+//! path: every operation on every thread serialised on it. Telemetry that
+//! perturbs the workload cannot be used to decide how to optimize that
+//! workload.
 //!
 //! Each thread is assigned a shard once and stays there, so the common case is
 //! an uncontended lock. Reading merges the shards, which is comparatively

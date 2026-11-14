@@ -1,10 +1,10 @@
 //! The SQL shell.
 //!
-//! M37 built the parser and stopped there; this is the other half — the thing
-//! a person types into. It is deliberately thin: every execution rule lives in
-//! the IR and the engine, and the shell only maps text onto them, because a
-//! front-end with its own evaluation rules would be a second engine that could
-//! disagree with the first.
+//! The SQL parser was built first and stopped there; this is the other half —
+//! the thing a person types into. It is deliberately thin: every execution rule
+//! lives in the IR and the engine, and the shell only maps text onto them,
+//! because a front-end with its own evaluation rules would be a second engine
+//! that could disagree with the first.
 //!
 //! The parser refuses far more than it accepts, by name. That discipline is
 //! inherited here unchanged: a statement the front-end does not implement

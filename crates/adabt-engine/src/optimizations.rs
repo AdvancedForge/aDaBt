@@ -431,8 +431,9 @@ impl Optimization for AutoIndexOpt {
     }
 
     fn plan_disable(&self, ctx: &OptContext<'_>, scope: &str, _params: &Params) -> ChangePlan {
-        // Drop only this scope's index. Dropping every index because one stopped
-        // paying was the M8 behaviour, and it threw away the ones that were.
+        // Drop only this scope's index. Dropping every index because one
+        // stopped paying was an earlier driver's behaviour, and it threw away
+        // the ones that were.
         let Some((collection, field)) = split_scope(scope) else {
             return ChangePlan::default();
         };
@@ -539,7 +540,7 @@ fn index_kind_param(params: &Params) -> Option<IndexKind> {
 ///
 /// A hash index cannot answer a range at all, so proposing one for a
 /// range-filtered field builds something the planner will never choose — which
-/// is exactly the pure loss the M7 matrix measured.
+/// is exactly the pure loss the level-matrix benchmark measured.
 fn index_kind_for(ctx: &OptContext<'_>, collection: &str, field: &str) -> IndexKind {
     const MOSTLY_EQUALITY: f64 = 0.8;
     match ctx.telemetry.equality_fraction(collection, field) {
@@ -1404,7 +1405,7 @@ impl Optimization for ThreadPerCoreOpt {
     }
 }
 
-// -- join order (M32) -------------------------------------------------------
+// -- join order -------------------------------------------------------------
 
 pub struct JoinOrderOpt;
 
@@ -1460,7 +1461,7 @@ impl Optimization for JoinOrderOpt {
     }
 }
 
-// -- data-driven partitioning (M32) ----------------------------------------
+// -- data-driven partitioning ----------------------------------------------
 
 pub struct DataPartitioningOpt;
 
@@ -1616,7 +1617,7 @@ mod tests {
         let mut r = Registry::new();
         register_builtins(&mut r);
         // Two more than the last revision: clustered_sort, delta_encoding and thread_per_core joined.
-        // M32 closed: join_order and data_partitioning joined.
+        // Then join_order and data_partitioning joined.
         assert_eq!(r.len(), 17);
         assert!(r.dependency_order().is_ok());
         for n in r.names() {
@@ -1693,9 +1694,9 @@ mod tests {
 
     // -- composite index selection ------------------------------------------
 
-    /// The structure existed since M25 and nothing chose it, because nothing
-    /// recorded which fields queries pin *together*. These tests are about the
-    /// signal as much as the decision.
+    /// The structure existed for a long time and nothing chose it, because
+    /// nothing recorded which fields queries pin *together*. These tests are
+    /// about the signal as much as the decision.
     #[test]
     fn auto_composite_waits_for_fields_to_be_pinned_together() {
         let mut fx = Fx::new();

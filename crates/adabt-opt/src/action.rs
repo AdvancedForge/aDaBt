@@ -66,9 +66,9 @@ pub enum Action {
     SetDeltaEncoding(bool),
     /// Enable per-core sharding of execution (thread-per-core).
     SetThreadPerCore(bool),
-    /// Optimize join order based on collection cardinalities (M32).
+    /// Optimize join order based on collection cardinalities.
     SetJoinOrder(bool),
-    /// Data-driven partitioning of hot key ranges (M32).
+    /// Data-driven partitioning of hot key ranges.
     SetDataPartitioning(bool),
 }
 

@@ -13,7 +13,7 @@
 //!   number is bytes of resident memory per row. If that is large, the
 //!   plan's "100M+ records" target is unreachable without a paged directory,
 //!   and saying so is worth more than a benchmark that quietly tests 100k.
-//! - **Bitmap vs hash index (M25).** The claim is that a bitmap index is
+//! - **Bitmap vs hash index.** The claim is that a bitmap index is
 //!   cheaper on a low-cardinality field. That was measured at 5,000 rows over
 //!   4 values. Refuted if the advantage vanishes — or inverts — at scale.
 //! - **Query latency vs row count.** An indexed point lookup should stay
@@ -192,8 +192,8 @@ pub fn run(data_dir: &std::path::Path, max_rows: u64, budget_mb: u64, pool_pages
 
 /// Bitmap vs hash index on a low-cardinality field, at a given row count.
 ///
-/// M25 claimed bitmap is cheaper here and measured it at 5,000 rows over 4
-/// values. This is the same claim at whatever scale is asked for.
+/// Bitmap was claimed cheaper here, measured at 5,000 rows over 4 values.
+/// This is the same claim at whatever scale is asked for.
 pub fn index_comparison(rows: u64) {
     use adabt_index::{BitmapIndex, HashIndex, Index};
 
@@ -233,9 +233,9 @@ pub fn index_comparison(rows: u64) {
 
 /// Where the per-row fetch cost actually goes.
 ///
-/// M36 measured a full scan at roughly 6 µs/row and showed it was *not*
-/// I/O-bound: a 64× larger buffer pool changed nothing. That refuted one
-/// hypothesis but did not produce another, and "CPU-side somewhere in the
+/// An earlier scale run measured a full scan at roughly 6 µs/row and showed it
+/// was *not* I/O-bound: a 64× larger buffer pool changed nothing. That refuted
+/// one hypothesis but did not produce another, and "CPU-side somewhere in the
 /// fetch path" is not a target you can optimize against.
 ///
 /// So this decomposes the path into the layers it is actually made of, each

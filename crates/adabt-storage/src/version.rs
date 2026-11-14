@@ -17,8 +17,8 @@
 //! control. There is no concurrent writer, no conflict detection, no isolation
 //! level negotiation. What it provides is the one property later milestones
 //! actually need — a stable read view — at a fraction of the cost, and it uses
-//! the `txn` field reserved in the record header since M1 precisely so that
-//! adding it now is not a format change.
+//! the `txn` field reserved in the record header from the first on-disk format
+//! precisely so that adding it now is not a format change.
 
 use adabt_core::ids::TxnId;
 /// Under the loom feature every atomic and thread primitive here is loom's,

@@ -123,13 +123,14 @@ fn sharded_database_backup_produces_an_openable_copy() {
 
 #[test]
 fn archiving_the_log_is_what_lets_pitr_reach_past_a_backups_checkpoint() {
-    // The end-to-end property M22 claimed and could not actually deliver from
-    // the engine API: `backup_to` checkpoints first, and a checkpoint discards
-    // the segments it folded into pages, so a bare backup can only ever be
-    // reopened at its own checkpoint. With archiving on, those segments are
-    // kept, and a restore can land on a moment *between* two checkpoints.
+    // The end-to-end property backup/PITR support claimed and could not
+    // actually deliver from the engine API: `backup_to` checkpoints first, and
+    // a checkpoint discards the segments it folded into pages, so a bare backup
+    // can only ever be reopened at its own checkpoint. With archiving on, those
+    // segments are kept, and a restore can land on a moment *between* two
+    // checkpoints.
     //
-    // The archive mechanism lived in `adabt-storage` from M17 but was
+    // The archive mechanism lived in `adabt-storage` from the start but was
     // reachable from nowhere above it until an audit caught that
     // `Database`/`ShardedDatabase` never exposed it. This test exists so that
     // gap cannot silently reopen.
@@ -232,7 +233,7 @@ fn open_at_restores_a_database_to_an_earlier_point_indexes_and_all() {
 fn point_in_time_recovery_is_reachable_entirely_from_the_engine_api() {
     // The whole PITR story through `Database` alone, with no reach into
     // `adabt-storage`. Each of the three pieces below existed in the storage
-    // crate and was exposed nowhere above it, which made M22's
+    // crate and was exposed nowhere above it, which made the
     // "point-in-time recovery" true of the storage layer and not of anything
     // an application could call:
     //   - set_log_archive   (keeps the segments a checkpoint would discard)

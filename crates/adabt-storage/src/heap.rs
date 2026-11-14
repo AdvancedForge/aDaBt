@@ -349,9 +349,9 @@ impl HeapStore {
     }
     /// The directory the log's segments live in.
     ///
-    /// A directory rather than a file since M17: the log is now a sequence of
-    /// bounded segments, so that everything below a checkpoint can be dropped
-    /// and recovery need not read history it has already folded into pages.
+    /// A directory rather than a file: the log is a sequence of bounded
+    /// segments, so that everything below a checkpoint can be dropped and
+    /// recovery need not read history it has already folded into pages.
     pub fn wal_path(dir: &Path) -> PathBuf {
         dir.join("wal")
     }
