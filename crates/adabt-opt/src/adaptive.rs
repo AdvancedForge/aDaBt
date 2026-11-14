@@ -498,6 +498,20 @@ impl OptimizationDriver for AdaptiveDriver {
             return Vec::new();
         }
 
+        // Nor on a workload an experiment is reshaping. While one runs, queries
+        // on its collection skip the caches and are planned around a structure
+        // the planner cannot see yet, so the telemetry describes the trial
+        // rather than the workload. On the soak, every filtered query was a
+        // scan for the few cycles an index spent in shadow, which was enough
+        // to admit a column store and read-ahead that the index made useless
+        // the cycle it was promoted, and they were retracted again: an
+        // add-then-drop in every filtering phase. The cache's real hit rate
+        // also collapsed for the duration, which argued for retracting it.
+        // Waiting a few cycles for the verdict costs less than either.
+        if !input.under_experiment.is_empty() {
+            return Vec::new();
+        }
+
         // Removals first: freeing a resource may make an addition affordable,
         // and dropping something that is not paying is never regrettable.
         // Leave alone anything an experiment is in the middle of proving. It is
@@ -1010,6 +1024,31 @@ mod wiring {
         let seen = measure(1_000, 500, false);
         assert_eq!(seen.len(), 1, "{seen:?}");
         assert!(seen[0] < 0.6, "the halving was measured as {:.2}x", seen[0]);
+    }
+
+    #[test]
+    fn nothing_is_decided_while_an_experiment_reshapes_the_workload() {
+        let mut reg = Registry::new();
+        reg.register(Box::new(Simple(&A_META)));
+        let policy = Policy::conventional();
+        let s = snap(2_000, 0);
+        let fx = Fx::new();
+        let ctx = fx.ctx(&policy, &s);
+        let empty = OptimizationConfig::new();
+        let input = |under| DriverInput {
+            registry: &reg,
+            current: &empty,
+            policy: &policy,
+            telemetry: &s,
+            ctx: &ctx,
+            under_experiment: under,
+            pinned: &[],
+        };
+
+        let trial = [("other", "global".to_string())];
+        assert!(AdaptiveDriver::new().decide(input(&trial)).is_empty());
+        // With no trial running, the same inputs do produce a proposal.
+        assert!(!AdaptiveDriver::new().decide(input(&[])).is_empty());
     }
 
     #[test]
