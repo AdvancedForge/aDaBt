@@ -2,7 +2,7 @@
 
 **Status:** `0.1.0-alpha.1` — experimental, not production-ready. See `docs/limitations.md`.
 
-Requires a C linker and Rust 1.82+.
+Requires a C linker and Rust 1.88+.
 
 ## Embedded: two runnable examples
 

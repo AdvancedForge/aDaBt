@@ -1,5 +1,9 @@
 # aDaBt
 
+[![ci](https://github.com/AdvancedForge/adabt/actions/workflows/ci.yml/badge.svg)](https://github.com/AdvancedForge/adabt/actions/workflows/ci.yml)
+![msrv](https://img.shields.io/badge/rust-1.88%2B-blue)
+![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
+
 A database that automatically optimizes itself for your workflow.
 Its interface remains stable, but the logic under the hood changes and 
 adapts to how the database is actually being used.
@@ -105,7 +109,7 @@ before and after every specialisation, and ensure identical results.
 
 ## Build
 
-Requires a C linker and Rust 1.82+.
+Requires a C linker and Rust 1.88+.
 
 ```sh
 cargo test --workspace

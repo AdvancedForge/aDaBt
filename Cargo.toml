@@ -22,8 +22,9 @@ exclude = [
 [workspace.package]
 version = "0.1.0-alpha.1"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/AdvancedForge/adabt"
 
 [workspace.dependencies]
 adabt-core = { path = "crates/adabt-core" }

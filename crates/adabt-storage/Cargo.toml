@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Storage engine for aDaBt: slotted pages, buffer pool, write-ahead log, recovery and versioned heap."
 
 [features]
 loom = ["dep:loom"]

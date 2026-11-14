@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Optimization framework for aDaBt: registry, level ladder, controller and adaptive driver."
 
 [dependencies]
 adabt-core.workspace = true

@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "The aDaBt database engine: a stable logical interface over self-specializing physical structures."
 
 [dependencies]
 adabt-core.workspace = true

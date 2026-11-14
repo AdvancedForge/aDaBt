@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "C ABI for embedding aDaBt."
 
 [lib]
 # `cdylib` is what a C linker consumes; `rlib` keeps the crate testable from

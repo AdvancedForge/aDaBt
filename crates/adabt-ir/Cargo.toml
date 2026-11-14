@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Logical query plans, expressions and query shapes for aDaBt."
 
 [dependencies]
 adabt-core.workspace = true
