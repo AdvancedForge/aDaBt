@@ -284,26 +284,41 @@ impl ShardedDatabase {
         Ok(())
     }
 
+    /// Apply a journalled write-set, one shard at a time in shard order.
+    ///
+    /// Each shard's slice commits as one local transaction under that shard's
+    /// lock, so it is crash-atomic on its own and costs one log sync rather
+    /// than one per write. Puts overwrite by id and deletes of absent ids are
+    /// no-ops, so replaying a journal over however much a crash had already
+    /// applied converges on exactly the journalled state.
     fn apply(&self, writes: &[CrossShardWrite]) -> Result<()> {
+        let shards = self.shards.len();
+        let mut by_shard: Vec<Vec<&CrossShardWrite>> = vec![Vec::new(); shards];
         for w in writes {
-            match &w.record {
-                Some(r) => {
-                    let mut db = lock(self.owner(w.id));
-                    // Put semantics by hand: a fresh id inserts, an id the
-                    // crash had already applied overwrites. Either way the
-                    // record ends up exactly as journalled, which is what
-                    // makes replaying a partially-applied journal safe.
-                    if db.insert(&w.collection, w.id, r.clone()).is_err() {
-                        db.update(&w.collection, w.id, r.clone())?;
-                    }
-                }
-                None => {
-                    // Deletes are idempotent; a miss is already the goal.
-                    let _ = lock(self.owner(w.id)).delete(&w.collection, w.id);
-                }
+            by_shard[shard_of(w.id, shards)].push(w);
+        }
+        for (shard, slice) in by_shard.iter().enumerate() {
+            if !slice.is_empty() {
+                Self::apply_slice(&mut lock(&self.shards[shard]), slice)?;
             }
         }
         Ok(())
+    }
+
+    /// Commit one shard's slice of a write-set as a single local transaction.
+    fn apply_slice(db: &mut Database, slice: &[&CrossShardWrite]) -> Result<()> {
+        let mut txn = db.begin();
+        for w in slice {
+            match &w.record {
+                Some(r) => {
+                    txn.update(db, &w.collection, w.id, r.clone())?;
+                }
+                None => {
+                    txn.delete(db, &w.collection, w.id)?;
+                }
+            }
+        }
+        db.commit(txn)
     }
 
     /// Commit one transaction across every shard it touches, all-or-nothing
