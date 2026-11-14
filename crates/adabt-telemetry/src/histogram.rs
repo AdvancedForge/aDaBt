@@ -104,6 +104,32 @@ impl Histogram {
         self.max = self.max.max(other.max);
     }
 
+    /// The observations recorded after `earlier`, where `earlier` is a copy
+    /// of this histogram taken before them.
+    ///
+    /// What a before-and-after comparison needs: a histogram that is never
+    /// decayed holds every sample since its shape first ran, so its
+    /// percentiles after a change are mostly made of samples from before it.
+    /// The difference is exactly the samples since.
+    ///
+    /// `min` becomes the floor of the lowest bucket still holding a sample;
+    /// the true minimum of the newer samples is not recoverable, and every
+    /// other statistic is exact.
+    pub fn since(&self, earlier: &Histogram) -> Histogram {
+        let mut out = Histogram::new();
+        for (i, (now, then)) in self.counts.iter().zip(earlier.counts.iter()).enumerate() {
+            let n = now.saturating_sub(*then);
+            if n > 0 && out.count == 0 {
+                out.min = Self::value_at(i);
+            }
+            out.counts[i] = n;
+            out.count += n;
+        }
+        out.sum = self.sum.saturating_sub(earlier.sum);
+        out.max = if out.count == 0 { 0 } else { self.max };
+        out
+    }
+
     pub fn count(&self) -> u64 {
         self.count
     }
@@ -154,6 +180,31 @@ impl Histogram {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn since_keeps_only_the_newer_samples() {
+        let mut h = Histogram::new();
+        h.record_n(1_000_000, 900);
+        let before = h.clone();
+        h.record_n(2_000, 100);
+
+        let newer = h.since(&before);
+        assert_eq!(newer.count(), 100);
+        assert_eq!(newer.sum(), 200_000);
+        // The cumulative median is still the old regime; the newer one is not.
+        assert!(h.percentile(50.0) >= 900_000);
+        assert!(newer.percentile(50.0) <= 2_000);
+        assert!(newer.percentile(99.0) <= 2_000);
+    }
+
+    #[test]
+    fn since_an_identical_copy_is_empty() {
+        let mut h = Histogram::new();
+        h.record_n(5_000, 10);
+        let same = h.since(&h.clone());
+        assert_eq!(same.count(), 0);
+        assert_eq!(same.percentile(50.0), 0);
+    }
 
     #[test]
     fn small_values_are_exact() {

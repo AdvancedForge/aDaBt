@@ -29,16 +29,33 @@ use crate::cost::{CostEstimate, Ratio};
 /// Snapshot of what an optimization was supposed to affect.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Metrics {
+    /// The query shape the latencies are for.
+    ///
+    /// Recorded so a before and an after are only compared when they measure
+    /// the same query. Without it a change applied as the workload moved on
+    /// was credited, or blamed, for the difference between two unrelated
+    /// queries: on the soak, whatever was enabled just before a phase ended
+    /// was judged by the next phase's query against the last one's.
+    pub shape: u64,
     pub p50_nanos: u64,
     pub p99_nanos: u64,
     pub bytes: u64,
     pub operations: u64,
 }
 
+/// Calls of the measured shape below which its percentiles are not a
+/// measurement.
+///
+/// A p99 needs a hundred samples to exist at all, and a p50 from a handful is
+/// whichever query happened to run. The soak's first baseline was a single
+/// 20 us call, which then recorded every change applied beside it as an 80x
+/// speedup.
+const MIN_MEASURED_CALLS: u64 = 100;
+
 impl Metrics {
     /// Whether there is enough here to compare against anything.
     pub fn is_usable(&self) -> bool {
-        self.operations > 0 && self.p50_nanos > 0
+        self.operations >= MIN_MEASURED_CALLS && self.p50_nanos > 0
     }
 }
 
@@ -52,7 +69,7 @@ pub struct Observation {
 
 impl Observation {
     pub fn between(before: &Metrics, after: &Metrics) -> Option<Observation> {
-        if !before.is_usable() || !after.is_usable() {
+        if !before.is_usable() || !after.is_usable() || before.shape != after.shape {
             return None;
         }
         Some(Observation {
@@ -184,11 +201,33 @@ mod tests {
 
     fn metrics(p50: u64, p99: u64, bytes: u64) -> Metrics {
         Metrics {
+            shape: 1,
             p50_nanos: p50,
             p99_nanos: p99,
             bytes,
             operations: 10_000,
         }
+    }
+
+    #[test]
+    fn different_queries_are_not_compared() {
+        // A change applied as the workload moved on must not be credited
+        // with the difference between the old query and the new one.
+        let before = metrics(1_000, 5_000, 0);
+        let after = Metrics {
+            shape: 2,
+            ..metrics(100, 500, 0)
+        };
+        assert_eq!(Observation::between(&before, &after), None);
+    }
+
+    #[test]
+    fn a_handful_of_calls_is_not_a_measurement() {
+        let thin = Metrics {
+            operations: MIN_MEASURED_CALLS - 1,
+            ..metrics(20_000, 20_000, 0)
+        };
+        assert_eq!(Observation::between(&thin, &metrics(250, 800, 0)), None);
     }
 
     fn optimistic() -> CostEstimate {

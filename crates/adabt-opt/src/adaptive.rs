@@ -27,7 +27,7 @@
 //! cooldowns, and a cap on changes per cycle keep it settled.
 
 use adabt_core::policy::Policy;
-use adabt_telemetry::Snapshot;
+use adabt_telemetry::{Histogram, QueryShape, Snapshot};
 use std::collections::HashMap;
 
 use crate::config::OptimizationConfig;
@@ -143,7 +143,22 @@ fn scope_key(name: &str, scope: &str) -> String {
 struct Pending {
     optimization: String,
     baseline: Metrics,
+    /// The measured shape's latency histogram when the change was made.
+    ///
+    /// Latency histograms are never decayed, so a shape that has run for an
+    /// hour carries an hour of samples, and its percentiles three cycles after
+    /// a change barely move whatever the change did. The judgment is taken
+    /// over the samples recorded since this copy instead.
+    baseline_latency: Histogram,
     applied_at: u64,
+    /// Whether an experiment ran while this change was waiting to be judged.
+    ///
+    /// Queries on an experiment's collection are routed around the caches
+    /// and see the candidate's structures, so what they measure is the
+    /// experiment, not this change. On the soak a result cache enabled beside
+    /// an index experiment served almost nothing for its whole window and was
+    /// recorded as making the median 31% *slower*.
+    confounded: bool,
 }
 
 pub struct AdaptiveDriver {
@@ -237,14 +252,25 @@ impl AdaptiveDriver {
     }
 
     /// Fold any change that has had time to show an effect into the model.
-    fn learn(&mut self, now: Metrics) {
+    ///
+    /// A change is judged on its own query's samples since it was made, and
+    /// not at all if an experiment overlapped the wait; see [`Pending`].
+    fn learn(&mut self, telemetry: &Snapshot, bytes: u64, experimenting: bool) {
         let cycle = self.cycles;
         let mut still_pending = Vec::new();
-        for p in std::mem::take(&mut self.pending) {
+        for mut p in std::mem::take(&mut self.pending) {
+            p.confounded |= experimenting;
             if cycle < p.applied_at + OBSERVE_AFTER_CYCLES {
                 still_pending.push(p);
                 continue;
             }
+            if p.confounded {
+                continue;
+            }
+            let Some(now) = metrics_since(telemetry, &p.baseline, &p.baseline_latency, bytes)
+            else {
+                continue;
+            };
             if let Some(obs) = Observation::between(&p.baseline, &now) {
                 self.model.record(&p.optimization, obs);
             }
@@ -460,7 +486,11 @@ impl OptimizationDriver for AdaptiveDriver {
         let now = metrics_from(input.telemetry, input.ctx.current_bytes);
         // Fold in anything that has had time to show an effect, so this cycle
         // decides against the most corrected priors available.
-        self.learn(now);
+        self.learn(
+            input.telemetry,
+            input.ctx.current_bytes,
+            !input.under_experiment.is_empty(),
+        );
 
         // Acting on a handful of operations would be reacting to startup, not
         // to a workload.
@@ -488,7 +518,7 @@ impl OptimizationDriver for AdaptiveDriver {
         choose_additions(&mut chosen, additions, input.registry, input.policy);
 
         self.remember_if_settled(chosen.is_empty(), fingerprint, input.current);
-        self.record_changes(&chosen, now);
+        self.record_changes(&chosen, now, input.telemetry);
         self.proposals += chosen.len() as u64;
         chosen
     }
@@ -574,14 +604,21 @@ impl AdaptiveDriver {
 
     /// Starts the cooldown on every chosen scope, queues enables for
     /// measurement, and bars evidence-based retractions from quick re-proposal.
-    fn record_changes(&mut self, chosen: &[Decision], now: Metrics) {
+    fn record_changes(&mut self, chosen: &[Decision], now: Metrics, telemetry: &Snapshot) {
+        let latency = telemetry
+            .per_shape
+            .get(&QueryShape(now.shape))
+            .map(|s| s.latency.clone())
+            .unwrap_or_default();
         for d in chosen {
             self.mark_changed(d.optimization, &d.scope);
             match d.action {
                 DecisionAction::Enable => self.pending.push(Pending {
                     optimization: d.optimization.to_string(),
                     baseline: now,
+                    baseline_latency: latency.clone(),
                     applied_at: self.cycles,
+                    confounded: false,
                 }),
                 DecisionAction::Disable if evidence_based(&d.trigger) => {
                     // Measurement refuted the estimate; do not let the estimate
@@ -682,17 +719,39 @@ fn choose_additions(
 pub fn metrics_from(telemetry: &Snapshot, bytes: u64) -> Metrics {
     let hottest = telemetry.hottest_shapes(1);
     match hottest.first() {
-        Some((_, stats)) => Metrics {
+        Some((shape, stats)) => Metrics {
+            shape: shape.0,
             p50_nanos: stats.latency.percentile(50.0),
             p99_nanos: stats.latency.percentile(99.0),
             bytes,
-            operations: stats.calls,
+            // The samples the percentiles are taken over. Not `calls`, which
+            // decays while the histogram does not.
+            operations: stats.latency.count(),
         },
         None => Metrics {
             bytes,
             ..Default::default()
         },
     }
+}
+
+/// The measured shape's latency over the samples recorded since `baseline`
+/// was taken, or `None` if the shape has not run since.
+fn metrics_since(
+    telemetry: &Snapshot,
+    baseline: &Metrics,
+    baseline_latency: &Histogram,
+    bytes: u64,
+) -> Option<Metrics> {
+    let stats = telemetry.per_shape.get(&QueryShape(baseline.shape))?;
+    let newer = stats.latency.since(baseline_latency);
+    Some(Metrics {
+        shape: baseline.shape,
+        p50_nanos: newer.percentile(50.0),
+        p99_nanos: newer.percentile(99.0),
+        bytes,
+        operations: newer.count(),
+    })
 }
 
 #[cfg(test)]
@@ -888,6 +947,76 @@ mod wiring {
             0,
             "a configuration that never settled was remembered anyway"
         );
+    }
+
+    /// Runs the driver from an empty configuration over a workload whose one
+    /// shape takes `before_nanos` until the first change and `after_nanos`
+    /// from then on, with an experiment running throughout if `experimenting`.
+    /// Returns the p50 ratios the model recorded for `a`.
+    fn measure(before_nanos: u64, after_nanos: u64, experimenting: bool) -> Vec<f64> {
+        let mut reg = Registry::new();
+        reg.register(Box::new(Simple(&A_META)));
+        let policy = Policy::conventional();
+        let fx = Fx::new();
+        let probe = CollectingProbe::new();
+        let record = |nanos: u64, n: usize| {
+            for _ in 0..n {
+                probe.record(Event::Op {
+                    collection: "users",
+                    kind: OpKind::Get,
+                    shape: QueryShape(1),
+                    nanos,
+                    rows: 1,
+                });
+            }
+        };
+        // A long history before the change, so a measurement taken over the
+        // whole histogram would barely see the change at all.
+        record(before_nanos, 20_000);
+        let under: Vec<(&'static str, String)> = if experimenting {
+            vec![("other", "global".to_string())]
+        } else {
+            Vec::new()
+        };
+        let mut config = OptimizationConfig::new();
+        let mut d = AdaptiveDriver::new();
+        for _ in 0..(OBSERVE_AFTER_CYCLES + 2) {
+            let s = probe.snapshot();
+            let ctx = fx.ctx(&policy, &s);
+            for x in d.decide(DriverInput {
+                registry: &reg,
+                current: &config,
+                policy: &policy,
+                telemetry: &s,
+                ctx: &ctx,
+                under_experiment: &under,
+                pinned: &[],
+            }) {
+                config.enable(x.optimization, x.scope.clone(), x.params.clone());
+            }
+            record(after_nanos, 500);
+        }
+        d.model()
+            .observations("a")
+            .iter()
+            .map(|o| o.p50_ratio)
+            .collect()
+    }
+
+    #[test]
+    fn a_change_is_measured_on_the_samples_since_it_was_made() {
+        // Twenty thousand samples at 1 us, then the change halves it. Over
+        // the cumulative histogram the median would still read 1 us.
+        let seen = measure(1_000, 500, false);
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(seen[0] < 0.6, "the halving was measured as {:.2}x", seen[0]);
+    }
+
+    #[test]
+    fn a_change_made_beside_an_experiment_is_not_measured() {
+        // An experiment reroutes queries around the caches and through its
+        // candidate, so the window measures the experiment, not this change.
+        assert!(measure(1_000, 500, true).is_empty());
     }
 
     #[test]

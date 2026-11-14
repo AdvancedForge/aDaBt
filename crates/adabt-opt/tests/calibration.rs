@@ -54,7 +54,13 @@ impl Optimization for Optimistic {
 
 fn busy_snapshot() -> Snapshot {
     let p = CollectingProbe::new();
-    for _ in 0..2_000 {
+    record_gets(&p, 2_000);
+    p.snapshot()
+}
+
+/// `n` identity lookups of one shape, all taking a microsecond.
+fn record_gets(p: &CollectingProbe, n: usize) {
+    for _ in 0..n {
         p.record(Event::Op {
             collection: "users",
             kind: OpKind::Get,
@@ -63,7 +69,6 @@ fn busy_snapshot() -> Snapshot {
             rows: 1,
         });
     }
-    p.snapshot()
 }
 
 struct Fx {
@@ -140,6 +145,7 @@ fn measurement_stops_a_refuted_estimate_from_being_proposed_again() {
     // fifty-cycle cooldown held it off.
     let mut model = CostModel::new();
     let flat = Metrics {
+        shape: 1,
         p50_nanos: 1_000,
         p99_nanos: 5_000,
         bytes: 4_000_000,
@@ -212,7 +218,13 @@ fn the_driver_folds_measurements_in_over_cycles() {
     assert_eq!(d.pending_measurements(), decisions.len().min(2));
 
     // Later cycles, with the workload unchanged, fold in "it did nothing".
+    // The traffic keeps arriving: a change is judged on the samples recorded
+    // after it, so a workload that stopped would leave nothing to measure.
+    let probe = CollectingProbe::new();
     for _ in 0..6 {
+        record_gets(&probe, 2_000);
+        let snap = probe.snapshot();
+        let ctx = fx.ctx(&policy, &snap);
         d.decide(DriverInput {
             registry: &reg,
             current: &config,
