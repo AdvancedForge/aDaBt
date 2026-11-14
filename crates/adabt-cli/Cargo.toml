@@ -10,6 +10,7 @@ description = "SQL shell for aDaBt."
 adabt-core.workspace = true
 adabt-engine.workspace = true
 adabt-ir.workspace = true
+adabt-opt.workspace = true
 
 [[bin]]
 name = "adabt-cli"

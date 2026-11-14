@@ -32,7 +32,13 @@ fn main() {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--level" => {
-                level = args.next().and_then(|v| v.parse().ok()).unwrap_or(4);
+                level = match args.next().map(|v| v.parse()) {
+                    Some(Ok(n)) if n <= adabt_opt::MAX_LEVEL => n,
+                    _ => {
+                        eprintln!("--level expects a number 0-{}", adabt_opt::MAX_LEVEL);
+                        std::process::exit(2);
+                    }
+                };
             }
             "--version" => {
                 println!("adabt-cli {}", env!("CARGO_PKG_VERSION"));

@@ -24,6 +24,7 @@ dependencies = [
  "adabt-core",
  "adabt-engine",
  "adabt-ir",
+ "adabt-opt",
 ]
 
 [[package]]

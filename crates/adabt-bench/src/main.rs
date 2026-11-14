@@ -54,6 +54,35 @@ fn arg(args: &[String], key: &str) -> Option<String> {
     args.get(i + 1).cloned()
 }
 
+/// The value of `key` parsed as `T`, or `default` when the flag is absent.
+/// A present but malformed value is a usage error, never a silent default:
+/// a benchmark that quietly ran with other settings reports wrong numbers.
+fn parsed<T: std::str::FromStr>(args: &[String], key: &str, default: T) -> T {
+    match arg(args, key) {
+        None => default,
+        Some(v) => v.parse().unwrap_or_else(|_| {
+            eprintln!("{key} expects a number, got {v:?}");
+            std::process::exit(2)
+        }),
+    }
+}
+
+/// A comma-separated list of `T`, with the same refusal rule as [`parsed`].
+fn parsed_list<T: std::str::FromStr>(args: &[String], key: &str, default: Vec<T>) -> Vec<T> {
+    match arg(args, key) {
+        None => default,
+        Some(list) => list
+            .split(',')
+            .map(|item| {
+                item.trim().parse().unwrap_or_else(|_| {
+                    eprintln!("{key} expects comma-separated numbers, got {item:?}");
+                    std::process::exit(2)
+                })
+            })
+            .collect(),
+    }
+}
+
 fn flag(args: &[String], key: &str) -> bool {
     args.iter().any(|a| a == key)
 }
@@ -140,20 +169,12 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("");
 
-    let size: u64 = arg(&args, "--size")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(100_000);
-    let ops: u64 = arg(&args, "--ops")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(200_000);
-    let seed: u64 = arg(&args, "--seed")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0xADAB7);
+    let size: u64 = parsed(&args, "--size", 100_000);
+    let ops: u64 = parsed(&args, "--ops", 200_000);
+    let seed: u64 = parsed(&args, "--seed", 0xADAB7);
     // A matrix spans workloads whose per-op cost differs by orders of
     // magnitude, so every run is bounded by wall-clock as well as op count.
-    let duration: Option<f64> = arg(&args, "--duration")
-        .and_then(|s| s.parse().ok())
-        .or(Some(10.0));
+    let duration: Option<f64> = Some(parsed(&args, "--duration", 10.0));
     let engine = arg(&args, "--engine").unwrap_or_else(|| "reference".into());
     let durability =
         parse_durability(&arg(&args, "--durability").unwrap_or_else(|| "strict".into()));
@@ -161,9 +182,7 @@ fn main() {
     let disabled: Vec<String> = arg(&args, "--disable")
         .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
         .unwrap_or_default();
-    let pool: usize = arg(&args, "--pool")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1024);
+    let pool: usize = parsed(&args, "--pool", 1024);
 
     // Default to a real disk. /tmp is tmpfs on most systems, where fsync is a
     // no-op and every durability number is meaningless.
@@ -197,27 +216,15 @@ fn main() {
         "soak" => {
             let cfg = soak::SoakConfig {
                 size,
-                ops_per_phase: arg(&args, "--ops-per-phase")
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(20_000),
+                ops_per_phase: parsed(&args, "--ops-per-phase", 20_000),
                 seed,
                 verify: !flag(&args, "--no-verify"),
-                verify_every: arg(&args, "--verify-every")
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(64),
-                cycle_every: arg(&args, "--cycle-every")
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(500),
+                verify_every: parsed(&args, "--verify-every", 64),
+                cycle_every: parsed(&args, "--cycle-every", 500),
                 priorities: adabt_core::policy::Priorities {
-                    speed: arg(&args, "--speed")
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(9),
-                    resources: arg(&args, "--resources")
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(3),
-                    freedom: arg(&args, "--freedom")
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(5),
+                    speed: parsed(&args, "--speed", 9),
+                    resources: parsed(&args, "--resources", 3),
+                    freedom: parsed(&args, "--freedom", 5),
                 },
             };
             let r = match soak::run_soak(&data_dir, &cfg) {
@@ -286,9 +293,7 @@ fn main() {
             // others rather than emitting identical rows under different
             // labels, which would read as "optimization made no difference"
             // instead of "does not apply".
-            let levels: Vec<u8> = arg(&args, "--levels")
-                .map(|l| l.split(',').filter_map(|s| s.trim().parse().ok()).collect())
-                .unwrap_or_else(|| vec![0]);
+            let levels: Vec<u8> = parsed_list(&args, "--levels", vec![0]);
             if engine != "engine" && levels.iter().any(|&l| l != 0) {
                 eprintln!(
                     "only the `engine` backend has optimization levels; \
@@ -333,9 +338,7 @@ fn main() {
                     .map(|s| queries::QueryMix::parse(s.trim()).unwrap_or_else(|| usage()))
                     .collect(),
             };
-            let levels: Vec<u8> = arg(&args, "--levels")
-                .map(|l| l.split(',').filter_map(|s| s.trim().parse().ok()).collect())
-                .unwrap_or_else(|| vec![0, 1, 2, 3, 10]);
+            let levels: Vec<u8> = parsed_list(&args, "--levels", vec![0, 1, 2, 3, 10]);
 
             let mut reports = Vec::new();
             for mix in mixes {
@@ -389,39 +392,23 @@ fn main() {
         }
 
         "scale" => {
-            let max = arg(&args, "--max-rows")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(8_000_000u64);
-            let budget = arg(&args, "--budget-mb")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1_500u64);
-            let pool_pages: usize = arg(&args, "--pool-pages")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
+            let max = parsed(&args, "--max-rows", 8_000_000u64);
+            let budget = parsed(&args, "--budget-mb", 1_500u64);
+            let pool_pages: usize = parsed(&args, "--pool-pages", 0);
             scale::run(&data_dir, max, budget, pool_pages);
         }
         "fetch-profile" => {
-            let rows = arg(&args, "--size")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(50_000u64);
-            let reps: u32 = arg(&args, "--reps")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(3);
+            let rows = parsed(&args, "--size", 50_000u64);
+            let reps: u32 = parsed(&args, "--reps", 3);
             scale::fetch_profile(rows, reps);
         }
         "record-repr" => {
-            let rows = arg(&args, "--size")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(200_000u64);
-            let reps: u32 = arg(&args, "--reps")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(5);
+            let rows = parsed(&args, "--size", 200_000u64);
+            let reps: u32 = parsed(&args, "--reps", 5);
             scale::record_repr(rows, reps);
         }
         "index-scale" => {
-            let rows = arg(&args, "--size")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1_000_000u64);
+            let rows = parsed(&args, "--size", 1_000_000u64);
             scale::index_comparison(rows);
         }
         "compiled" => {
