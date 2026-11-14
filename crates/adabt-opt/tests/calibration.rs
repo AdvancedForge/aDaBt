@@ -279,6 +279,7 @@ fn a_change_whose_prior_measurement_refutes_is_eventually_retracted() {
                 p50_ratio: 1.0,
                 p99_ratio: 1.0,
                 byte_delta: 0,
+                predicted: None,
             },
         );
     }

@@ -31,6 +31,7 @@ use adabt_telemetry::{Histogram, QueryShape, Snapshot};
 use std::collections::HashMap;
 
 use crate::config::OptimizationConfig;
+use crate::cost::CostEstimate;
 use crate::decision::{Decision, DecisionAction, Source};
 use crate::driver::{DriverInput, OptimizationDriver};
 use crate::memory::{Fingerprint, WorkloadMemory};
@@ -159,6 +160,9 @@ struct Pending {
     /// an index experiment served almost nothing for its whole window and was
     /// recorded as making the median 31% *slower*.
     confounded: bool,
+    /// The uncalibrated estimate the change was admitted on, so the
+    /// measurement can be read as a correction to it.
+    prior: CostEstimate,
 }
 
 pub struct AdaptiveDriver {
@@ -271,7 +275,9 @@ impl AdaptiveDriver {
             else {
                 continue;
             };
-            if let Some(obs) = Observation::between(&p.baseline, &now) {
+            if let Some(obs) =
+                Observation::between(&p.baseline, &now).map(|o| o.predicting(&p.prior))
+            {
                 self.model.record(&p.optimization, obs);
             }
         }
@@ -532,7 +538,7 @@ impl OptimizationDriver for AdaptiveDriver {
         choose_additions(&mut chosen, additions, input.registry, input.policy);
 
         self.remember_if_settled(chosen.is_empty(), fingerprint, input.current);
-        self.record_changes(&chosen, now, input.telemetry);
+        self.record_changes(&chosen, now, &input);
         self.proposals += chosen.len() as u64;
         chosen
     }
@@ -618,8 +624,9 @@ impl AdaptiveDriver {
 
     /// Starts the cooldown on every chosen scope, queues enables for
     /// measurement, and bars evidence-based retractions from quick re-proposal.
-    fn record_changes(&mut self, chosen: &[Decision], now: Metrics, telemetry: &Snapshot) {
-        let latency = telemetry
+    fn record_changes(&mut self, chosen: &[Decision], now: Metrics, input: &DriverInput<'_>) {
+        let latency = input
+            .telemetry
             .per_shape
             .get(&QueryShape(now.shape))
             .map(|s| s.latency.clone())
@@ -633,6 +640,11 @@ impl AdaptiveDriver {
                     baseline_latency: latency.clone(),
                     applied_at: self.cycles,
                     confounded: false,
+                    prior: input
+                        .registry
+                        .get(d.optimization)
+                        .map(|o| o.estimate(input.ctx))
+                        .unwrap_or_else(CostEstimate::neutral),
                 }),
                 DecisionAction::Disable if evidence_based(&d.trigger) => {
                     // Measurement refuted the estimate; do not let the estimate

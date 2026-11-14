@@ -65,6 +65,10 @@ pub struct Observation {
     pub p50_ratio: f64,
     pub p99_ratio: f64,
     pub byte_delta: i64,
+    /// The p50 and p99 ratios the uncalibrated estimate predicted when the
+    /// change was made, if known. See [`CostModel::calibrate`] for why it
+    /// matters.
+    pub predicted: Option<(f64, f64)>,
 }
 
 impl Observation {
@@ -76,9 +80,57 @@ impl Observation {
             p50_ratio: after.p50_nanos as f64 / before.p50_nanos as f64,
             p99_ratio: after.p99_nanos as f64 / before.p99_nanos as f64,
             byte_delta: after.bytes as i64 - before.bytes as i64,
+            predicted: None,
         })
     }
+
+    /// Record what the estimate predicted for this change.
+    pub fn predicting(mut self, prior: &CostEstimate) -> Self {
+        self.predicted = Some((prior.p50_delta.0, prior.p99_delta.0));
+        self
+    }
+
+    /// The latency ratios this observation implies for a change whose
+    /// uncalibrated estimate is now `prior`.
+    ///
+    /// With no prediction on record, what was measured. With one, the
+    /// measurement is read as a correction *to the prediction*: the gain the
+    /// estimate claims now, scaled by how the measured gain compared with
+    /// the gain it claimed then. That keeps a measurement taken on one
+    /// workload from claiming a gain on another: an estimate grounded in the
+    /// traffic it helps claims nothing once that traffic has gone, and nothing
+    /// scaled is still nothing.
+    fn implied(&self, prior: &CostEstimate) -> (f64, f64) {
+        let Some((then_p50, then_p99)) = self.predicted else {
+            return (self.p50_ratio, self.p99_ratio);
+        };
+        let scale = |now: f64, then: f64, seen: f64| {
+            let claimed = 1.0 - then;
+            if claimed.abs() < MIN_CLAIMED_GAIN {
+                return seen;
+            }
+            let factor = ((1.0 - seen) / claimed).clamp(-MAX_FACTOR, MAX_FACTOR);
+            (1.0 - (1.0 - now) * factor).max(0.0)
+        };
+        (
+            scale(prior.p50_delta.0, then_p50, self.p50_ratio),
+            scale(prior.p99_delta.0, then_p99, self.p99_ratio),
+        )
+    }
 }
+
+/// A predicted gain below which a measurement cannot be read as a correction
+/// to it: a factor over a claim of nothing is noise divided by nothing.
+const MIN_CLAIMED_GAIN: f64 = 0.01;
+
+/// Bound on how far one measurement can scale a prediction.
+///
+/// Observations are confounded with whatever else changed in their window,
+/// and an unbounded factor lets one of them dominate: a 2% claim measured
+/// beside a change that halved latency would read as a factor of 25. Five
+/// lets a measurement say "it was several times better or worse than
+/// claimed", which is as much as one confounded before-and-after can say.
+const MAX_FACTOR: f64 = 5.0;
 
 /// Observations required before the model trusts itself over the prior.
 const FULL_TRUST_AT: f64 = 8.0;
@@ -140,6 +192,13 @@ impl CostModel {
     /// With no observations the prior is returned untouched. As they accumulate
     /// the estimate moves toward what was actually seen, and confidence rises —
     /// but only while the observations agree with each other.
+    ///
+    /// An observation that records what was predicted corrects the
+    /// *prediction* rather than replacing it (see `Observation::implied`).
+    /// Without that, a gain measured while a column store's scans were running
+    /// went on being claimed after the scans stopped: the soak's last phase,
+    /// pure identity lookups, kept a column store because one measurement from
+    /// the aggregate phase said it was worth 12% there too.
     pub fn calibrate(&self, optimization: &str, prior: CostEstimate) -> CostEstimate {
         let obs = self.observations(optimization);
         if obs.is_empty() {
@@ -149,8 +208,9 @@ impl CostModel {
         // Weight on the measurements, rising with count and saturating.
         let w = (n / FULL_TRUST_AT).min(1.0);
 
-        let mean_p50 = obs.iter().map(|o| o.p50_ratio).sum::<f64>() / n;
-        let mean_p99 = obs.iter().map(|o| o.p99_ratio).sum::<f64>() / n;
+        let implied: Vec<(f64, f64)> = obs.iter().map(|o| o.implied(&prior)).collect();
+        let mean_p50 = implied.iter().map(|(p50, _)| p50).sum::<f64>() / n;
+        let mean_p99 = implied.iter().map(|(_, p99)| p99).sum::<f64>() / n;
         let mean_bytes = obs.iter().map(|o| o.byte_delta as f64).sum::<f64>() / n;
 
         let blend = |prior: f64, seen: f64| prior * (1.0 - w) + seen * w;
@@ -207,6 +267,42 @@ mod tests {
             bytes,
             operations: 10_000,
         }
+    }
+
+    /// Eight measurements of a change predicted to halve latency that
+    /// measured `seen` instead.
+    fn measured_against_a_halving(seen: f64) -> CostModel {
+        let predicted = CostEstimate::faster(0.5, 0.5);
+        let mut m = CostModel::new();
+        for _ in 0..8 {
+            let after = (1000.0 * seen) as u64;
+            m.record(
+                "scan_helper",
+                Observation::between(&metrics(1000, 1000, 0), &metrics(after, after, 0))
+                    .unwrap()
+                    .predicting(&predicted),
+            );
+        }
+        m
+    }
+
+    #[test]
+    fn a_measured_gain_does_not_outlive_the_traffic_it_was_measured_on() {
+        // Measured as predicted on a scan-heavy workload; the estimate now
+        // claims nothing, because the scans have stopped. The measurement
+        // must not put the gain back.
+        let m = measured_against_a_halving(0.5);
+        let c = m.calibrate("scan_helper", CostEstimate::neutral());
+        assert!(!c.helps_latency(), "{c:?}");
+    }
+
+    #[test]
+    fn a_prediction_is_corrected_in_proportion() {
+        // Predicted a halving, measured a quarter off: half the claimed gain.
+        // A claim of 40% now should be calibrated to 20%.
+        let m = measured_against_a_halving(0.75);
+        let c = m.calibrate("scan_helper", CostEstimate::faster(0.6, 0.6));
+        assert!((c.p50_delta.0 - 0.8).abs() < 1e-9, "{c:?}");
     }
 
     #[test]
