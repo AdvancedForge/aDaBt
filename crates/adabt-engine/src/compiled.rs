@@ -37,6 +37,15 @@ pub enum CompiledPath {
 }
 
 impl CompiledPath {
+    /// The collection this path reads.
+    pub fn collection(&self) -> &str {
+        match self {
+            CompiledPath::DirectById { collection } | CompiledPath::HeapById { collection } => {
+                collection
+            }
+        }
+    }
+
     pub fn describe(&self) -> String {
         match self {
             CompiledPath::DirectById { collection } => {
@@ -55,12 +64,53 @@ impl CompiledPath {
 /// cost of deciding is amortised over calls that will actually use it.
 pub const HOT_THRESHOLD: u64 = 256;
 
+/// One compiled call in this many is timed. The rest are only counted: the
+/// path is a couple of hundred nanoseconds, and reading the clock twice per
+/// call measurably slowed it.
+const SAMPLE_EVERY: u64 = 16;
+
+/// Traffic one compiled shape has served since it was last reported.
+///
+/// A compiled lookup skips the general path's telemetry, and it has to report
+/// somehow: a shape whose traffic disappears from telemetry the moment it gets
+/// fast is a shape the adaptive driver stops reasoning about. Counting every
+/// call and timing a sample keeps that evidence at a fraction of the cost of
+/// an event per call.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Tally {
+    pub calls: u64,
+    pub rows: u64,
+    sampled_nanos: u64,
+    samples: u64,
+}
+
+impl Tally {
+    /// Mean latency of the sampled calls; zero if none were sampled yet.
+    pub fn mean_nanos(&self) -> u64 {
+        self.sampled_nanos.checked_div(self.samples).unwrap_or(0)
+    }
+}
+
+/// A compiled call in progress: whether to time it.
+#[derive(Debug, Clone, Copy)]
+pub struct Call {
+    pub timed: bool,
+}
+
+struct Compiled {
+    path: CompiledPath,
+    tally: Tally,
+}
+
 /// What can be specialised, and what has been.
 #[derive(Default)]
 pub struct CompiledPaths {
-    paths: HashMap<QueryShape, CompiledPath>,
+    paths: HashMap<QueryShape, Compiled>,
     /// Shapes seen but not yet hot enough to specialise.
     counts: HashMap<QueryShape, u64>,
+    /// Traffic of paths dropped by [`clear`](Self::clear) and not yet
+    /// reported, so a layout change cannot erase evidence.
+    retired: Vec<(QueryShape, String, Tally)>,
     pub hits: u64,
     pub compilations: u64,
 }
@@ -70,12 +120,43 @@ impl CompiledPaths {
         Self::default()
     }
 
-    pub fn get(&mut self, shape: QueryShape) -> Option<&CompiledPath> {
-        let found = self.paths.get(&shape);
-        if found.is_some() {
-            self.hits += 1;
+    /// Start a call through the compiled path for `shape`, if there is one.
+    pub fn enter(&mut self, shape: QueryShape) -> Option<Call> {
+        let compiled = self.paths.get_mut(&shape)?;
+        self.hits += 1;
+        compiled.tally.calls += 1;
+        Some(Call {
+            timed: compiled.tally.calls % SAMPLE_EVERY == 1,
+        })
+    }
+
+    /// Finish a call started with [`enter`](Self::enter): count its rows, and
+    /// for a timed call, its latency.
+    pub fn leave(&mut self, shape: QueryShape, call: Call, rows: u64, nanos: Option<u64>) {
+        if let Some(compiled) = self.paths.get_mut(&shape) {
+            compiled.tally.rows += rows;
+            if let (true, Some(n)) = (call.timed, nanos) {
+                compiled.tally.sampled_nanos += n;
+                compiled.tally.samples += 1;
+            }
         }
-        found
+    }
+
+    /// Take every shape's traffic since the last report, with the collection
+    /// it reads. Shapes that served nothing are left out.
+    pub fn drain_tallies(&mut self) -> Vec<(QueryShape, String, Tally)> {
+        let live = self
+            .paths
+            .iter_mut()
+            .filter(|(_, c)| c.tally.calls > 0)
+            .map(|(shape, c)| {
+                let tally = std::mem::take(&mut c.tally);
+                (*shape, c.path.collection().to_string(), tally)
+            });
+        std::mem::take(&mut self.retired)
+            .into_iter()
+            .chain(live)
+            .collect()
     }
 
     pub fn len(&self) -> usize {
@@ -96,7 +177,13 @@ impl CompiledPaths {
     }
 
     pub fn install(&mut self, shape: QueryShape, path: CompiledPath) {
-        self.paths.insert(shape, path);
+        self.paths.insert(
+            shape,
+            Compiled {
+                path,
+                tally: Tally::default(),
+            },
+        );
         self.counts.remove(&shape);
         self.compilations += 1;
     }
@@ -107,6 +194,8 @@ impl CompiledPaths {
     /// decision about what exists; if a direct array is dropped, a path that
     /// still reaches for it is wrong rather than merely stale.
     pub fn clear(&mut self) {
+        let unreported = self.drain_tallies();
+        self.retired = unreported;
         self.paths.clear();
         self.counts.clear();
     }
@@ -164,7 +253,7 @@ mod tests {
             },
         );
         assert!(!c.observe(s), "an installed shape was counted again");
-        assert!(c.get(s).is_some());
+        assert!(c.enter(s).is_some());
         assert_eq!(c.hits, 1);
     }
 
@@ -213,7 +302,7 @@ mod tests {
         c.observe(QueryShape(2));
         c.clear();
         assert!(c.is_empty());
-        assert!(c.get(QueryShape(1)).is_none());
+        assert!(c.enter(QueryShape(1)).is_none());
         // And the partial count is gone too, so a shape does not jump straight
         // back to hot against a layout that no longer exists.
         assert!(!c.observe(QueryShape(2)));
@@ -229,5 +318,53 @@ mod tests {
             collection: "users".into(),
         };
         assert!(h.describe().contains("page directory"));
+    }
+
+    #[test]
+    fn every_call_is_counted_and_one_in_sample_every_is_timed() {
+        let mut c = CompiledPaths::new();
+        let s = QueryShape(9);
+        c.install(
+            s,
+            CompiledPath::HeapById {
+                collection: "users".into(),
+            },
+        );
+        let mut timed = 0;
+        for _ in 0..(SAMPLE_EVERY * 4) {
+            let call = c.enter(s).unwrap();
+            timed += call.timed as u64;
+            c.leave(s, call, 1, call.timed.then_some(200));
+        }
+        assert_eq!(timed, 4);
+        let drained = c.drain_tallies();
+        assert_eq!(drained.len(), 1);
+        let (_, collection, tally) = &drained[0];
+        assert_eq!(collection, "users");
+        assert_eq!(
+            (tally.calls, tally.rows, tally.mean_nanos()),
+            (SAMPLE_EVERY * 4, SAMPLE_EVERY * 4, 200)
+        );
+        assert!(
+            c.drain_tallies().is_empty(),
+            "a drained tally must not be reported twice"
+        );
+    }
+
+    #[test]
+    fn clearing_compiled_paths_keeps_their_unreported_traffic() {
+        let mut c = CompiledPaths::new();
+        let s = QueryShape(9);
+        c.install(
+            s,
+            CompiledPath::HeapById {
+                collection: "users".into(),
+            },
+        );
+        let call = c.enter(s).unwrap();
+        c.leave(s, call, 1, Some(100));
+        c.clear();
+        assert!(c.enter(s).is_none());
+        assert_eq!(c.drain_tallies()[0].2.calls, 1);
     }
 }

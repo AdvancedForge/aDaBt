@@ -17,7 +17,7 @@ use adabt_core::ids::RecordId;
 use adabt_core::record::Record;
 use adabt_exec::planner::PlanDecision;
 use adabt_ir::{QueryKey, QueryShape};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CacheStats {
@@ -138,6 +138,18 @@ impl PlanCache {
 
 type Rows = Vec<(RecordId, Record)>;
 
+/// Entries a result cache holds when the optimizer turns it on, and therefore
+/// the size of the ghost that predicts what such a cache would do while it is
+/// off.
+pub const RESULT_CACHE_ENTRIES: usize = 256;
+
+/// The telemetry name the ghost's would-be hits and misses are recorded under.
+///
+/// Kept apart from `"result_cache"` so a simulated hit rate is never mistaken
+/// for a measured one, and so a cache that is on is judged by what it actually
+/// served.
+pub const RESULT_CACHE_GHOST: &str = "result_cache_ghost";
+
 struct ResultEntry {
     collection: String,
     epoch: u64,
@@ -151,6 +163,109 @@ pub struct ResultCache {
     order: Vec<QueryKey>,
     capacity: usize,
     stats: CacheStats,
+    /// What a cache of [`RESULT_CACHE_ENTRIES`] would hold, kept only while
+    /// this one is off.
+    ghost: Ghost,
+}
+
+/// One remembered key: everything the real cache keeps except the rows.
+struct GhostEntry {
+    collection: String,
+    epoch: u64,
+    bytes: usize,
+}
+
+/// A result cache that stores keys and sizes but no rows.
+///
+/// **Whether a result cache pays is a fact about the traffic, not about the
+/// database**: it pays when the same query, literals included, comes back
+/// before a write to its collection makes the answer stale. No estimate can
+/// know that, and a cache that is off cannot measure it. A ghost can: it runs
+/// the real cache's admission, eviction and invalidation rules on the keys
+/// alone, so its hit rate is the hit rate the cache would have had, and its
+/// byte count is the memory the cache would have used. Both are what the
+/// optimizer otherwise had to guess.
+///
+/// The cost is a hash lookup per query and a few dozen bytes per remembered
+/// key, bounded by [`RESULT_CACHE_ENTRIES`].
+#[derive(Default)]
+struct Ghost {
+    entries: HashMap<QueryKey, GhostEntry>,
+    order: VecDeque<QueryKey>,
+    bytes: usize,
+}
+
+impl Ghost {
+    /// Whether the real cache would have answered this query. A stale entry
+    /// is dropped, as the real cache drops it.
+    fn probe(&mut self, key: QueryKey, epoch: u64) -> bool {
+        match self.entries.get(&key) {
+            Some(e) if e.epoch == epoch => true,
+            Some(_) => {
+                self.remove(key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Remember a key the real cache would now hold, evicting oldest-first as
+    /// it would.
+    fn admit(&mut self, key: QueryKey, collection: &str, epoch: u64, bytes: usize) {
+        if self.entries.contains_key(&key) {
+            return;
+        }
+        self.entries.insert(
+            key,
+            GhostEntry {
+                collection: collection.to_string(),
+                epoch,
+                bytes,
+            },
+        );
+        self.order.push_back(key);
+        self.bytes += bytes;
+        while self.entries.len() > RESULT_CACHE_ENTRIES {
+            match self.order.front().copied() {
+                Some(oldest) => self.remove(oldest),
+                None => break,
+            }
+        }
+    }
+
+    fn remove(&mut self, key: QueryKey) {
+        if let Some(e) = self.entries.remove(&key) {
+            self.bytes -= e.bytes;
+            self.order.retain(|k| *k != key);
+        }
+    }
+
+    fn invalidate_collection(&mut self, collection: &str) {
+        self.entries.retain(|_, e| e.collection != collection);
+        let entries = &self.entries;
+        self.order.retain(|k| entries.contains_key(k));
+        self.bytes = self.entries.values().map(|e| e.bytes).sum();
+    }
+
+    fn clear(&mut self) {
+        *self = Ghost::default();
+    }
+}
+
+/// Approximate bytes a cached copy of `rows` occupies, on the same scale as
+/// [`ResultCache::memory_bytes`].
+///
+/// Measured on the first row and scaled, not summed over every row: this runs
+/// on every query the ghost sees, and walking a large result set to size it
+/// would cost a noticeable fraction of producing it. Rows of one result share
+/// a projection, so the first is representative.
+fn approx_rows_bytes(collection: &str, rows: &Rows) -> usize {
+    let per_row = rows.first().map_or(0, |(_, r)| row_bytes(r));
+    collection.len() + per_row * rows.len()
+}
+
+fn row_bytes(r: &Record) -> usize {
+    r.iter().map(|(k, _)| k.len() + 48).sum::<usize>() + 32
 }
 
 impl ResultCache {
@@ -182,6 +297,10 @@ impl ResultCache {
         while self.entries.len() > self.capacity {
             self.evict_one();
         }
+        // A real cache now measures itself; the ghost would only shadow it.
+        if self.enabled() {
+            self.ghost.clear();
+        }
     }
 
     fn evict_one(&mut self) {
@@ -191,6 +310,36 @@ impl ResultCache {
         let victim = self.order.remove(0);
         self.entries.remove(&victim);
         self.stats.evictions += 1;
+    }
+
+    /// While the cache is off: whether it would have answered this query.
+    ///
+    /// Always `false` while it is on — the real lookup answers that, and a
+    /// second opinion would double-count the traffic.
+    pub fn would_hit(&mut self, key: QueryKey, epoch: u64) -> bool {
+        !self.enabled() && self.ghost.probe(key, epoch)
+    }
+
+    /// While the cache is off: note a result it would now hold.
+    ///
+    /// Takes the rows by reference and keeps only their size, so a disabled
+    /// cache still never makes the caller build a copy it will discard.
+    pub fn note_would_insert(&mut self, key: QueryKey, collection: &str, epoch: u64, rows: &Rows) {
+        if self.enabled() {
+            return;
+        }
+        let bytes = approx_rows_bytes(collection, rows);
+        self.ghost.admit(key, collection, epoch, bytes);
+    }
+
+    /// Bytes this cache holds, or while it is off, would hold on the traffic
+    /// seen so far. The resource half of deciding whether to turn it on.
+    pub fn resident_bytes(&self) -> usize {
+        if self.enabled() {
+            self.memory_bytes()
+        } else {
+            self.ghost.bytes
+        }
     }
 
     /// Look up, treating any epoch mismatch as a miss.
@@ -263,6 +412,7 @@ impl ResultCache {
     }
     /// Drop every entry for one collection.
     pub fn invalidate_collection(&mut self, collection: &str) {
+        self.ghost.invalidate_collection(collection);
         let before = self.entries.len();
         self.entries.retain(|_, e| e.collection != collection);
         self.order.retain(|k| self.entries.contains_key(k));
@@ -274,6 +424,7 @@ impl ResultCache {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.order.clear();
+        self.ghost.clear();
         self.stats.invalidations += 1;
     }
 
@@ -281,13 +432,7 @@ impl ResultCache {
     pub fn memory_bytes(&self) -> usize {
         self.entries
             .values()
-            .map(|e| {
-                e.collection.len()
-                    + e.rows
-                        .iter()
-                        .map(|(_, r)| r.iter().map(|(k, _)| k.len() + 48).sum::<usize>() + 32)
-                        .sum::<usize>()
-            })
+            .map(|e| e.collection.len() + e.rows.iter().map(|(_, r)| row_bytes(r)).sum::<usize>())
             .sum()
     }
 }
@@ -440,6 +585,69 @@ mod tests {
         assert!(c.memory_bytes() > empty + 1000);
         c.clear();
         assert_eq!(c.memory_bytes(), 0);
+    }
+
+    #[test]
+    fn a_disabled_cache_predicts_the_hits_an_enabled_one_would_have() {
+        // The ghost's whole claim: same traffic, same verdicts as the real
+        // cache, without holding a single row.
+        let mut off = ResultCache::new(0);
+        let mut on = ResultCache::new(RESULT_CACHE_ENTRIES);
+        let traffic = [(1, 0), (2, 0), (1, 0), (1, 1), (2, 1), (2, 1), (3, 1)];
+        for (key, epoch) in traffic {
+            let key = QueryKey(key);
+            let predicted = off.would_hit(key, epoch);
+            let actual = on.get(key, epoch).is_some();
+            assert_eq!(
+                predicted, actual,
+                "ghost disagreed on {key:?} at epoch {epoch}"
+            );
+            off.note_would_insert(key, "users", epoch, &rows(2));
+            on.insert(key, "users", epoch, || rows(2));
+        }
+        assert!(off.is_empty(), "the ghost stored rows");
+    }
+
+    #[test]
+    fn the_ghost_reports_the_memory_the_cache_would_use() {
+        let mut off = ResultCache::new(0);
+        let mut on = ResultCache::new(RESULT_CACHE_ENTRIES);
+        for key in 0..10 {
+            off.note_would_insert(QueryKey(key), "users", 0, &rows(20));
+            on.insert(QueryKey(key), "users", 0, || rows(20));
+        }
+        assert_eq!(off.resident_bytes(), on.resident_bytes());
+    }
+
+    #[test]
+    fn the_ghost_forgets_a_collection_that_was_written_to() {
+        let mut off = ResultCache::new(0);
+        off.note_would_insert(QueryKey(1), "users", 0, &rows(2));
+        off.invalidate_collection("users");
+        assert!(!off.would_hit(QueryKey(1), 0));
+        assert_eq!(off.resident_bytes(), 0);
+    }
+
+    #[test]
+    fn the_ghost_is_bounded_by_the_size_the_cache_would_have() {
+        let mut off = ResultCache::new(0);
+        for key in 0..(RESULT_CACHE_ENTRIES as u64 * 2) {
+            off.note_would_insert(QueryKey(key), "users", 0, &rows(1));
+        }
+        assert!(
+            !off.would_hit(QueryKey(0), 0),
+            "the oldest key was not evicted"
+        );
+        assert!(off.would_hit(QueryKey(RESULT_CACHE_ENTRIES as u64 * 2 - 1), 0));
+    }
+
+    #[test]
+    fn enabling_the_cache_discards_the_ghost() {
+        let mut c = ResultCache::new(0);
+        c.note_would_insert(QueryKey(1), "users", 0, &rows(2));
+        c.set_capacity(RESULT_CACHE_ENTRIES);
+        assert_eq!(c.resident_bytes(), 0);
+        assert!(!c.would_hit(QueryKey(1), 0));
     }
 
     #[test]

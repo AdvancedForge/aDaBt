@@ -64,6 +64,18 @@ pub enum Event<'a> {
         nanos: u64,
         rows: u64,
     },
+    /// `count` operations of one shape, reported together: the form for paths
+    /// too hot to afford an event each. Recorded exactly as `count` `Op`
+    /// events of `nanos_each` would be, so nothing downstream can tell the
+    /// difference except in cost. `rows` is the total across all of them.
+    Ops {
+        collection: &'a str,
+        kind: OpKind,
+        shape: QueryShape,
+        count: u64,
+        nanos_each: u64,
+        rows: u64,
+    },
     /// A record was touched. Feeds data-temperature estimation.
     Touch { collection: &'a str, id: RecordId },
     /// A cache was consulted.
@@ -135,6 +147,15 @@ pub enum Event<'a> {
     /// either zero or a guess. Recorded at the exact point the price is
     /// actually paid, so it counts real work rather than an estimate of it.
     IndexMaintained { collection: &'a str, field: &'a str },
+    /// How many bytes a cache holds now, or for a cache that is switched off,
+    /// would hold on the traffic seen so far.
+    ///
+    /// A gauge, not a count: each report replaces the last and nothing decays
+    /// it. The resource half of judging a cache, beside the hit rate that is
+    /// the benefit half — without it a cache's memory could only be guessed
+    /// from its capacity, which overstates it by however many slots the
+    /// workload never fills.
+    CacheResident { name: &'static str, bytes: u64 },
     /// An optimization changed state.
     OptChanged { name: &'static str, enabled: bool },
 }

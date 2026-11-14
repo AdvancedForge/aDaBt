@@ -12,6 +12,7 @@ use adabt_opt::decision::{Decision, DecisionAction, Source as DecisionSource};
 use adabt_opt::driver::{ManualDriver, OptimizationDriver};
 use adabt_opt::experiment::Guardrails;
 use adabt_opt::{OptimizationConfig, OptimizationController, Registry};
+use adabt_telemetry::{Event, Probe};
 
 use super::{Database, OptInputs};
 
@@ -194,7 +195,33 @@ impl Database {
     }
 
     /// Gather everything the optimizer needs to describe this database.
+    /// Fold the compiled paths' traffic into telemetry. Those calls skip the
+    /// per-call events the general path records, so without this the
+    /// adaptive driver would see a shape's traffic vanish the moment it got
+    /// fast, and stop reasoning about it.
+    fn report_compiled_traffic(&mut self) {
+        for (shape, collection, tally) in self.caches.compiled.drain_tallies() {
+            self.telemetry.probe.record(Event::Ops {
+                collection: &collection,
+                // The kind the general path records for every query, so a
+                // shape looks the same whichever path answered it.
+                kind: adabt_telemetry::OpKind::Scan,
+                shape: adabt_telemetry::QueryShape(shape.0),
+                count: tally.calls,
+                nanos_each: tally.mean_nanos(),
+                rows: tally.rows,
+            });
+        }
+    }
+
     pub(super) fn opt_inputs(&mut self) -> Result<OptInputs> {
+        // What the result cache holds, or would hold if it were on: the
+        // memory half of judging it, measured rather than read off capacity.
+        self.telemetry.probe.record(Event::CacheResident {
+            name: "result_cache",
+            bytes: self.caches.results.resident_bytes() as u64,
+        });
+        self.report_compiled_traffic();
         let snapshot = self.telemetry.probe.snapshot();
         let collections = self.collection_sizes()?;
         let filtered = snapshot.most_filtered_fields();

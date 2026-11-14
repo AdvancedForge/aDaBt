@@ -67,6 +67,8 @@ pub struct Snapshot {
     pub per_shape: HashMap<QueryShape, ShapeStats>,
     pub cache_hits: HashMap<&'static str, u64>,
     pub cache_misses: HashMap<&'static str, u64>,
+    /// Latest reported bytes per cache; see `Event::CacheResident`.
+    pub cache_resident_bytes: HashMap<&'static str, u64>,
     /// `(collection, field) -> times a query filtered on it`.
     pub field_filters: HashMap<(String, String), u64>,
     /// Of those, how many were equality predicates.
@@ -125,6 +127,13 @@ impl Snapshot {
         } else {
             Some(h / (h + m))
         }
+    }
+
+    /// Hits plus misses recorded for a cache: how much evidence its hit rate
+    /// rests on.
+    pub fn probes(&self, cache: &str) -> u64 {
+        self.cache_hits.get(cache).copied().unwrap_or(0)
+            + self.cache_misses.get(cache).copied().unwrap_or(0)
     }
 
     pub fn latency(&self, kind: OpKind) -> Option<&Histogram> {
@@ -276,8 +285,42 @@ struct Shard {
     opt_changes: Vec<(&'static str, bool)>,
 }
 
+impl Shard {
+    /// Account for `count` operations of one kind and shape, each taking
+    /// `nanos_each`, returning `rows` in total.
+    fn note_ops(
+        &mut self,
+        kind: OpKind,
+        shape: QueryShape,
+        count: u64,
+        nanos_each: u64,
+        rows: u64,
+    ) {
+        let e = self
+            .per_op
+            .entry(kind)
+            .or_insert_with(|| (0, 0, Histogram::new()));
+        e.0 += count;
+        e.1 += rows;
+        e.2.record_n(nanos_each, count);
+        // Only real shapes get a breakdown; UNKNOWN would collapse every
+        // non-query operation into one meaningless bucket.
+        if shape != QueryShape::UNKNOWN {
+            let s = self.per_shape.entry(shape).or_default();
+            s.calls += count;
+            s.rows += rows;
+            s.total_nanos += nanos_each.saturating_mul(count);
+            s.latency.record_n(nanos_each, count);
+        }
+    }
+}
+
 pub struct CollectingProbe {
     shards: Vec<Mutex<Shard>>,
+    /// Gauges live outside the shards: a gauge's latest value is the only one
+    /// that matters, and with one value per shard a merge could not tell
+    /// which was latest.
+    cache_resident: Mutex<HashMap<&'static str, u64>>,
 }
 
 impl Default for CollectingProbe {
@@ -290,6 +333,7 @@ impl CollectingProbe {
     pub fn new() -> Self {
         Self {
             shards: (0..SHARDS).map(|_| Mutex::new(Shard::default())).collect(),
+            cache_resident: Mutex::new(HashMap::new()),
         }
     }
 
@@ -356,6 +400,11 @@ impl CollectingProbe {
             }
             out.opt_changes.extend(g.opt_changes.iter().copied());
         }
+        out.cache_resident_bytes = self
+            .cache_resident
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         out
     }
 
@@ -363,6 +412,10 @@ impl CollectingProbe {
         for shard in &self.shards {
             *shard.lock().unwrap_or_else(|e| e.into_inner()) = Shard::default();
         }
+        self.cache_resident
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// Forget a fraction of what has been counted so far.
@@ -430,6 +483,13 @@ impl CollectingProbe {
 
 impl Probe for CollectingProbe {
     fn record(&self, ev: Event<'_>) {
+        if let Event::CacheResident { name, bytes } = ev {
+            self.cache_resident
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(name, bytes);
+            return;
+        }
         let mut g = self.shard().lock().unwrap_or_else(|e| e.into_inner());
         match ev {
             Event::Op {
@@ -438,24 +498,15 @@ impl Probe for CollectingProbe {
                 rows,
                 shape,
                 ..
-            } => {
-                let e = g
-                    .per_op
-                    .entry(kind)
-                    .or_insert_with(|| (0, 0, Histogram::new()));
-                e.0 += 1;
-                e.1 += rows;
-                e.2.record(nanos);
-                // Only real shapes get a breakdown; UNKNOWN would collapse every
-                // non-query operation into one meaningless bucket.
-                if shape != QueryShape::UNKNOWN {
-                    let s = g.per_shape.entry(shape).or_default();
-                    s.calls += 1;
-                    s.rows += rows;
-                    s.total_nanos += nanos;
-                    s.latency.record(nanos);
-                }
-            }
+            } => g.note_ops(kind, shape, 1, nanos, rows),
+            Event::Ops {
+                kind,
+                shape,
+                count,
+                nanos_each,
+                rows,
+                ..
+            } => g.note_ops(kind, shape, count, nanos_each, rows),
             Event::Touch { id, .. } => {
                 g.touches += 1;
                 g.temperature.observe(id.0);
@@ -511,6 +562,7 @@ impl Probe for CollectingProbe {
                 }
             }
             Event::OptChanged { name, enabled } => g.opt_changes.push((name, enabled)),
+            Event::CacheResident { .. } => unreachable!("gauges are recorded above"),
         }
     }
 }
@@ -711,6 +763,49 @@ mod tests {
             distinct.len() > 1,
             "every thread landed on one shard: {v:?}"
         );
+    }
+
+    #[test]
+    fn a_cache_size_report_replaces_the_last_and_survives_decay() {
+        let p = CollectingProbe::new();
+        p.record(Event::CacheResident {
+            name: "c",
+            bytes: 1_000,
+        });
+        p.record(Event::CacheResident {
+            name: "c",
+            bytes: 400,
+        });
+        p.decay(1, 4);
+        assert_eq!(p.snapshot().cache_resident_bytes.get("c"), Some(&400));
+        p.reset();
+        assert!(p.snapshot().cache_resident_bytes.is_empty());
+    }
+
+    #[test]
+    fn a_batch_of_ops_is_recorded_exactly_like_that_many_single_ops() {
+        let single = CollectingProbe::new();
+        for _ in 0..40 {
+            shaped(&single, 7, 300, 1);
+        }
+        let batched = CollectingProbe::new();
+        batched.record(Event::Ops {
+            collection: "c",
+            kind: OpKind::Scan,
+            shape: QueryShape(7),
+            count: 40,
+            nanos_each: 300,
+            rows: 40,
+        });
+        let (a, b) = (single.snapshot(), batched.snapshot());
+        assert_eq!(a.total_calls(), b.total_calls());
+        let (sa, sb) = (&a.per_shape[&QueryShape(7)], &b.per_shape[&QueryShape(7)]);
+        assert_eq!(
+            (sa.calls, sa.rows, sa.total_nanos),
+            (sb.calls, sb.rows, sb.total_nanos)
+        );
+        assert_eq!(sa.latency.count(), sb.latency.count());
+        assert_eq!(sa.latency.percentile(0.5), sb.latency.percentile(0.5));
     }
 
     #[test]

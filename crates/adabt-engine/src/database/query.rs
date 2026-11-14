@@ -419,6 +419,9 @@ impl Database {
             self.caches
                 .results
                 .insert(key, &collection, epoch, || rows.clone());
+            self.caches
+                .results
+                .note_would_insert(key, &collection, epoch, &rows);
         }
         if mode.is_counted() {
             self.telemetry
@@ -434,17 +437,26 @@ impl Database {
         shape: QueryShape,
         mode: QueryMode,
     ) -> Result<Option<Vec<(RecordId, Record)>>> {
-        if mode.uses_caches() && self.caches.compiled.get(shape).is_some() {
-            if let adabt_ir::plan::LogicalOp::GetById { collection, id } = &logical.root {
-                let (collection, id) = (collection.clone(), *id);
-                let rec = match self.derived.direct.get(&collection) {
-                    Some(d) => d.get(id)?,
-                    None => self.store.get(&collection, id)?,
-                };
-                return Ok(Some(rec.map(|r| (id, r)).into_iter().collect()));
-            }
+        if !mode.uses_caches() {
+            return Ok(None);
         }
-        Ok(None)
+        let adabt_ir::plan::LogicalOp::GetById { collection, id } = &logical.root else {
+            return Ok(None);
+        };
+        let Some(call) = self.caches.compiled.enter(shape) else {
+            return Ok(None);
+        };
+        let started = call.timed.then(Instant::now);
+        let rec = match self.derived.direct.get(collection) {
+            Some(d) => d.get(*id)?,
+            None => self.store.get(collection, *id)?,
+        };
+        let rows: Vec<_> = rec.map(|r| (*id, r)).into_iter().collect();
+        let nanos = started.map(|t| t.elapsed().as_nanos() as u64);
+        self.caches
+            .compiled
+            .leave(shape, call, rows.len() as u64, nanos);
+        Ok(Some(rows))
     }
 
     /// Count this shape towards compilation, installing a compiled path once it is hot.
@@ -507,6 +519,15 @@ impl Database {
             name: "result_cache",
             hit: false,
         });
+        // While the cache is off, ask what it would have done: the evidence
+        // the optimizer needs to decide whether turning it on would pay.
+        if mode.is_counted() && !self.caches.results.enabled() {
+            let hit = self.caches.results.would_hit(key, epoch);
+            self.telemetry.probe.record(Event::CacheProbe {
+                name: crate::caches::RESULT_CACHE_GHOST,
+                hit,
+            });
+        }
         None
     }
 

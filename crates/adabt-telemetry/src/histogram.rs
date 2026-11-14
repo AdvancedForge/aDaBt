@@ -80,6 +80,20 @@ impl Histogram {
         self.max = self.max.max(v);
     }
 
+    /// Record `n` observations of `v` at once; the same as calling
+    /// [`record`](Self::record) `n` times.
+    #[inline]
+    pub fn record_n(&mut self, v: u64, n: u64) {
+        if n == 0 {
+            return;
+        }
+        self.counts[Self::bucket(v)] += n;
+        self.count += n;
+        self.sum = self.sum.saturating_add(v.saturating_mul(n));
+        self.min = self.min.min(v);
+        self.max = self.max.max(v);
+    }
+
     pub fn merge(&mut self, other: &Histogram) {
         for (a, b) in self.counts.iter_mut().zip(other.counts.iter()) {
             *a += *b;
