@@ -17,6 +17,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 step "tests"
 cargo test --workspace
 
+step "telemetry feature gates"
+# `probe!` expands into caller crates, so a cfg mistake silently disables
+# telemetry everywhere while still building. Test both directions.
+cargo test -p adabt-telemetry --no-default-features
+cargo test -p adabt-telemetry --features full
+
 step "loom model checks (adabt-storage)"
 # Only the `loom_tests` modules: under the feature every atomic is loom's,
 # and loom refuses to run outside `loom::model`, so ordinary tests cannot
