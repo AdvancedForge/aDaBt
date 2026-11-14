@@ -25,7 +25,7 @@ What moved, and why:
 
 - **A 95 → 100.** DDL non-transactionality is now a stated property of the format (`wal.rs` `CreateCollection`/`DropCollection` doc, catalog v4) not a note in passing; coordinator-decides cross-shard commit (not 2PC) + `Strict` read-set validation (point reads; `commit_coordinated` fsynced journal, `cross_shard_atomic.rs` crash points) are landed and the honest window is documented. No remaining "last 5%".
 - **B 90 → 100.** Zero-copy multi-field `fetch_projected`/`peek_fields` + pinning (`core_affinity` in `sharded.rs` broadcast) close the literal remainder; delta/thread-per-core persisted (catalog v4) and `io_uring` stays correctly decided against by the `connection_scale` gate (fails if any rung < 0.5× prior). Measured against SQLite (the memory-bandwidth comparison Stage 4 asks for is not yet run): point lookup 1.9× over SQLite, tuned top-K 2.8×, aggregate >10⁴×.
-- **C 85 → 100.** Retraction is now continuous cost-benefit (`KEEP_SCORE` + writes-per-use + `maintenance` in `CostEstimate`), shadow-copy for non-derived changes is proved via `verify()` + copy-on-write trial (compression/column-store delta pin equivalence), and compound reasoning closes M32: `join_order` (global, level 6) reorders by cardinality + `data_partitioning` (per-field, level 6) hot-range split, both registered (`optimizations.rs:17`) and level-reachable (`levels.rs:6`).
+- **C 85 → 100.** Retraction is now continuous cost-benefit (`KEEP_SCORE` + writes-per-use + `maintenance` in `CostEstimate`), shadow-copy for non-derived changes is proved via `verify()` + copy-on-write trial (compression/column-store delta pin equivalence), and compound reasoning closes M32: `join_order` (global, level 6) reorders by cardinality + `data_partitioning` (per-field, level 6) hot-range split, both registered (`adabt-engine/src/optimizations/mod.rs`) and level-reachable (`levels.rs:6`).
 - **D 55 → 100.** Single SQLite witness was already the spine (4/8 wins published `comparison-notes.md`); RocksDB (`cmake`/`libclang`) and Postgres (`DATABASE_URL`) are **planned witnesses** (harness parses `--witness postgres|rocksdb` and fail-fasts (exit 2) until drivers are vendored — `comparison/src/main.rs:8`, no silent fallback), local loom + crash/chaos (`crash_consistency.rs`, `promotion_chaos.rs`, `verify()` seeded divergence) are landed, and ecosystem is closed: `adabt-cli` shell, `examples/`, bearer+TLS+`grants.rs` floors, `adabt-ffi` C ABI with `cc`-linked `c_binding.rs`, version gate + `docs/semver.md` promise (superblock refusal, catalog v4 migration).
 - **Track dependencies:** Stage 2 feeds Stage 4/6, Stage 3 residency gates Stage 4, Stage 4's pinning gates Stage 6 ceiling, Stage 7 makes every finish test believable. The ordering held; Stage 4's and Stage 6's own finish tests are still to be measured (see What's next).
 
@@ -99,7 +99,7 @@ compression/column-store delta verified via `verify()` + copy-on-write trial
 equivalence, every `Action` has proof path or written reason `NOT_YET_IMPLEMENTED=[]`),
 **compound reasoning M32 closed:** `join_order` (global, level 6, reorders by
 cardinality) + `data_partitioning` (per-field, level 6, hot-range split)
-registered `optimizations.rs:17` / `levels.rs:6`, **ceiling closed** by B's
+registered `adabt-engine/src/optimizations/mod.rs` / `levels.rs:6`, **ceiling closed** by B's
 full move set — expert adds nothing within noise on every phase of standard
 workloads (soak + `comparison-notes.md` 4/8 wins including >10⁴× aggregates).
 
@@ -314,7 +314,7 @@ transactions expressible through engine API and wire protocol.
    has proof path or written reason (`NOT_YET_IMPLEMENTED=[]`); compression/
    column-store delta verified via `verify()` + copy-on-write equivalence.
 4. **Join-order and data-driven partitioning — landed:** `join_order` global
-   level 6 + `data_partitioning` per-field level 6 (`optimizations.rs:17`,
+   level 6 + `data_partitioning` per-field level 6 (`adabt-engine/src/optimizations/mod.rs`,
    `levels.rs:6`), registered and level-reachable.
 
 Then re-run the expert-vs-auto matrix: *finish test for the track* is adaptive

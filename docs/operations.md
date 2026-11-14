@@ -51,7 +51,7 @@ Catalog v4 (`delta_encoding`/`thread_per_core`) is authoritative; loss rebuilds 
 
 ## Tuning
 
-`Policy::manual(level)`, or `policy.mode = Mode::Adaptive`. Levels are cumulative presets (`adabt-opt/src/levels.rs`): 0 conventional → 11 maximum. `adabt-engine/src/optimizations.rs` 17 optimizations, all level-reachable (`every_registered_optimization_is_reachable_from_some_level`). `explain_optimizations()` / decision log + `to_prometheus_text`.
+`Policy::manual(level)`, or `policy.mode = Mode::Adaptive`. Levels are cumulative presets (`adabt-opt/src/levels.rs`): 0 conventional → 11 maximum. `adabt-engine/src/optimizations/` 17 optimizations, all level-reachable (`every_registered_optimization_is_reachable_from_some_level`). `explain_optimizations()` / decision log + `to_prometheus_text`.
 
 ## Hardening you can run
 
