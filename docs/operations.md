@@ -15,7 +15,7 @@ Or manually:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo test -p adabt-storage --features loom   # TxId allocator model-check (engine not yet covered)
+cargo test -p adabt-storage --features loom --lib loom_tests   # TxId allocator model-check (engine not yet covered)
 cargo doc --workspace --no-deps
 ```
 

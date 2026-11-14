@@ -1,35 +1,33 @@
 #!/usr/bin/env bash
+# The project's gate: everything that must pass before a push.
+# Enable as a pre-push hook with `git config core.hooksPath .githooks`.
 set -euo pipefail
-# Enforced continuous check — local replacement for the removed GH Actions.
-# Private repo has no Actions runner; this script is the gate. Run before
-# every push, or enable the pre-push hook (`git config core.hooksPath .githooks`).
+cd "$(dirname "$0")/.."
 
-echo "== fmt =="
+step() { printf '\n== %s ==\n' "$1"; }
+
+step "fmt"
 cargo fmt --all -- --check
 
-echo "== clippy =="
-# Note: `--all-features` is intentionally excluded. The `loom` feature swaps
-# `Arc`/`Mutex` types across crates; full cross-crate feature compatibility
-# requires a broader design decision (not a bug). The `loom` subset runs
-# separately below (line 17) for targeted verification.
+step "clippy"
+# `--all-features` is deliberately absent: the `loom` feature swaps
+# `Arc`/`Mutex` types across crates and is verified on its own below.
 cargo clippy --workspace --all-targets -- -D warnings
 
-echo "== test workspace =="
+step "tests"
 cargo test --workspace
 
-echo "== loom subset (verified: storage only; engine feature-gated but cross-crate type substitution remains open) =="
-cargo test -p adabt-storage --features loom -- --nocapture 2>&1 | tail -n 5
+step "loom model checks (adabt-storage)"
+# Only the `loom_tests` modules: under the feature every atomic is loom's,
+# and loom refuses to run outside `loom::model`, so ordinary tests cannot
+# share this build. The engine crate is not yet model-checked; see
+# docs/limitations.md.
+cargo test -p adabt-storage --features loom --lib loom_tests
 
-echo "== comparison harness sanity (separate workspace) =="
-cargo build --manifest-path comparison/Cargo.toml --release 2>&1 | tail -n 1
+step "comparison harness builds (separate workspace)"
+cargo build --manifest-path comparison/Cargo.toml --release
 
-echo "== critical release tests =="
-cargo test -p adabt-engine --test cross_shard_concurrent -- --nocapture 2>&1 | tail -n 3
-cargo test -p adabt-engine --test cross_shard_atomic -- --nocapture 2>&1 | tail -n 3
-cargo test -p adabt-engine --test serializable -- --nocapture 2>&1 | tail -n 3
-cargo test -p adabt-storage --test catalog_upgrade -- --nocapture 2>&1 | tail -n 3
+step "docs"
+cargo doc --workspace --no-deps --quiet
 
-echo "== docs =="
-cargo doc --workspace --no-deps >/dev/null
-
-echo "all checks passed"
+printf '\nall checks passed\n'

@@ -115,7 +115,7 @@ aggregates >10⁴× via column store + `materialized_views`, top-20 sort 2.8× v
 RocksDB (`cmake`/`libclang`) and Postgres (`DATABASE_URL`) are planned witnesses (harness `comparison/src/main.rs:8` fail-fasts until drivers exist); hardening landed
 deterministic sweep + `Database::verify()` forward/reverse/columnar with seeded
 fault-injection, crash/chaos matrix 13 offsets `crash_consistency.rs`,
-`promotion_chaos.rs` + loom subset (`--features loom` TxId allocator, `cargo test --features loom`),
+`promotion_chaos.rs` + loom subset (TxId allocator, `cargo test -p adabt-storage --features loom --lib loom_tests`),
 no time-assertions in default suite; surface closed `adabt-cli` shell (`.explain`,
 tables/indexes, exact decimal rendering), `examples/` (`quickstart`,
 `watch_it_optimize`); security closed bearer `--auth-token`/`ADABT_TOKEN` gate
@@ -342,7 +342,7 @@ time — a lost trial loses only the trial.
 mid-application / torn-tail) — continuation of same truncation-at-offsets
 discipline.
 
-*Finish tests:* `bash scripts/check.sh` (`fmt --check` + `clippy -D warnings` + `test --workspace` + `--features loom` + `comparison` sanity + `doc`) enforced locally, `git config core.hooksPath .githooks` runs it on pre-push (private repo, no GH Actions); checker detects every seeded divergence; no time-assertions in default suite.
+*Finish tests:* `bash scripts/check.sh` (`fmt --check` + `clippy -D warnings` + `test --workspace` + loom model checks + `comparison` build + `doc`) enforced locally, `git config core.hooksPath .githooks` runs it on pre-push (no hosted CI); checker detects every seeded divergence; no time-assertions in default suite.
 
 ### Stage 8 — Surface and ecosystem *(finishes D)*
 
