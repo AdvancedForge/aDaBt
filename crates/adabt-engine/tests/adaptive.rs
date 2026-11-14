@@ -296,7 +296,9 @@ fn every_adaptive_decision_is_explained() {
     )
     .unwrap();
     seed(&mut db, 5_000);
-    run_workload(&mut db, 4);
+    // Enough rounds for the reads to outweigh the initial bulk load: the
+    // driver acts on evidence, and four rounds are mostly the load.
+    run_workload(&mut db, 12);
 
     let text = db.explain_optimizations();
     assert!(text.contains("requested by: adaptive"), "{text}");
@@ -322,11 +324,23 @@ fn the_driver_drops_indexes_it_created_once_the_planner_stops_choosing_them() {
     .unwrap();
     seed(&mut db, 2_000);
 
-    // Phase one: equality queries, so the driver builds an index.
+    // Phase one: equality queries, so the driver builds an index. A write
+    // after each query keeps the result cache from answering them instead.
     let equality = LogicalPlan::new(LogicalOp::scan("users").filter(Expr::eq("country", "NO")));
+    let mut next_id = 2_000u64;
     for _ in 0..6 {
         for _ in 0..120 {
             db.query(&equality).unwrap();
+            db.insert(
+                "users",
+                RecordId(next_id),
+                Record::new()
+                    .with("id", next_id)
+                    .with("country", COUNTRIES[(next_id % 4) as usize])
+                    .with("age", (next_id % 70) as i64),
+            )
+            .unwrap();
+            next_id += 1;
         }
         db.optimize().unwrap();
     }

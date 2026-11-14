@@ -103,7 +103,7 @@ pub fn score(effects: &AxisEffects, est: &CostEstimate, policy: &Policy) -> Scor
 /// Score against an explicit resource scale.
 ///
 /// `footprint` is what the database currently costs; memory spent or saved is
-/// judged relative to it (see [`resource_change`]), so the same proportional
+/// judged relative to it (see `resource_change`), so the same proportional
 /// change counts the same on a small database as on a large one. A stated
 /// `max_ram` ceiling overrides it, because a user who names a budget means
 /// that budget.
