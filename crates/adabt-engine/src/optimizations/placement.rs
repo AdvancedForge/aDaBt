@@ -84,7 +84,12 @@ impl Optimization for ClusteredSortOpt {
     fn estimate(&self, ctx: &OptContext<'_>) -> CostEstimate {
         let candidates = Self::candidates(ctx);
         let rows: usize = candidates.iter().map(|(c, _)| ctx.rows_in(c)).sum();
-        CostEstimate::faster(0.5, 0.4)
+        // Placement helps a range read touch fewer pages and nothing else, so
+        // the gain is claimed on the share of the workload that ranges. Once
+        // range traffic ends the claim goes with it, which is what lets a
+        // clustering built for an ended phase be given back.
+        let ranges = ctx.workload().range_share();
+        CostEstimate::faster(1.0 - 0.5 * ranges, 1.0 - 0.6 * ranges)
             .with_ram(0)
             .with_maintenance(0.05)
             .with_confidence(0.4)

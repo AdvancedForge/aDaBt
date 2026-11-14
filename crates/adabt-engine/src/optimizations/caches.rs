@@ -236,12 +236,14 @@ impl Optimization for MaterializedViewOpt {
     }
 
     fn estimate(&self, ctx: &OptContext<'_>) -> CostEstimate {
-        // The saving is enormous where it applies and nil where it does not, and
-        // which of those is true depends on how much of the workload aggregates
-        // — something only telemetry knows. Hence the low confidence: this is an
-        // estimate that expects to be corrected by measurement.
-        let read_share = 1.0 - ctx.telemetry.write_fraction();
-        CostEstimate::faster(1.0 - 0.5 * read_share, 1.0 - 0.5 * read_share)
+        // The saving is enormous where it applies and nil where it does not.
+        // A view answers a grouping over the whole collection, so the gain is
+        // claimed only on unfiltered reads of more than one record; a filtered
+        // aggregate, a lookup or a write gets nothing from it. Telemetry does
+        // not record which of those reads group, hence the low confidence:
+        // this still expects to be corrected by measurement.
+        let groupings = ctx.workload().unfiltered_scan_share();
+        CostEstimate::faster(1.0 - 0.5 * groupings, 1.0 - 0.5 * groupings)
             .with_maintenance(0.03)
             .with_confidence(0.35)
     }

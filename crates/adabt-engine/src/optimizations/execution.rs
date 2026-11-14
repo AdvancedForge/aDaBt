@@ -40,8 +40,14 @@ impl Optimization for ThreadPerCoreOpt {
         Applicability::Applicable
     }
 
-    fn estimate(&self, _ctx: &OptContext<'_>) -> CostEstimate {
-        CostEstimate::faster(0.6, 0.5)
+    fn estimate(&self, ctx: &OptContext<'_>) -> CostEstimate {
+        // Pinning changes where scan workers run, and nothing else: a lookup
+        // or a write takes one shard and never reaches a worker. So the gain
+        // is claimed on the share of the workload that scans. Whether the
+        // database is sharded at all is not visible here; on one that is not,
+        // calibration has to learn that this does nothing.
+        let scans = ctx.workload().scan_share();
+        CostEstimate::faster(1.0 - 0.4 * scans, 1.0 - 0.5 * scans)
             .with_ram(0)
             .with_maintenance(0.05)
             .with_confidence(0.3)

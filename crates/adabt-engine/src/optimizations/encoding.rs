@@ -123,10 +123,13 @@ impl Optimization for ColumnStoreOpt {
 
     fn estimate(&self, ctx: &OptContext<'_>) -> CostEstimate {
         let rows: usize = ctx.collections.iter().map(|(_, n)| n).sum();
-        // Writes tombstone columnar rows faster than reads can use them, so the
-        // benefit shrinks and the upkeep grows as the mix shifts to writes.
-        let reads = 1.0 - ctx.telemetry.write_fraction();
-        CostEstimate::faster(1.0 - 0.5 * reads, 1.0 - 0.55 * reads)
+        // The planner reads columns only for a query no index can serve, so
+        // the gain is claimed on the share of the workload that scans and on
+        // nothing else: an identity lookup or an indexed filter never touches
+        // the copy. Writes count against that share as well as through the
+        // upkeep below, since they tombstone columnar rows.
+        let scans = ctx.workload().scan_share();
+        CostEstimate::faster(1.0 - 0.5 * scans, 1.0 - 0.55 * scans)
             .with_ram(rows as i64 * 24)
             .with_maintenance(0.12 + 0.3 * ctx.telemetry.write_fraction())
             .with_confidence(0.4)
@@ -185,7 +188,11 @@ impl Optimization for DeltaEncodingOpt {
 
     fn estimate(&self, ctx: &OptContext<'_>) -> CostEstimate {
         let rows: usize = ctx.collections.iter().map(|(_, n)| n).sum();
-        CostEstimate::faster(0.9, 0.9)
+        // Decoding sorted integer columns faster helps the queries that read
+        // through them, which are scans; a lookup decodes one record either
+        // way. The memory saving does not depend on the traffic.
+        let scans = ctx.workload().scan_share();
+        CostEstimate::faster(1.0 - 0.1 * scans, 1.0 - 0.1 * scans)
             .with_ram(-(rows as i64 * 8))
             .with_confidence(0.5)
             .with_build(BuildCost {

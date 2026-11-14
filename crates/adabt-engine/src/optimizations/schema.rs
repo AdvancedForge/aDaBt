@@ -152,8 +152,12 @@ impl Optimization for DirectLookupOpt {
             .map(|c| ctx.rows_in(c))
             .sum();
         // A whole second copy of the data, in exchange for removing the page
-        // directory, the slot table and the search from the lookup path.
-        CostEstimate::faster(0.4, 0.35)
+        // directory, the slot table and the search from the lookup path. Only
+        // a lookup by identity takes that path, so the gain is claimed on the
+        // share of the workload that does: on a filtering workload the copy is
+        // all cost, and it should be given back.
+        let lookups = ctx.workload().identity_share();
+        CostEstimate::faster(1.0 - 0.6 * lookups, 1.0 - 0.65 * lookups)
             .with_ram(rows as i64 * 64)
             .with_maintenance(0.15)
             .with_confidence(0.5)
@@ -194,6 +198,7 @@ mod tests {
     fn direct_lookup_becomes_applicable_with_a_fixed_schema() {
         let mut fx = Fx::new();
         fx.fixed = vec!["users".into()];
+        fx.identity_traffic(1_000);
         assert!(DirectLookupOpt.applicability(&fx.ctx()).is_applicable());
         let e = DirectLookupOpt.estimate(&fx.ctx());
         assert!(e.helps_latency());

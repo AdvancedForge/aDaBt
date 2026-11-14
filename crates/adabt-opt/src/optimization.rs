@@ -130,6 +130,12 @@ impl OptContext<'_> {
         self.fixed_size_collections.iter().any(|c| c == collection)
     }
 
+    /// What the recent workload asked for, judged against the indexes that
+    /// exist now. See [`crate::evidence`].
+    pub fn workload(&self) -> crate::evidence::WorkloadMix {
+        crate::evidence::WorkloadMix::with_indexes(self.telemetry, self.existing_indexes)
+    }
+
     /// Occupied fraction of a collection's id space.
     ///
     /// Returns 1.0 for an unknown or empty collection: with nothing to be

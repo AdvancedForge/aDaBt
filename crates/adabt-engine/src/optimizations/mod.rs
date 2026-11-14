@@ -88,8 +88,9 @@ mod tests {
     use adabt_core::index_kind::IndexKind;
     use adabt_core::policy::Policy;
     use adabt_opt::config::Params;
-    use adabt_opt::optimization::{OptContext, Reversibility};
-    use adabt_telemetry::Snapshot;
+    use adabt_opt::optimization::{OptContext, Optimization as _, Reversibility};
+    use adabt_telemetry::event::{Event, OpKind, QueryShape};
+    use adabt_telemetry::{CollectingProbe, Probe as _, Snapshot};
 
     pub(super) struct Fx {
         pub(super) collections: Vec<(String, usize)>,
@@ -129,6 +130,43 @@ mod tests {
                 .or_default() += n;
         }
 
+        /// Replace the telemetry with `n` identity lookups through the query
+        /// path, as the soak's identity phase records them.
+        pub(super) fn identity_traffic(&mut self, n: usize) {
+            let probe = CollectingProbe::new();
+            for _ in 0..n {
+                probe.record(Event::Op {
+                    collection: "users",
+                    kind: OpKind::Scan,
+                    shape: QueryShape(1),
+                    nanos: 300,
+                    rows: 1,
+                });
+            }
+            self.snap = probe.snapshot();
+        }
+
+        /// Replace the telemetry with `n` filtered queries that no index
+        /// served, each returning a dozen rows.
+        pub(super) fn scan_traffic(&mut self, n: usize) {
+            let probe = CollectingProbe::new();
+            for _ in 0..n {
+                probe.record(Event::FieldFiltered {
+                    collection: "users",
+                    field: "age",
+                    equality: false,
+                });
+                probe.record(Event::Op {
+                    collection: "users",
+                    kind: OpKind::Scan,
+                    shape: QueryShape(2),
+                    nanos: 1_000_000,
+                    rows: 12,
+                });
+            }
+            self.snap = probe.snapshot();
+        }
+
         pub(super) fn ctx(&self) -> OptContext<'_> {
             OptContext {
                 policy: &self.policy,
@@ -141,6 +179,64 @@ mod tests {
                 current_bytes: 0,
             }
         }
+    }
+
+    /// The optimizations whose gain comes from reading through a collection.
+    fn scan_helpers() -> Vec<Box<dyn adabt_opt::optimization::Optimization>> {
+        vec![
+            Box::new(ColumnStoreOpt),
+            Box::new(DeltaEncodingOpt),
+            Box::new(PrefetchOpt),
+            Box::new(ThreadPerCoreOpt),
+        ]
+    }
+
+    #[test]
+    fn scan_optimizations_claim_nothing_on_identity_lookups() {
+        // The expert comparison's identity phase: each of these claimed a
+        // 10-50% gain on traffic none of them can touch, and cleared the bar.
+        let mut fx = Fx::new();
+        fx.identity_traffic(2_000);
+        for opt in scan_helpers().iter().chain(
+            [
+                Box::new(MaterializedViewOpt) as Box<dyn adabt_opt::optimization::Optimization>,
+                Box::new(ClusteredSortOpt),
+            ]
+            .iter(),
+        ) {
+            let e = opt.estimate(&fx.ctx());
+            assert!(
+                !e.helps_latency(),
+                "{} claims {:.0}% on identity lookups",
+                opt.meta().name,
+                e.p50_delta.improvement() * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn scan_optimizations_claim_their_gain_on_scans() {
+        let mut fx = Fx::new();
+        fx.scan_traffic(2_000);
+        for opt in scan_helpers() {
+            assert!(
+                opt.estimate(&fx.ctx()).helps_latency(),
+                "{} claims nothing on a workload of unindexed scans",
+                opt.meta().name
+            );
+        }
+    }
+
+    #[test]
+    fn direct_lookup_claims_its_gain_only_on_identity_lookups() {
+        let mut fx = Fx::new();
+        fx.fixed = vec!["users".into()];
+        fx.identity_traffic(2_000);
+        let lookups = DirectLookupOpt.estimate(&fx.ctx());
+        fx.scan_traffic(2_000);
+        let scans = DirectLookupOpt.estimate(&fx.ctx());
+        assert!(lookups.p50_delta.0 < 0.5, "{lookups:?}");
+        assert!(!scans.helps_latency(), "{scans:?}");
     }
 
     #[test]

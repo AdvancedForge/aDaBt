@@ -100,9 +100,11 @@ impl Optimization for PrefetchOpt {
     fn estimate(&self, ctx: &OptContext<'_>) -> CostEstimate {
         // Worth more the more of the workload is scans. Sixteen pages per read
         // instead of one is a large reduction in syscalls, but only for the
-        // queries that walk pages in order.
-        let scan_heavy = 1.0 - ctx.telemetry.write_fraction();
-        let gain = 1.0 - 0.25 * scan_heavy;
+        // queries that walk pages in order, so the gain is claimed on the share
+        // that scans. It used to be claimed on every read, which had a
+        // database answering only identity lookups turn read-ahead on.
+        let scans = ctx.workload().scan_share();
+        let gain = 1.0 - 0.25 * scans;
         CostEstimate::faster(gain, gain)
             .with_ram(0)
             .with_confidence(0.4)
