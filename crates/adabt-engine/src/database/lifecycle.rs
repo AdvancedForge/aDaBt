@@ -100,8 +100,6 @@ impl Database {
                 cluster_fields: HashMap::new(),
                 delta_encoding: true,
                 thread_per_core: false,
-                join_order: false,
-                data_partitioning: false,
             },
             execution: Execution {
                 last_stats: ExecStats::default(),
@@ -174,13 +172,5 @@ impl Database {
 
     pub fn is_delta_encoding(&self) -> bool {
         self.tuning.delta_encoding
-    }
-
-    pub fn is_join_order(&self) -> bool {
-        self.tuning.join_order
-    }
-
-    pub fn is_data_partitioning(&self) -> bool {
-        self.tuning.data_partitioning
     }
 }

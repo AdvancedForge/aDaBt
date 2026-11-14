@@ -103,14 +103,6 @@ impl ActionSink for Database {
                 self.store.set_prefetch(*on);
                 Ok(())
             }
-            Action::SetJoinOrder(on) => {
-                self.tuning.join_order = *on;
-                Ok(())
-            }
-            Action::SetDataPartitioning(on) => {
-                self.tuning.data_partitioning = *on;
-                Ok(())
-            }
         }
     }
 }

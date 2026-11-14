@@ -22,7 +22,7 @@ db.verify()? // forward (heap→index) + reverse (index→heap) + columnar id-se
 db.policy() -> &Policy; db.telemetry() -> Snapshot; db.last_exec_stats() -> ExecStats
 ```
 
-`Transaction` is a value buffering writes against a fixed `Snapshot`; `commit` is all-or-nothing, sorted-key order, first-committer-wins, `Strict` also validates point reads (write-skew closed, predicate phantoms documented as not yet prevented — `serializable.rs:phantom`).
+`Transaction` is a value buffering writes against a fixed `Snapshot`; `commit` validates first-committer-wins and then applies writes in sorted-key order. It is all-or-nothing against conflicts, but not against a crash: there is no commit record, so a crash mid-commit leaves a prefix of the sorted write-set (`commit_window_chaos.rs` pins this). `Strict` also validates point reads (write skew closed; predicate phantoms are not prevented — see `serializable.rs`).
 
 **DDL is not transactional** (see `WalOp` in `adabt-storage`): `CreateCollection`/`DropCollection`/`AlterSchemaInPlace`/`AdoptMigration` commit on write, not rolled back with a `Transaction`. Catalog v4 persists `delta_encoding`/`thread_per_core`.
 
@@ -48,7 +48,7 @@ Guarantee is **coordinator-decides durability**, not linearizable atomicity: bet
 
 ## Execution / Optimizer
 
-`Source::fetch` + `peek_field` (tri-state) + `fetch_projected`/`get_projected` (`RecordCodec::peek_fields`, `LogicalStore::get_projected`, `Database::fetch_projected` handles `DirectArray` per-field O(1) and `HeapStore` codec walk; `filter_by_peek_fields` 1–4 fields, `fetch_projected_batches` for Project-aware callers). `ExecBudget` (`max_ram_bytes` + `cancel` polled every 4096 rows). `Optimization` 17/17 level-reachable (`plan_cache`, `result_cache`, `buffer_pool`, `auto_index`, `auto_composite_index`, `auto_covering_index`, `record_compression`, `column_store`, `freeze_schema`, `direct_lookup`, `prefetch`, `materialized_view`, `clustered_sort`, `delta_encoding`, `thread_per_core`, `join_order`, `data_partitioning`) via `Action::{CreateIndex,SetColumnStore,SetDeltaEncoding,SetThreadPerCore,SetJoinOrder,SetDataPartitioning,SetClusterField,...}` — all `is_shadowable` or written reason, `NOT_YET_IMPLEMENTED=[]`.
+`Source::fetch` + `peek_field` (tri-state) + `fetch_projected`/`get_projected` (`RecordCodec::peek_fields`, `LogicalStore::get_projected`, `Database::fetch_projected` handles `DirectArray` per-field O(1) and `HeapStore` codec walk; `filter_by_peek_fields` 1–4 fields, `fetch_projected_batches` for Project-aware callers). `ExecBudget` (`max_ram_bytes` + `cancel` polled every 4096 rows). `Optimization`: 15, each level-reachable (`plan_cache`, `result_cache`, `buffer_pool`, `auto_index`, `auto_composite_index`, `auto_covering_index`, `record_compression`, `column_store`, `freeze_schema`, `direct_lookup`, `prefetch`, `materialized_view`, `clustered_sort`, `delta_encoding`, `thread_per_core`) via `Action::{CreateIndex,SetColumnStore,SetDeltaEncoding,SetThreadPerCore,SetClusterField,...}` — all `is_shadowable` or written reason, `NOT_YET_IMPLEMENTED=[]`.
 
 ## Errors
 

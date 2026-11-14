@@ -19,8 +19,8 @@
 //! - `covering_index`: `auto_covering_index`
 //! - `encoding`: `record_compression`, `column_store`, `delta_encoding`
 //! - `schema`: `freeze_schema`, `direct_lookup`
-//! - `placement`: `clustered_sort`, `data_partitioning`
-//! - `execution`: `thread_per_core`, `join_order`
+//! - `placement`: `clustered_sort`
+//! - `execution`: `thread_per_core`
 
 use adabt_opt::Registry;
 
@@ -39,9 +39,9 @@ pub use caches::{MaterializedViewOpt, PlanCacheOpt, ResultCacheOpt};
 pub use composite_index::AutoCompositeIndexOpt;
 pub use covering_index::AutoCoveringIndexOpt;
 pub use encoding::{ColumnStoreOpt, DeltaEncodingOpt, RecordCompressionOpt};
-pub use execution::{JoinOrderOpt, ThreadPerCoreOpt};
+pub use execution::ThreadPerCoreOpt;
 pub use paging::{BufferPoolOpt, PrefetchOpt};
-pub use placement::{ClusteredSortOpt, DataPartitioningOpt};
+pub use placement::ClusteredSortOpt;
 pub use schema::{DirectLookupOpt, FreezeSchemaOpt};
 
 /// Register every implemented optimization, in dependency order.
@@ -61,8 +61,6 @@ pub fn register_builtins(registry: &mut Registry) {
     registry.register(Box::new(ClusteredSortOpt));
     registry.register(Box::new(DeltaEncodingOpt));
     registry.register(Box::new(ThreadPerCoreOpt));
-    registry.register(Box::new(JoinOrderOpt));
-    registry.register(Box::new(DataPartitioningOpt));
 }
 
 /// Split a `"collection.field"` scope. Returns `None` for a scope that names no
@@ -150,7 +148,7 @@ mod tests {
         let mut r = Registry::new();
         register_builtins(&mut r);
         // One per name in the module docs' list of families.
-        assert_eq!(r.len(), 17);
+        assert_eq!(r.len(), 15);
         assert!(r.dependency_order().is_ok());
         for n in r.names() {
             assert!(!r.meta(n).unwrap().summary.is_empty(), "{n} has no summary");

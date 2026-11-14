@@ -1,12 +1,10 @@
 //! Optimizations that change how queries execute rather than how data is
-//! stored: per-core pinning of a sharded database's scan workers, and
-//! `join_order`, which records a flag the planner does not consult — the
-//! executor's own join algorithm choice does not depend on it.
+//! stored: best-effort pinning of a sharded database's scan workers to cores.
 
 use adabt_core::policy::GuaranteeRequirements;
 use adabt_opt::action::{Action, ChangePlan};
 use adabt_opt::config::Params;
-use adabt_opt::cost::{AxisEffects, BuildCost, CostEstimate};
+use adabt_opt::cost::{AxisEffects, CostEstimate};
 use adabt_opt::optimization::{
     Applicability, OptContext, OptMeta, Optimization, Reversibility, ScopeKind,
 };
@@ -17,7 +15,7 @@ pub struct ThreadPerCoreOpt;
 
 const THREAD_PER_CORE_META: OptMeta = OptMeta {
     name: "thread_per_core",
-    summary: "per-core sharding with pinning and run-to-completion",
+    summary: "pin a sharded database's scan workers to cores (best effort)",
     scope_kind: ScopeKind::Global,
     min_level: 9,
     axis_effects: AxisEffects::new(8, -6, 0),
@@ -58,61 +56,5 @@ impl Optimization for ThreadPerCoreOpt {
 
     fn plan_disable(&self, _ctx: &OptContext<'_>, _scope: &str, _params: &Params) -> ChangePlan {
         ChangePlan::new(vec![Action::SetThreadPerCore(false)], vec![])
-    }
-}
-
-// -- join order -------------------------------------------------------------
-
-pub struct JoinOrderOpt;
-
-const JOIN_ORDER_META: OptMeta = OptMeta {
-    name: "join_order",
-    summary: "reorder join inputs by estimated cardinality (small side build)",
-    scope_kind: ScopeKind::Global,
-    min_level: 6,
-    axis_effects: AxisEffects::new(5, -1, 0),
-    requires_guarantees: GuaranteeRequirements::ANY,
-    prerequisites: &[],
-    conflicts_with: &[],
-    reversibility: Reversibility::Instant,
-};
-
-impl Optimization for JoinOrderOpt {
-    fn meta(&self) -> &OptMeta {
-        &JOIN_ORDER_META
-    }
-    fn applicability(&self, ctx: &OptContext<'_>) -> Applicability {
-        // Needs at least one join observed; telemetry for joins is derived from
-        // filtered_fields co-occurrence already used for composite indexes.
-        let has_join = ctx
-            .telemetry
-            .most_pinned_sets()
-            .iter()
-            .any(|(_, f, _)| f.len() >= 2);
-        if !has_join {
-            return Applicability::NotYet("no join-shaped queries observed yet".into());
-        }
-        if ctx.collections.iter().map(|(_, n)| *n).sum::<usize>() < 1_000 {
-            return Applicability::NotYet("collections too small for join order to matter".into());
-        }
-        Applicability::Applicable
-    }
-    fn estimate(&self, _ctx: &OptContext<'_>) -> CostEstimate {
-        CostEstimate::faster(0.6, 0.55)
-            .with_confidence(0.4)
-            .with_build(BuildCost {
-                estimated_secs: 0.0,
-                rows_read: 0,
-                online: true,
-            })
-    }
-    fn plan_enable(&self, _ctx: &OptContext<'_>, _scope: &str, _params: &Params) -> ChangePlan {
-        ChangePlan::new(
-            vec![Action::SetJoinOrder(true)],
-            vec![Action::SetJoinOrder(false)],
-        )
-    }
-    fn plan_disable(&self, _ctx: &OptContext<'_>, _scope: &str, _params: &Params) -> ChangePlan {
-        ChangePlan::new(vec![Action::SetJoinOrder(false)], vec![])
     }
 }

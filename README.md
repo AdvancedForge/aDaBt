@@ -45,7 +45,7 @@ promoted them.
 
 ```
  telemetry ──► propose ──► build hidden ──► shadow ──► ramp 1→10→50→90% ──► keep
- (per query      (17 opt-     (planner       (both paths    (any divergence     (re-scored
+ (per query      (15 opt-     (planner       (both paths    (any divergence     (re-scored
   shape)         imizations)   can't see it)  answer, must   or guardrail        every cycle;
                                               agree)         breach reverts)     retracted when
                                                                                  it stops paying)

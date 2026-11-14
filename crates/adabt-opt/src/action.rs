@@ -66,10 +66,6 @@ pub enum Action {
     SetDeltaEncoding(bool),
     /// Enable per-core sharding of execution (thread-per-core).
     SetThreadPerCore(bool),
-    /// Optimize join order based on collection cardinalities.
-    SetJoinOrder(bool),
-    /// Data-driven partitioning of hot key ranges.
-    SetDataPartitioning(bool),
 }
 
 impl Action {
@@ -97,8 +93,6 @@ impl Action {
                 | Action::SetMaterializedViews(true)
                 | Action::SetClusterField { .. }
                 | Action::SetDeltaEncoding(true)
-                | Action::SetJoinOrder(true)
-                | Action::SetDataPartitioning(true)
         )
     }
 
@@ -133,8 +127,6 @@ impl Action {
             Action::ClearClusterField { collection } => format!("clear clustering of {collection}"),
             Action::SetDeltaEncoding(on) => format!("delta encoding {}", on_off(*on)),
             Action::SetThreadPerCore(on) => format!("thread-per-core {}", on_off(*on)),
-            Action::SetJoinOrder(on) => format!("join order {}", on_off(*on)),
-            Action::SetDataPartitioning(on) => format!("data partitioning {}", on_off(*on)),
         }
     }
 }

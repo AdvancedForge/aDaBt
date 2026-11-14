@@ -1,6 +1,6 @@
 //! Optimizations that decide where records sit on pages: clustering by a
-//! range-filtered key, and `data_partitioning`, which declares the same
-//! clustering for a range-skewed field (plus a flag nothing else reads).
+//! range-filtered key, so a range over it touches pages in proportion to the
+//! range rather than the collection.
 
 use adabt_core::policy::GuaranteeRequirements;
 use adabt_opt::action::{Action, ChangePlan};
@@ -113,75 +113,5 @@ impl Optimization for ClusteredSortOpt {
             return ChangePlan::default();
         };
         ChangePlan::new(vec![Action::ClearClusterField { collection }], vec![])
-    }
-}
-
-// -- data-driven partitioning -----------------------------------------------
-
-pub struct DataPartitioningOpt;
-
-const DATA_PARTITIONING_META: OptMeta = OptMeta {
-    name: "data_partitioning",
-    summary: "partition hot key ranges to separate pages (clustered-sort companion)",
-    scope_kind: ScopeKind::PerField,
-    min_level: 6,
-    axis_effects: AxisEffects::new(4, -1, 0),
-    requires_guarantees: GuaranteeRequirements::ANY,
-    prerequisites: &[],
-    conflicts_with: &[],
-    reversibility: Reversibility::Instant,
-};
-
-impl Optimization for DataPartitioningOpt {
-    fn meta(&self) -> &OptMeta {
-        &DATA_PARTITIONING_META
-    }
-    fn candidate_scopes(&self, ctx: &OptContext<'_>) -> Vec<String> {
-        ctx.telemetry
-            .most_range_filtered_fields()
-            .into_iter()
-            .filter(|(c, _, n)| *n >= 10 && ctx.rows_in(c) >= 5_000)
-            .map(|(c, f, _)| format!("{c}.{f}"))
-            .collect()
-    }
-    fn applicability(&self, ctx: &OptContext<'_>) -> Applicability {
-        if self.candidate_scopes(ctx).is_empty() {
-            return Applicability::NotYet("no field shows range-skewed access yet".into());
-        }
-        Applicability::Applicable
-    }
-    fn estimate(&self, _ctx: &OptContext<'_>) -> CostEstimate {
-        CostEstimate::faster(0.7, 0.65).with_confidence(0.35)
-    }
-    fn plan_enable(&self, _ctx: &OptContext<'_>, scope: &str, _params: &Params) -> ChangePlan {
-        let Some((c, f)) = split_scope(scope) else {
-            return ChangePlan::default();
-        };
-        // Reuse clustered placement — partitioning is its hot-range refinement.
-        ChangePlan::new(
-            vec![
-                Action::SetDataPartitioning(true),
-                Action::SetClusterField {
-                    collection: c.clone(),
-                    field: f.clone(),
-                },
-            ],
-            vec![
-                Action::SetDataPartitioning(false),
-                Action::ClearClusterField { collection: c },
-            ],
-        )
-    }
-    fn plan_disable(&self, _ctx: &OptContext<'_>, scope: &str, _params: &Params) -> ChangePlan {
-        let Some((c, _)) = split_scope(scope) else {
-            return ChangePlan::default();
-        };
-        ChangePlan::new(
-            vec![
-                Action::SetDataPartitioning(false),
-                Action::ClearClusterField { collection: c },
-            ],
-            vec![],
-        )
     }
 }

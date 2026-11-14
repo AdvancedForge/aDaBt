@@ -30,7 +30,7 @@ each step, is in [`history/roadmap-stages.md`](history/roadmap-stages.md).
   materialized views; record compression; direct addressing for fixed schemas;
   compiled hot paths; clustered placement; zero-copy projection; a cost model
   calibrated by measurement.
-- **Automatically optimal:** 17 registered optimizations, each reachable from
+- **Automatically optimal:** 15 registered optimizations, each reachable from
   the level ladder; an adaptive driver that proposes from telemetry, proves each
   change in a shadow trial before ramping it into traffic, re-scores settled
   decisions every cycle and retracts what stops paying.
@@ -70,13 +70,23 @@ throughout: evidence first, then what it unblocks.
   `fetch_projected_batches`.
 
 ### 4. Correctness gaps a user will hit
+- Crash-atomic commits: a commit record, so a crash mid-commit applies all of
+  a transaction or none of it rather than a prefix.
 - Predicate phantoms under `Strict` (needs predicate or range validation).
 - `loom` model checks for `adabt-engine`, which does not yet compile with the
   feature (loom's `Arc` meets std's at crate boundaries).
 - Writes and DDL through SQL.
 - A C ABI wider than i64 put/get.
 
-### 5. Toward beta
+### 5. Join ordering
+- Two optimizations, `join_order` and `data_partitioning`, were registered
+  while doing nothing (a flag no planner read; a duplicate of
+  `clustered_sort`) and have been removed. Real cardinality-driven join
+  ordering is open, with one constraint: the hash join builds on the right
+  side so that output order never depends on the algorithm, so reordering
+  must preserve that.
+
+### 6. Toward beta
 - Freeze `LogicalStore` and the wire protocol, and extend
   [`semver.md`](semver.md) from the disk format to the API.
 

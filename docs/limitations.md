@@ -10,7 +10,7 @@ file wins.
 
 ## What it is
 - A RAM-resident, single-node Rust database (embedded, or behind `adabt-server`)
-- Adaptive physical optimization: 17 built-in optimizations on a cumulative level ladder 0–11 (`docs/architecture.md`)
+- Adaptive physical optimization: 15 built-in optimizations on a cumulative level ladder 0–11 (`docs/architecture.md`)
 - Cross-shard writes through a serialized coordinator with crash-convergent recovery and a documented visibility window
 - Snapshot-isolated transactions; `Strict` additionally validates point reads (closes write skew)
 
@@ -22,6 +22,7 @@ file wins.
 - **Full SQL** — a `SELECT` subset only; writes and DDL go through the Rust API
 - **Full serializable isolation** — `Strict` validates point reads; predicate phantoms remain possible (`serializable.rs` documents this)
 - **Atomic cross-shard visibility** — coordinator-decides durability (`XSH1` journal), not 2PC: other connections can see shards disagree inside the commit window
+- **Transactions are not crash-atomic** — a commit is all-or-nothing against conflicts, but a crash during it leaves a prefix of the sorted write-set applied (there is no commit record)
 - **DDL is not transactional** — `CreateCollection`/`DropCollection`/schema changes commit on write
 - **Persistent thread-per-core workers** — burst pinning only (`core_affinity` per query)
 - **Write throughput** — bulk load is ~11× slower than SQLite and single-row inserts also lose; per-record MVCC + WAL is the price (`docs/benchmarks/comparison-notes.md`)

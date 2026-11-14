@@ -20,7 +20,7 @@ README's layout table has a one-line role for each crate.
 
 ## The level ladder
 
-17 registered optimizations, every one reachable from some level
+15 registered optimizations, every one reachable from some level
 (`crates/adabt-opt/src/levels.rs`, `MAX_LEVEL = 11`). Levels are cumulative
 presets, not states — nothing in the engine branches on a level:
 
@@ -32,7 +32,7 @@ presets, not states — nothing in the engine branches on a level:
 | 3 | aggressive execution: prefetching, larger caches |
 | 4 | physical layout: column stores, materialized views, delta encoding |
 | 5 | workload-aware: workload-specific, covering indexes, clustered sort |
-| 6–9 | increasing specialisation (6: `join_order`, `data_partitioning`; 8: schema freeze; 9: thread-per-core) |
+| 6–9 | increasing specialisation (8: schema freeze; 9: thread-per-core) |
 | 10 | direct addressing |
 | 11 | a workload-specific data appliance |
 

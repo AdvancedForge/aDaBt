@@ -35,7 +35,7 @@ Scale is **RAM-bound by design** (`docs/benchmarks/scale-decision.md`): ~470 B/r
 
 Sharding is the growth story: `ShardedDatabase::open(dir, shards, policy)` → `dir/shard-{i}`, `RecordId % shards` routing, `commit_coordinated` for cross-shard durability (see `docs/api.md` windowed visibility). `--shards 1` is the honest unpartitioned control.
 
-Per-core: `SetThreadPerCore(true)` (level 9, `SetDataPartitioning`/`SetJoinOrder` level 6) pins `broadcast` workers via `core_affinity` (best-effort) — per-shard `Mutex` + `BufferPool` already gives per-core memory (shards == cores). Burst pinning (scoped per-query threads) is intentional: persistent shard workers would add a queue between caller and the only thing it waits for, without measured collapse (`connection_scale` gate: fails if any rung <0.5× prior, currently 116k→72k gentle decline).
+Per-core: `SetThreadPerCore(true)` (level 9) pins `broadcast` workers via `core_affinity` (best-effort) — per-shard `Mutex` + `BufferPool` already gives per-core memory (shards == cores). Burst pinning (scoped per-query threads) is intentional: persistent shard workers would add a queue between caller and the only thing it waits for, without measured collapse (`connection_scale` gate: fails if any rung <0.5× prior, currently 116k→72k gentle decline).
 
 ## Checkpoints, backup, PITR
 
@@ -51,7 +51,7 @@ Catalog v4 (`delta_encoding`/`thread_per_core`) is authoritative; loss rebuilds 
 
 ## Tuning
 
-`Policy::manual(level)`, or `policy.mode = Mode::Adaptive`. Levels are cumulative presets (`adabt-opt/src/levels.rs`): 0 conventional → 11 maximum. `adabt-engine/src/optimizations/` 17 optimizations, all level-reachable (`every_registered_optimization_is_reachable_from_some_level`). `explain_optimizations()` / decision log + `to_prometheus_text`.
+`Policy::manual(level)`, or `policy.mode = Mode::Adaptive`. Levels are cumulative presets (`adabt-opt/src/levels.rs`): 0 conventional → 11 maximum. `adabt-engine/src/optimizations/` 15 optimizations, all level-reachable (`every_registered_optimization_is_reachable_from_some_level`). `explain_optimizations()` / decision log + `to_prometheus_text`.
 
 ## Hardening you can run
 

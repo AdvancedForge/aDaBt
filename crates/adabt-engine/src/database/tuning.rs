@@ -13,13 +13,6 @@ pub(super) struct Tuning {
     pub(super) delta_encoding: bool,
     /// Whether thread-per-core execution is enabled.
     pub(super) thread_per_core: bool,
-    /// Whether join order optimization is enabled. Recorded and reported
-    /// through `is_join_order`; nothing in planning or execution reads it.
-    pub(super) join_order: bool,
-    /// Whether data-driven partitioning is enabled. Recorded and reported
-    /// through `is_data_partitioning`; the placement itself comes from the
-    /// clustering field the same decision declares.
-    pub(super) data_partitioning: bool,
 }
 
 impl Tuning {
