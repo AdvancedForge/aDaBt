@@ -478,14 +478,14 @@ fn hand_written(mix: QueryMix) -> Vec<(&'static str, Vec<Override>)> {
     match mix {
         QueryMix::ByIdentity => vec![
             (
-                "direct lookup",
+                "plan cache + direct lookup",
                 vec![
                     Override::toggle("plan_cache", true),
                     Override::scoped("direct_lookup", "users", true),
                 ],
             ),
             (
-                "direct lookup only",
+                "direct lookup",
                 vec![Override::scoped("direct_lookup", "users", true)],
             ),
         ],
