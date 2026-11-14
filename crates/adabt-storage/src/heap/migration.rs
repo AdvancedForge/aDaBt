@@ -179,7 +179,7 @@ impl HeapStore {
     /// no-op, which is what lets recovery apply it without tracking whether it
     /// already had.
     pub(super) fn adopt(&mut self, target: &str, source: &str) -> Result<()> {
-        let Some(staged) = self.collections.remove(source) else {
+        let Some(mut staged) = self.collections.remove(source) else {
             return Ok(());
         };
         self.by_id.remove(&staged.id);
@@ -188,6 +188,12 @@ impl HeapStore {
         if let Some(old) = self.collections.remove(target) {
             self.by_id.remove(&old.id);
             self.free_pages_of(&old)?;
+            // The adopted collection answers for the old one's history too: a
+            // write to the old collection after some transaction's snapshot
+            // (say, a delete that left it empty, so the staging copy has no
+            // writes of its own) must still conflict with that transaction's
+            // scan once the name points at the new one.
+            staged.newest_write = staged.newest_write.max(old.newest_write);
         }
         self.by_id.insert(staged.id, target.to_string());
         self.collections.insert(target.to_string(), staged);

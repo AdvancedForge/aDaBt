@@ -138,7 +138,20 @@ pub enum Durability {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Consistency {
+    /// Serializable transactions. On top of snapshot isolation, commit
+    /// validates everything a transaction observed: an id it read must not
+    /// have been written since its snapshot, and a collection it scanned must
+    /// have received no committed write at all since then — which closes
+    /// write skew and predicate phantoms alike. Validation is optimistic, so
+    /// a transaction that fails it aborts with `Error::TransactionConflict`
+    /// and is retried by the caller. Scans are checked at collection
+    /// granularity: under `Strict`, a scan conflicts with any concurrent
+    /// committed write to that collection, whether or not it touched a row the
+    /// caller cared about.
     Strict,
+    /// Snapshot isolation. Each transaction reads one consistent snapshot and
+    /// conflicts only over records both it and a concurrent committer wrote;
+    /// write skew and phantoms are possible.
     Snapshot,
     Eventual,
 }

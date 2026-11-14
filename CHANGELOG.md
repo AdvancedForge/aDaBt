@@ -17,6 +17,15 @@ A correctness and code-quality pass. No on-disk format change.
   then fail), one that moves a unique value between records commits, and a
   record too large for a page is refused before it is logged rather than
   logged and then refused, which made every later open fail.
+- **`Consistency::Strict` is serializable.** It validated only the ids a
+  transaction read, so a scan did not conflict with a concurrent insert of a
+  row it never saw: two transactions could each find no matching row and
+  each insert one (a predicate phantom). Commit now also refuses a
+  transaction any of whose scanned collections received a committed write
+  after its snapshot, using a per-collection newest-write stamp the heap keeps
+  in memory. The check is at collection granularity, so under `Strict` a scan
+  conflicts with any concurrent write to that collection; point reads are
+  judged per id as before, and `Snapshot` is unchanged.
 - **Two optimizations that did nothing were removed.** `join_order` and
   `data_partitioning` were registered, enabled at level 6 and reported as
   applied, but only set flags nothing read. 17 optimizations are now 15; real

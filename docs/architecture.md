@@ -47,7 +47,7 @@ structures go through a shadow trial and staged rollout before serving traffic.
 - Zero-copy multi-field projection (`peek_fields`)
 - Catalog v4 (`FORMAT_VERSION`): delta encoding and thread-per-core flags persisted
 - Cross-shard writes serialized via `Arc<Mutex<()>>` (`commit_coordinated`), coordinator-decides, not 2PC
-- `Strict` consistency validates point-read sets (not full serializable; predicate phantoms possible)
+- `Strict` consistency is serializable: commit validates point reads per id and scans per collection (a collection's newest-write stamp, kept by the heap)
 - Memory-resident: no disk overflow planned (`docs/benchmarks/scale-decision.md`)
 
 Gaps are listed in `docs/limitations.md`.

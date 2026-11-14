@@ -12,7 +12,7 @@ file wins.
 - A RAM-resident, single-node Rust database (embedded, or behind `adabt-server`)
 - Adaptive physical optimization: 15 built-in optimizations on a cumulative level ladder 0–11 (`docs/architecture.md`)
 - Cross-shard writes through a serialized coordinator with crash-convergent recovery and a documented visibility window
-- Snapshot-isolated transactions; `Strict` additionally validates point reads (closes write skew)
+- Snapshot-isolated transactions; `Strict` makes them serializable by validating point reads and scans at commit (closes write skew and predicate phantoms; a scan conflicts with any concurrent write to its collection)
 
 ## What it is not (and will not become without a new roadmap)
 - **Replicated or highly available** — permanently out of scope (`docs/replication-decision.md`)
@@ -20,9 +20,8 @@ file wins.
 
 ## Known gaps
 - **Full SQL** — a `SELECT` subset only; writes and DDL go through the Rust API
-- **Full serializable isolation** — `Strict` validates point reads; predicate phantoms remain possible (`serializable.rs` documents this)
 - **Atomic cross-shard visibility** — coordinator-decides durability (`XSH1` journal), not 2PC: other connections can see shards disagree inside the commit window
-- **DDL is not transactional** — `CreateCollection`/`DropCollection`/schema changes commit on write
+- **DDL is not transactional** — `CreateCollection`/`DropCollection`/schema changes commit on write, and sit outside `Strict`'s guarantee: a collection dropped and re-created under a running transaction is judged only by writes to the new one
 - **Point-in-time restore over a newer heap file** — `open_at` replays the log up to the target over the heap file as it stands. The buffer pool writes dirty pages to that file on eviction, so a page carrying writes from after the target may already be there, and those writes show through (transactional or not). It is sound when no page written after the target has reached the heap file; restoring from a base image older than the target is not yet supported
 - **Persistent thread-per-core workers** — burst pinning only (`core_affinity` per query)
 - **Write throughput** — bulk load is ~11× slower than SQLite and single-row inserts also lose; per-record MVCC + WAL is the price (`docs/benchmarks/comparison-notes.md`)

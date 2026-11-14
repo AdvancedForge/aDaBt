@@ -40,7 +40,7 @@
 //! contract).
 
 use adabt_core::error::{Error, Result};
-use adabt_core::ids::{CollectionId, Lsn, RecordId};
+use adabt_core::ids::{CollectionId, Lsn, RecordId, TxnId};
 use adabt_core::policy::Durability;
 use adabt_core::schema::Schema;
 #[cfg(feature = "loom")]
@@ -107,6 +107,36 @@ struct Collection {
     /// Survives restarts through replay and the catalog; the *ranges* above
     /// do not (they re-derive from subsequent keyed inserts).
     cluster_name: Option<String>,
+    /// The stamp and id of the newest committed write — put or delete — to
+    /// any record in this collection: the collection's write high-water mark.
+    ///
+    /// What lets a serializable transaction validate a *scan* in one
+    /// comparison. A version chain answers "has this id changed?", which says
+    /// nothing about an id the scan never saw because it did not exist yet;
+    /// this answers "has anything in the collection changed?", which covers
+    /// that phantom too. Kept separately from the chains because reclamation
+    /// drops chain entries, and a high-water mark must never go backwards.
+    ///
+    /// In memory only. No snapshot survives a restart, so no transaction can
+    /// ever compare against a value from a previous process; it starts at
+    /// `None` and the first write after open sets it.
+    newest_write: Option<(TxnId, RecordId)>,
+}
+
+impl Collection {
+    /// Advance the high-water mark. Called wherever a new version of a
+    /// record is committed — put or delete, live or replayed. A vacuum
+    /// relocation is the one exception: it moves bytes without changing what
+    /// any reader sees. A re-encode (`recompress_all`) changes nothing a
+    /// reader sees either, but goes through the ordinary write path and so
+    /// counts; erring towards a spurious conflict is the safe direction.
+    fn note_write(&mut self, txn: TxnId, id: RecordId) {
+        debug_assert!(
+            self.newest_write.is_none_or(|(t, _)| t.0 < txn.0),
+            "write stamps are allocated in increasing order"
+        );
+        self.newest_write = Some((txn, id));
+    }
 }
 
 pub struct HeapStore {
@@ -278,6 +308,7 @@ impl HeapStore {
                 next_record_id: 0,
                 cluster: None,
                 cluster_name: None,
+                newest_write: None,
             },
         );
         self.by_id.insert(id, name.to_string());

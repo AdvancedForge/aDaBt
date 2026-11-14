@@ -47,6 +47,7 @@ impl HeapStore {
         let chain = c.directory.entry(id).or_default();
         let superseded = !chain.versions.is_empty();
         chain.push(txn, Some(loc));
+        c.note_write(txn, id);
         // Every write through here — manual or auto-allocated, live or
         // replayed — pushes the sequence past whatever id it just used. This is
         // the one physical write path, so there is nowhere else an id could
@@ -83,6 +84,7 @@ impl HeapStore {
         let chain = c.directory.entry(id).or_default();
         let superseded = !chain.versions.is_empty();
         chain.push(txn, Some(loc));
+        c.note_write(txn, id);
         c.next_record_id = c.next_record_id.max(id.0 + 1);
         if superseded {
             self.retained += 1;
@@ -105,6 +107,7 @@ impl HeapStore {
         // A tombstone rather than a removal: a reader whose snapshot predates
         // the delete must still find the record.
         chain.push(txn, None);
+        c.note_write(txn, id);
         self.retained += 1;
         self.maybe_reclaim()?;
         Ok(true)

@@ -108,6 +108,19 @@ impl HeapStore {
             .and_then(|c| c.newest_stamp()))
     }
 
+    /// The newest write — put or delete — committed to any record of
+    /// `collection` since this store was opened, as its stamp and the id it
+    /// wrote; `None` if there has been none.
+    ///
+    /// The collection-level counterpart of [`Self::latest_write_ts`]: a
+    /// transaction that scanned `collection` validates the whole scan, rows it
+    /// never saw included, by comparing this one stamp with its snapshot.
+    /// Nothing before the open is reported, and nothing needs to be: no
+    /// snapshot spans a restart.
+    pub fn newest_write_in(&self, collection: &str) -> Result<Option<(TxnId, RecordId)>> {
+        Ok(self.coll(collection)?.newest_write)
+    }
+
     pub fn retained_versions(&self) -> usize {
         self.retained
     }

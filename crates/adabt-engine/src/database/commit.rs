@@ -7,9 +7,10 @@
 //!
 //! **Decide**, against state nothing else can change while `&mut self` is
 //! held: first-committer-wins over the write-set (and, under
-//! `Consistency::Strict`, the read-set), the schema, and unique constraints
-//! judged against the state the whole write-set would produce. Any failure
-//! here returns an error with nothing written anywhere.
+//! `Consistency::Strict`, the ids read and the collections scanned), the
+//! schema, and unique constraints judged against the state the whole
+//! write-set would produce. Any failure here returns an error with nothing
+//! written anywhere.
 //!
 //! **Apply**, which cannot be refused for any reason the transaction could
 //! have anticipated: the write-set goes to the store as one group
@@ -79,8 +80,10 @@ impl Database {
     /// the transaction's snapshot was taken; for a value being written,
     /// against the schema; and the write-set as a whole against unique
     /// constraints, as the state it would leave behind. Under
-    /// `Consistency::Strict` the read-set gets the same conflict check. Only
-    /// once all of that has passed is anything written.
+    /// `Consistency::Strict` every id the transaction read gets the same
+    /// conflict check, and every collection it scanned must have received no
+    /// committed write since the snapshot. Only once all of that has passed is
+    /// anything written.
     ///
     /// The writes are then logged as one group under a single commit record
     /// and made durable once — one fsync under `Durability::Strict`, however
@@ -128,24 +131,55 @@ impl Database {
             .try_for_each(|(collection, id)| self.check_unchanged_since(txn, collection, *id))
     }
 
-    /// Serializable posture (`Consistency::Strict`): the read set gets the
-    /// same first-committer-wins check the write set already had.
+    /// Serializable posture (`Consistency::Strict`): everything the
+    /// transaction observed gets the first-committer-wins check the write set
+    /// already had.
     ///
-    /// This is what closes write skew — a transaction whose *observations* went
-    /// stale between its snapshot and its commit aborts instead of committing a
-    /// result no serial execution would have produced. Under
-    /// `Consistency::Snapshot` it does nothing and the guarantee is snapshot
-    /// isolation exactly as documented. (The enum's ordinal runs
-    /// strongest-first, so an inequality here would silently include
-    /// `Eventual`; the guarantee is named exactly or not at all.)
+    /// This is what makes `Strict` serializable — a transaction whose
+    /// *observations* went stale between its snapshot and its commit aborts
+    /// instead of committing a result no serial execution would have
+    /// produced. Point reads close write skew; scans close predicate phantoms.
+    /// Under `Consistency::Snapshot` it does nothing, costs nothing, and the
+    /// guarantee is snapshot isolation exactly as documented.
     fn check_read_conflicts(&self, txn: &Transaction) -> Result<()> {
-        if self.policy.guarantees.consistency != adabt_core::policy::Consistency::Strict {
+        if !self.validates_reads() {
             return Ok(());
         }
+        self.check_point_reads(txn)?;
+        self.check_scans(txn)
+    }
+
+    /// Whether commit validates what a transaction read, not only what it
+    /// wrote. (The enum's ordinal runs strongest-first, so an inequality here
+    /// would silently include `Eventual`; the guarantee is named exactly or
+    /// not at all.)
+    fn validates_reads(&self) -> bool {
+        self.policy.guarantees.consistency == adabt_core::policy::Consistency::Strict
+    }
+
+    /// Refuse if any id read by `get` was written after the snapshot. Ids the
+    /// transaction also writes were already checked with the write set.
+    fn check_point_reads(&self, txn: &Transaction) -> Result<()> {
         txn.reads()
             .iter()
             .filter(|(collection, id)| !txn.writes().contains_key(&(collection.clone(), *id)))
             .try_for_each(|(collection, id)| self.check_unchanged_since(txn, collection, *id))
+    }
+
+    /// Refuse if any scanned collection received a committed write — insert,
+    /// update or delete, of any row — after the snapshot.
+    ///
+    /// Collection granularity is deliberate. A scan's caller may have
+    /// evaluated any predicate over the rows; the only way its answer can
+    /// change is for the set of rows to change, and every such change advances
+    /// the collection's newest write. That includes a row inserted after the
+    /// snapshot, which no per-id check can see because the scan never saw the
+    /// id — the phantom. The cost is that a write no predicate would have
+    /// matched conflicts too.
+    fn check_scans(&self, txn: &Transaction) -> Result<()> {
+        txn.scanned()
+            .iter()
+            .try_for_each(|collection| self.check_collection_unchanged_since(txn, collection))
     }
 
     /// Refuse if `collection`/`id` was written after `txn`'s snapshot.
@@ -157,6 +191,19 @@ impl Database {
     ) -> Result<()> {
         match self.store.latest_write_ts(collection, id)? {
             Some(ts) if ts.0 > txn.snapshot().at().0 => Err(Error::TransactionConflict {
+                collection: collection.to_string(),
+                id,
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// Refuse if anything in `collection` was written after `txn`'s snapshot.
+    /// The conflict names the newest such write, which is the one that made
+    /// the scan stale whichever row the caller cared about.
+    fn check_collection_unchanged_since(&self, txn: &Transaction, collection: &str) -> Result<()> {
+        match self.store.newest_write_in(collection)? {
+            Some((ts, id)) if ts.0 > txn.snapshot().at().0 => Err(Error::TransactionConflict {
                 collection: collection.to_string(),
                 id,
             }),

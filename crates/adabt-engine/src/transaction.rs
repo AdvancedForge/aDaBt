@@ -1,4 +1,5 @@
-//! Multi-statement transactions, single-shard snapshot isolation.
+//! Multi-statement transactions on one shard: snapshot isolation, or
+//! serializable under `Consistency::Strict`.
 //!
 //! A [`Transaction`] is a value: [`Database::begin`](crate::database::Database::begin) hands one out, its reads
 //! and writes accumulate in memory against a fixed snapshot, and
@@ -85,25 +86,62 @@
 //! be writing into — a real question, and not one that needs answering to
 //! deliver multi-statement data transactions.
 //!
+//! It follows that DDL is outside the serializable guarantee below. A
+//! transaction whose read or scanned collection has been dropped by the time
+//! it commits fails with `NoSuchCollection`; one dropped and re-created in
+//! between is judged only by the writes made to the new collection. A schema
+//! change that rebuilds the collection writes every record again, so it
+//! conflicts with a concurrent scan like any other write; one applied in
+//! place rewrites nothing and does not.
+//!
+//! # Isolation: snapshot by default, serializable on request
+//!
+//! Two transactions with disjoint write-sets can, under plain snapshot
+//! isolation, commit a result no serial execution would have produced (the
+//! classic write-skew anomaly) — and that remains true when the policy says
+//! [`adabt_core::policy::Consistency::Snapshot`].
+//!
+//! When the policy says [`adabt_core::policy::Consistency::Strict`], commit
+//! also validates everything the transaction *observed*, optimistically and
+//! with the same first-committer-wins rule the write set always had:
+//!
+//! - every id it read with [`Transaction::get`] — absence included, and
+//!   including the existence checks `insert`, `update` and `delete` make —
+//!   must not have been written since its snapshot;
+//! - every collection it read with [`Transaction::scan`] must have received
+//!   no committed write at all since its snapshot: no insert, no update, no
+//!   delete, of any row.
+//!
+//! The second rule is what closes predicate phantoms. Whatever predicate a
+//! caller evaluates over a scan, its answer can only change if the set of
+//! rows changes, and any such change is a committed write to the collection.
+//! Recording ids alone would miss the row a concurrent transaction inserts,
+//! because the scan never saw it.
+//!
+//! Why that is serializable: a committed `Strict` transaction read nothing
+//! that changed between its snapshot and its commit, so every read it made
+//! returns the same answer at its commit point, where its writes land as one
+//! group. It is therefore equivalent to running alone at that point, and
+//! commit order is a serial order for all of them. (A read-only transaction
+//! is equivalent to running at its snapshot, which is equally a point on that
+//! order.) Nothing commits concurrently with a commit — `&mut self` again —
+//! so "between snapshot and commit" is well defined.
+//!
+//! The price is granularity. A scan conflicts with *any* concurrent committed
+//! write to its collection, including one to a row no predicate of the
+//! caller's would ever have matched; a busy collection makes long scanning
+//! transactions abort and retry. That is the honest cost of validating
+//! without knowing the predicate — this API has no predicate to know — and
+//! it is paid only under `Strict`: a transaction that only reads by id is
+//! judged by those ids alone, as before.
+//!
+//! Reads are recorded under both policies so the guarantee stays a choice
+//! made at the policy, not a fork in the transaction code path; under
+//! `Snapshot` the record is simply never consulted.
+//!
 //! # What this does not do
 //!
-//! Snapshot isolation by default; serializable on request. Two transactions
-//! with disjoint write-sets can, under plain snapshot isolation, commit a
-//! result no serial execution would have produced (the classic write-skew
-//! anomaly) — and that remains true when the policy says
-//! [`adabt_core::policy::Consistency::Snapshot`]. When the policy says
-//! [`adabt_core::policy::Consistency::Strict`], commit validates the read
-//! set with the same first-committer-wins rule the write set always had: a
-//! transaction whose observations went stale aborts, and the skew is closed.
-//! Reads are recorded either way so the guarantee stays a choice made at the
-//! policy, not a fork in the transaction code path.
-//!
-//! What is recorded is the ids a transaction read, not the predicates it
-//! asked. So `Strict` closes write skew but not predicate phantoms: a scan
-//! that found no matching row does not conflict with a concurrent insert of
-//! one (`tests/serializable.rs` pins that limit).
-//!
-//! And nothing here reaches across shards. A `Transaction` is born from one
+//! Nothing here reaches across shards. A `Transaction` is born from one
 //! `Database` and can only write to it. A write-set spanning shards goes
 //! through `ShardedDatabase::commit_coordinated` instead, which guarantees the
 //! writes survive a crash together but takes no snapshot and validates no
@@ -113,7 +151,7 @@ use adabt_core::error::{Error, Result};
 use adabt_core::ids::{RecordId, TransactionId};
 use adabt_core::record::Record;
 use adabt_storage::version::Snapshot;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// One buffered write, keyed by `(collection, id)` in [`Transaction::writes`].
 #[derive(Debug, Clone)]
@@ -122,23 +160,30 @@ pub(crate) enum Write {
     Delete,
 }
 
-/// A multi-statement transaction under snapshot isolation.
+/// A multi-statement transaction: snapshot isolation, or serializable when
+/// the policy asks for `Consistency::Strict`.
 ///
-/// See the module documentation for what "snapshot isolation" means here and
-/// why buffering in memory is the correct mechanism rather than a shortcut.
+/// See the module documentation for exactly what each guarantee means here
+/// and why buffering in memory is the correct mechanism rather than a
+/// shortcut.
 pub struct Transaction {
     id: TransactionId,
     snapshot: Snapshot,
     writes: HashMap<(String, RecordId), Write>,
-    /// Every row this transaction observed through its snapshot — via `get`
-    /// (including reads that found nothing) and `scan`. Recorded always, so
-    /// the isolation decision can be made at commit rather than frozen at
-    /// begin; validated only when the policy demands serializable, where a
-    /// read row modified since the snapshot aborts the commit and closes
-    /// write skew. Under plain snapshot isolation this list is written but
-    /// never read, which is the cost of keeping one code path for both
-    /// guarantees.
-    reads: std::collections::HashSet<(String, RecordId)>,
+    /// Every id this transaction looked up through its snapshot with `get`,
+    /// including lookups that found nothing. Recorded always, so the
+    /// isolation decision can be made at commit rather than frozen at begin;
+    /// validated only when the policy demands serializable, where an id
+    /// written since the snapshot aborts the commit and closes write skew.
+    /// Under plain snapshot isolation this set is written but never read,
+    /// which is the cost of keeping one code path for both guarantees.
+    reads: HashSet<(String, RecordId)>,
+    /// Every collection this transaction scanned. Validated, under the same
+    /// policy, against the collection's newest committed write rather than
+    /// row by row, which is what catches a row inserted after the snapshot
+    /// that the scan therefore never saw. Ordered so that, of several
+    /// conflicting collections, the one reported is always the same.
+    scanned: BTreeSet<String>,
 }
 
 impl Transaction {
@@ -147,7 +192,8 @@ impl Transaction {
             id,
             snapshot,
             writes: HashMap::new(),
-            reads: std::collections::HashSet::new(),
+            reads: HashSet::new(),
+            scanned: BTreeSet::new(),
         }
     }
 
@@ -174,9 +220,14 @@ impl Transaction {
         &self.writes
     }
 
-    /// Every row this transaction read through its snapshot.
-    pub(crate) fn reads(&self) -> &std::collections::HashSet<(String, RecordId)> {
+    /// Every id this transaction looked up through its snapshot.
+    pub(crate) fn reads(&self) -> &HashSet<(String, RecordId)> {
         &self.reads
+    }
+
+    /// Every collection this transaction scanned through its snapshot.
+    pub(crate) fn scanned(&self) -> &BTreeSet<String> {
+        &self.scanned
     }
 
     /// Read as this transaction sees it: its own buffered writes first, then
@@ -227,12 +278,13 @@ impl Transaction {
                 }
             }
         }
-        // Every row the scan observed joins the read set, same as `get` —
-        // a predicate evaluated over a scan is precisely what write skew
-        // reads behind.
-        for id in rows.keys() {
-            self.reads.insert((collection.to_string(), *id));
-        }
+        // The scan is recorded as a whole, not as the ids it returned: a
+        // caller filtering these rows is asking a question about the
+        // collection, and a row inserted after the snapshot changes the
+        // answer without being one of these ids. Collection-level validation
+        // also covers every returned id, so recording them as well would buy
+        // nothing.
+        self.scanned.insert(collection.to_string());
         Ok(rows.into_iter().collect())
     }
 

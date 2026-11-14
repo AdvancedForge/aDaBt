@@ -57,5 +57,5 @@ Catalog v4 (`delta_encoding`/`thread_per_core`) is authoritative; loss rebuilds 
 
 - `cargo test -p adabt-storage --test catalog_upgrade` — v3 accepted with defaults, v4 round-trips, future version refused
 - `cargo test -p adabt-engine --test cross_shard_concurrent` — coordinator soak under concurrent readers/writers
-- `cargo test -p adabt-engine --test serializable -- predicate_phantom` — documents Strict phantom limit
+- `cargo test -p adabt-engine --test serializable -- phantom` — write skew through a phantom commits under `Snapshot` and is refused under `Strict`
 - `crash_consistency.rs` (13 offsets), `promotion_chaos.rs` (Building/Shadow kill-reopen), `verify()` seeded divergence

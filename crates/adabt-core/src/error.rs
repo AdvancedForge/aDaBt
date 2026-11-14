@@ -22,8 +22,14 @@ pub enum Error {
     #[error("not yet implemented: {0}")]
     Unsupported(String),
 
-    /// A transaction's write conflicted with one committed after its snapshot
-    /// began — first-committer-wins, and this one lost.
+    /// Something a transaction depended on was changed by a write committed
+    /// after its snapshot began — first-committer-wins, and this one lost.
+    /// Retrying the transaction from a fresh snapshot is the remedy.
+    ///
+    /// A write always depends on the record it writes. Under
+    /// `Consistency::Strict` a transaction also depends on every record it
+    /// read and every collection it scanned; for a scan, `id` names the
+    /// newest record written to that collection since the snapshot.
     #[error("transaction conflict on {collection}.{id}: modified since the transaction's snapshot began")]
     TransactionConflict { collection: String, id: RecordId },
 

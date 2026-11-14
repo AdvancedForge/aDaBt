@@ -4,7 +4,9 @@
 //! guarantees existed and enforced nowhere — a promise without a mechanism.
 //! It now means something: at commit, the read set gets the same
 //! first-committer-wins validation the write set always had, which closes
-//! the write-skew anomaly that plain snapshot isolation permits. The same
+//! the write-skew anomaly that plain snapshot isolation permits, and every
+//! collection it scanned is checked for any committed write at all, which
+//! closes predicate phantoms. The same
 //! workload under `Consistency::Snapshot` commits both transactions — this
 //! file runs it both ways, because a guarantee is only honest when the test
 //! shows what life is like *without* it.
@@ -212,54 +214,224 @@ fn a_transactions_own_writes_need_no_read_validation() {
     db.commit(txn).unwrap();
 }
 
+fn i64(v: i64) -> adabt_core::value::Value {
+    adabt_core::value::Value::I64(v)
+}
+
+fn doctor(who: &str, age: i64) -> Record {
+    Record::new()
+        .with("who", who)
+        .with("on_call", true)
+        .with("age", age)
+}
+
+/// The predicate both transactions in the phantom tests evaluate over a scan.
+fn anyone_aged(txn: &mut adabt_engine::Transaction, db: &mut Database, age: i64) -> bool {
+    txn.scan(db, "doctors")
+        .unwrap()
+        .iter()
+        .any(|(_, r)| r.get("age") == Some(&i64(age)))
+}
+
+fn is_conflict(err: &adabt_core::error::Error) -> bool {
+    matches!(err, adabt_core::error::Error::TransactionConflict { .. })
+}
+
 #[test]
-fn predicate_phantom_is_not_prevented_even_under_strict() {
-    // Strict currently validates point reads (the ids a scan observed) with
-    // first-committer-wins, which closes write-skew but not predicate phantoms:
-    // a scan that saw "no row matching age=30" does not record that predicate,
-    // so a concurrent insert of a new id with age=30 is not in the first
-    // transaction's read set and both commit. This test documents the current
-    // guarantee rather than claiming more. True phantom prevention would require
-    // predicate/ranged read tracking, which is future work and deliberately not
-    // smuggled in via collection-level aborts (too many false positives).
+fn write_skew_through_a_phantom_commits_under_snapshot_and_is_refused_under_strict() {
+    // The rule: at most one doctor aged 30. Each transaction scans, finds
+    // nobody aged 30, and inserts one under a fresh id. Their write-sets are
+    // disjoint and neither saw the other's row — it did not exist yet — so no
+    // per-id check can relate them. Only validating the scan itself can.
     for consistency in [Consistency::Snapshot, Consistency::Strict] {
-        let t = Tmp::new(&format!("phantom-{consistency:?}"));
+        let t = Tmp::new(&format!("phantom-skew-{consistency:?}"));
         let mut db = on_call_db(t.path(), consistency);
-        // T1 scans for age=30 — sees nothing (read set is the ids it observed, none match).
         let mut t1 = db.begin();
-        let scan = t1.scan(&mut db, "doctors").unwrap();
-        let phantom_exists = scan
-            .iter()
-            .any(|(_, r)| r.get("age") == Some(&adabt_core::value::Value::I64(30)));
-        assert!(!phantom_exists);
-
-        // T2 inserts a new doctor with age=30.
         let mut t2 = db.begin();
-        t2.insert(
-            &mut db,
-            "doctors",
-            RecordId(99),
-            Record::new()
-                .with("who", "eve")
-                .with("on_call", true)
-                .with("age", 30i64),
-        )
-        .unwrap();
-        db.commit(t2).unwrap();
 
-        // T1 now writes based on its phantom-free view and commits — currently
-        // allowed under both levels, documenting the limit of Strict today.
-        t1.insert(
-            &mut db,
-            "doctors",
-            RecordId(100),
-            Record::new().with("who", "mallory").with("age", 31i64),
-        )
-        .unwrap();
+        assert!(!anyone_aged(&mut t1, &mut db, 30));
+        assert!(!anyone_aged(&mut t2, &mut db, 30));
+        t1.insert(&mut db, "doctors", RecordId(10), doctor("eve", 30))
+            .unwrap();
+        t2.insert(&mut db, "doctors", RecordId(11), doctor("mallory", 30))
+            .unwrap();
+
         db.commit(t1).unwrap();
+        let second = db.commit(t2);
 
-        // Both phantoms landed; a true predicate-locking Strict would have
-        // refused one of them. The count proves the phantom slipped through.
-        assert_eq!(db.count("doctors").unwrap(), 4);
+        let aged_30 = db
+            .scan("doctors")
+            .unwrap()
+            .iter()
+            .filter(|(_, r)| r.get("age") == Some(&i64(30)))
+            .count();
+        match consistency {
+            Consistency::Snapshot => {
+                second.expect("snapshot isolation permits the phantom");
+                assert_eq!(aged_30, 2, "the anomaly did not reproduce");
+            }
+            _ => {
+                let err = second.expect_err("strict must refuse the phantom");
+                assert!(is_conflict(&err), "{err}");
+                assert_eq!(aged_30, 1, "the refused transaction left a trace");
+            }
+        }
     }
+}
+
+/// A concurrent autocommit write against the scanned collection, as the
+/// conflict tests below exercise it.
+type ConcurrentWrite = fn(&mut Database);
+
+/// Every kind of committed write a scan must be invalidated by. Rows 1 and 2
+/// exist when the scanning transaction begins; row 50 does not.
+const CONCURRENT_WRITES: [(&str, ConcurrentWrite); 3] = [
+    ("insert", |db| {
+        db.insert("doctors", RecordId(50), doctor("eve", 30))
+            .unwrap();
+    }),
+    ("update", |db| {
+        db.update("doctors", RecordId(1), doctor("alice", 30))
+            .unwrap();
+    }),
+    ("delete", |db| {
+        assert!(db.delete("doctors", RecordId(2)).unwrap());
+    }),
+];
+
+#[test]
+fn a_scan_conflicts_with_any_concurrent_write_to_its_collection_under_strict() {
+    // The insert is the phantom proper: a row the scan never saw. The update
+    // and the delete hit rows the scan did return, which the collection-level
+    // check must cover now that a scan no longer records the ids it saw.
+    for (what, concurrent_write) in CONCURRENT_WRITES {
+        for consistency in [Consistency::Snapshot, Consistency::Strict] {
+            let t = Tmp::new(&format!("scan-vs-{what}-{consistency:?}"));
+            let mut db = on_call_db(t.path(), consistency);
+            let mut txn = db.begin();
+            let _ = txn.scan(&mut db, "doctors").unwrap();
+            concurrent_write(&mut db);
+            // A write on an id nobody else touches, so the write-set alone
+            // can never conflict: anything refused here is the scan.
+            txn.insert(&mut db, "doctors", RecordId(60), doctor("zed", 40))
+                .unwrap();
+
+            let result = db.commit(txn);
+            match consistency {
+                Consistency::Snapshot => {
+                    result.unwrap_or_else(|e| panic!("{what}: snapshot refused: {e}"))
+                }
+                _ => {
+                    let err = result.expect_err(what);
+                    assert!(is_conflict(&err), "{what}: {err}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_scan_conflict_names_the_collection_and_the_newest_write() {
+    let t = Tmp::new("scan-conflict-names");
+    let mut db = on_call_db(t.path(), Consistency::Strict);
+    let mut txn = db.begin();
+    let _ = txn.scan(&mut db, "doctors").unwrap();
+    db.insert("doctors", RecordId(50), doctor("eve", 30))
+        .unwrap();
+    db.insert("doctors", RecordId(51), doctor("frank", 31))
+        .unwrap();
+    txn.insert(&mut db, "doctors", RecordId(60), doctor("zed", 40))
+        .unwrap();
+
+    match db.commit(txn) {
+        Err(adabt_core::error::Error::TransactionConflict { collection, id }) => {
+            assert_eq!(collection, "doctors");
+            assert_eq!(id, RecordId(51));
+        }
+        other => panic!("expected a conflict, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_scan_does_not_conflict_with_writes_to_another_collection() {
+    let t = Tmp::new("scan-other-collection");
+    let mut db = on_call_db(t.path(), Consistency::Strict);
+    db.create_collection("shifts", Schema::new(SchemaMode::Dynamic, vec![]).unwrap())
+        .unwrap();
+    let mut txn = db.begin();
+    let _ = txn.scan(&mut db, "doctors").unwrap();
+    db.insert("shifts", RecordId(1), Record::new().with("who", "alice"))
+        .unwrap();
+    txn.insert(&mut db, "doctors", RecordId(60), doctor("zed", 40))
+        .unwrap();
+    db.commit(txn).unwrap();
+}
+
+#[test]
+fn a_scan_does_not_conflict_with_earlier_commits_or_its_own_writes() {
+    // The bound is the snapshot, not the transaction's first read, and a
+    // transaction's own buffered writes are not "committed by someone else".
+    let t = Tmp::new("scan-own-writes");
+    let mut db = on_call_db(t.path(), Consistency::Strict);
+    db.insert("doctors", RecordId(50), doctor("eve", 30))
+        .unwrap();
+    let mut txn = db.begin();
+    txn.update(&mut db, "doctors", RecordId(1), doctor("alice", 41))
+        .unwrap();
+    txn.delete(&mut db, "doctors", RecordId(2)).unwrap();
+    let rows = txn.scan(&mut db, "doctors").unwrap();
+    assert_eq!(rows.len(), 2);
+    txn.insert(&mut db, "doctors", RecordId(60), doctor("zed", 40))
+        .unwrap();
+    db.commit(txn).unwrap();
+    assert_eq!(db.count("doctors").unwrap(), 3);
+}
+
+#[test]
+fn point_reads_do_not_conflict_with_writes_to_other_rows_of_the_collection() {
+    // Collection-level validation applies to scans only. A transaction that
+    // reads by id depends on those ids alone, so a concurrent insert, update
+    // or delete elsewhere in the collection must not abort it.
+    for (what, concurrent_write) in CONCURRENT_WRITES {
+        let t = Tmp::new(&format!("point-vs-{what}"));
+        let mut db = on_call_db(t.path(), Consistency::Strict);
+        db.insert("doctors", RecordId(3), doctor("carol", 50))
+            .unwrap();
+        let mut txn = db.begin();
+        let carol = txn.get(&mut db, "doctors", RecordId(3)).unwrap().unwrap();
+        concurrent_write(&mut db);
+        txn.update(&mut db, "doctors", RecordId(3), off_call(&carol))
+            .unwrap();
+        db.commit(txn)
+            .unwrap_or_else(|e| panic!("{what}: a point read conflicted: {e}"));
+    }
+}
+
+#[test]
+fn a_schema_rebuild_carries_the_collections_write_history() {
+    // Deleting every row and then rebuilding the collection under a new
+    // schema leaves a collection none of whose records was written after the
+    // snapshot — there are none. The deletes happened, though, and the scan
+    // that saw those rows must still be refused.
+    let t = Tmp::new("scan-vs-rebuild");
+    let mut db = on_call_db(t.path(), Consistency::Strict);
+    let mut txn = db.begin();
+    assert_eq!(txn.scan(&mut db, "doctors").unwrap().len(), 2);
+    for id in [1, 2] {
+        assert!(db.delete("doctors", RecordId(id)).unwrap());
+    }
+    let wider = Schema::new(
+        SchemaMode::Dynamic,
+        vec![
+            adabt_core::schema::FieldDef::new("who", adabt_core::schema::FieldType::Char(8)),
+            adabt_core::schema::FieldDef::new("on_call", adabt_core::schema::FieldType::Bool),
+            adabt_core::schema::FieldDef::new("age", adabt_core::schema::FieldType::I64),
+        ],
+    )
+    .unwrap();
+    assert_eq!(db.alter_schema("doctors", wider).unwrap(), 0);
+    txn.insert(&mut db, "doctors", RecordId(60), doctor("zed", 40))
+        .unwrap();
+    let err = db.commit(txn).expect_err("the deletes made the scan stale");
+    assert!(is_conflict(&err), "{err}");
 }
