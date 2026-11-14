@@ -158,9 +158,9 @@ pub struct Database {
     delta_encoding: bool,
     /// Whether thread-per-core execution is enabled.
     thread_per_core: bool,
-    /// Whether join order optimization is enabled (M32).
+    /// Whether join order optimization is enabled.
     join_order: bool,
-    /// Whether data-driven partitioning is enabled (M32).
+    /// Whether data-driven partitioning is enabled.
     data_partitioning: bool,
 }
 

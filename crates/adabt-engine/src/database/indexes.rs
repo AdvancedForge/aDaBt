@@ -366,7 +366,7 @@ impl Database {
     }
 
     /// Distinct pages `get` has touched since the last clear — the number a
-    /// locality claim is measured against. See [`HeapStore::touched_pages`].
+    /// locality claim is measured against. See [`HeapStore::touched_pages`](adabt_storage::heap::HeapStore::touched_pages).
     pub fn touched_pages(&self) -> usize {
         self.store.touched_pages()
     }

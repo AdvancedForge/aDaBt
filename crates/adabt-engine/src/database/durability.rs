@@ -212,8 +212,8 @@ impl Database {
     ///
     /// `Database::open` fixes this at 1024 pages — 4 MiB — regardless of how
     /// much data the database holds, and `HeapStore::set_pool_capacity` was
-    /// reachable from nowhere above the storage crate. Scale measurement
-    /// (M36) showed why that matters: at 1.6M rows the heap is far larger
+    /// reachable from nowhere above the storage crate. The scale benchmark
+    /// showed why that matters: at 1.6M rows the heap is far larger
     /// than 4 MiB, so nearly every fetch is a cold page read and both scans
     /// and indexed point lookups degrade with collection size.
     pub fn set_pool_capacity(&mut self, pages: usize) -> Result<()> {
@@ -231,11 +231,10 @@ impl Database {
     /// those segments, and it is therefore the difference between "restore to
     /// exactly when I backed up" and real PITR.
     ///
-    /// The mechanism existed in `adabt-storage` since M17 and was reachable
-    /// from nowhere above it until now, which made M22's "point-in-time
-    /// recovery" true of the storage layer and not of anything an
-    /// application could actually call. An audit caught that; this is the
-    /// fix.
+    /// The mechanism lived in `adabt-storage` long before anything above it
+    /// could reach it, which made "point-in-time recovery" true of the
+    /// storage layer and not of anything an application could call. This
+    /// method is the fix.
     pub fn set_log_archive(&mut self, dir: Option<std::path::PathBuf>) {
         self.store.set_log_archive(dir);
     }

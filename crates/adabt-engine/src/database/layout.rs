@@ -115,8 +115,9 @@ impl Database {
     /// store built against the old field set is still self-consistent data,
     /// just data that no longer matches what the schema now promises a reader
     /// — a dropped field silently disappearing from a column store's own
-    /// declared shape would be a second, quieter version of the M14 schema-
-    /// freeze bug. Cheap either way, since every one of these is rebuildable.
+    /// declared shape would be a quieter version of the schema-freeze bug,
+    /// where a crash left a new codec reading bytes the old one wrote
+    /// (`docs/history/m14-notes.md`). Cheap either way, since every one of these is rebuildable.
     fn invalidate_after_schema_change(&mut self, collection: &str) {
         self.indexes.remove(collection);
         self.direct.remove(collection);

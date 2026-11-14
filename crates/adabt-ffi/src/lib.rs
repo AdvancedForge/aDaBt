@@ -13,9 +13,9 @@
 //! # Shape
 //!
 //! Each exported function is a thin shim: it hands a closure returning
-//! `Result<T, Status>` to [`boundary`], which runs it with panics caught and
+//! `Result<T, Status>` to `boundary`, which runs it with panics caught and
 //! turns the outcome into the C return convention. All logic lives in the
-//! closures, written with `?` against [`handle`] and [`text`]; no panic and
+//! closures, written with `?` against `handle` and `text`; no panic and
 //! no Rust error ever unwinds into the caller.
 //!
 //! # Contract

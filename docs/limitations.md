@@ -26,7 +26,7 @@ file wins.
 - **Persistent thread-per-core workers** — burst pinning only (`core_affinity` per query)
 - **Write throughput** — bulk load is ~11× slower than SQLite and single-row inserts also lose; per-record MVCC + WAL is the price (`docs/benchmarks/comparison-notes.md`)
 - **Comparison witnesses** — SQLite only; the PostgreSQL and RocksDB witnesses are planned and the harness exits 2 rather than fake them
-- **`loom` coverage** — `adabt-storage` is model-checked; `adabt-engine` is feature-gated but cross-crate `Arc`/`Mutex` substitution needs broader design work
+- **`loom` coverage** — `adabt-storage`'s transaction-id allocator is model-checked; `adabt-engine` does not yet compile with `--features loom` (loom's `Arc` meets std's at crate boundaries), so the engine has no model checks
 - **C ABI** — open/close, create-collection, i64 field put/get, count; nothing more
 - **CI** — no hosted CI; the gate is `scripts/check.sh`, optionally run by the pre-push hook
 
