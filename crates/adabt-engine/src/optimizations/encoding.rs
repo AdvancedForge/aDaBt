@@ -48,14 +48,33 @@ impl Optimization for RecordCompressionOpt {
 
     fn estimate(&self, ctx: &OptContext<'_>) -> CostEstimate {
         let rows: usize = ctx.collections.iter().map(|(_, n)| n).sum();
+        let (raw, saved) = compression_saving(ctx);
+        // Decoding is paid on every read that reaches a stored record, so the
+        // CPU and latency cost scale with the share of traffic doing that,
+        // the way other estimates scale their gain by the share they help.
+        // With no traffic seen yet there is no evidence of a cheap workload,
+        // so the full cost is assumed rather than none.
+        let mix = ctx.workload();
+        let reads = if mix.operations == 0 {
+            1.0
+        } else {
+            mix.record_read_share()
+        };
         // Whether a particular dataset compresses is a property of the data,
         // not of the algorithm, so confidence here is deliberately low: this is
         // a candidate for *measurement*, which is what shadow trials are for.
-        let mut e = CostEstimate::faster(1.05, 1.08);
-        e.storage_bytes = -(rows as i64 * 48);
-        e.ram_bytes = -(rows as i64 * 16);
-        e.cpu_frac = 0.08;
-        e.io_ops = -(rows as i64 / 100);
+        // The ratio behind `saved` is measured when the engine reports one,
+        // but the CPU it costs is not.
+        let mut e = CostEstimate::faster(1.0 + 0.05 * reads, 1.0 + 0.08 * reads);
+        // The saving is counted once: the bytes leave the stored records, and
+        // a quarter of them is credited as buffer-pool residency, the share
+        // the old fixed figures (48 and 16 bytes a row) gave it. Counting the
+        // whole saving on both would claim twice what is freed.
+        e.storage_bytes = -((saved * 0.75) as i64);
+        e.ram_bytes = -((saved * 0.25) as i64);
+        e.cpu_frac = 0.08 * reads;
+        let shrink = if raw > 0.0 { saved / raw } else { 0.0 };
+        e.io_ops = -((rows as f64 / 100.0 * shrink) as i64);
         e.with_maintenance(0.06)
             .with_confidence(0.3)
             .with_build(BuildCost {
@@ -79,6 +98,40 @@ impl Optimization for RecordCompressionOpt {
 
 /// Below this the CPU spent compressing outweighs the bytes saved.
 const MIN_ROWS_FOR_COMPRESSION: usize = 500;
+
+/// Record size assumed for a collection whose size the engine did not report.
+const ASSUMED_RECORD_BYTES: f64 = 96.0;
+
+/// Compressed over uncompressed size assumed where none was measured: a
+/// saving a little above the 12% below which the store keeps a record raw.
+const ASSUMED_COMPRESSION_RATIO: f64 = 0.7;
+
+/// What the records take uncompressed, and how many of those bytes
+/// compression would free, summed over every collection.
+///
+/// Built on the uncompressed size and the measured ratio, both reported the
+/// same whether compression is on or off, so the claim does not shrink once
+/// the saving is made. It used to be a fixed 64 bytes a row: more than the
+/// expert comparison's records occupy (about 56 bytes, too short for the
+/// store to compress at all), so it claimed to free the whole database.
+fn compression_saving(ctx: &OptContext<'_>) -> (f64, f64) {
+    let (mut raw, mut saved) = (0.0, 0.0);
+    for (name, rows) in ctx.collections {
+        let (bytes, ratio) = match ctx.record_bytes_of(name) {
+            Some(b) => (
+                b.raw as f64,
+                b.compression_ratio.unwrap_or(ASSUMED_COMPRESSION_RATIO),
+            ),
+            None => (
+                *rows as f64 * ASSUMED_RECORD_BYTES,
+                ASSUMED_COMPRESSION_RATIO,
+            ),
+        };
+        raw += bytes;
+        saved += bytes * (1.0 - ratio).clamp(0.0, 1.0);
+    }
+    (raw, saved)
+}
 
 // -- column store -----------------------------------------------------------
 
@@ -218,6 +271,9 @@ impl Optimization for DeltaEncodingOpt {
 mod tests {
     use super::*;
     use crate::optimizations::tests::Fx;
+    use adabt_opt::optimization::RecordBytes;
+    use adabt_telemetry::event::{Event, OpKind, QueryShape};
+    use adabt_telemetry::{CollectingProbe, Probe as _};
 
     #[test]
     fn a_resource_saver_reports_negative_storage_and_positive_cpu() {
@@ -244,6 +300,97 @@ mod tests {
         assert!(RecordCompressionOpt
             .applicability(&fx.ctx())
             .is_applicable());
+    }
+
+    fn measured(raw: u64, ratio: f64) -> Vec<(String, RecordBytes)> {
+        vec![(
+            "users".into(),
+            RecordBytes {
+                raw,
+                compression_ratio: Some(ratio),
+            },
+        )]
+    }
+
+    #[test]
+    fn records_that_do_not_compress_are_claimed_to_save_nothing() {
+        // The expert comparison's records: about 43 bytes each, below the
+        // size at which the store compresses anything. The fixed estimate
+        // claimed 64 bytes a row of them, more than the database held.
+        let mut fx = Fx::new();
+        fx.collections = vec![("users".into(), 20_000)];
+        fx.record_bytes = measured(20_000 * 43, 1.0);
+        fx.current_bytes = 20_000 * 56;
+        let e = RecordCompressionOpt.estimate(&fx.ctx());
+        assert_eq!(e.storage_bytes + e.ram_bytes, 0, "{e:?}");
+        let s = adabt_opt::score::score_against(
+            &RECORD_COMPRESSION_META.axis_effects,
+            &e,
+            &fx.policy,
+            fx.current_bytes,
+        );
+        assert!(s.total < 0.0, "a saving of nothing is not worth CPU: {s:?}");
+    }
+
+    #[test]
+    fn the_claim_is_what_the_measured_ratio_frees_and_no_more() {
+        let mut fx = Fx::new();
+        fx.collections = vec![("users".into(), 10_000)];
+        fx.record_bytes = measured(1_300_000, 0.3);
+        let e = RecordCompressionOpt.estimate(&fx.ctx());
+        let claimed = -(e.storage_bytes + e.ram_bytes);
+        assert!((claimed - 910_000).abs() <= 2, "{claimed}");
+    }
+
+    #[test]
+    fn the_claim_does_not_shrink_once_compression_has_shrunk_the_store() {
+        // Off, the store holds the raw records; on, about a third of them.
+        // The uncompressed size and the ratio are reported the same either
+        // way, so the bytes claimed must be too, or the change argues for
+        // itself before it is made and against itself after.
+        let mut fx = Fx::new();
+        fx.collections = vec![("users".into(), 10_000)];
+        fx.record_bytes = measured(1_300_000, 0.3);
+        fx.current_bytes = 1_430_000;
+        let off = RecordCompressionOpt.estimate(&fx.ctx());
+        fx.current_bytes = 520_000;
+        let on = RecordCompressionOpt.estimate(&fx.ctx());
+        assert_eq!(off.storage_bytes, on.storage_bytes);
+        assert_eq!(off.ram_bytes, on.ram_bytes);
+    }
+
+    #[test]
+    fn decoding_costs_only_on_the_reads_that_reach_records() {
+        let mut fx = Fx::new();
+        fx.collections = vec![("users".into(), 10_000)];
+        fx.record_bytes = measured(1_300_000, 0.3);
+        fx.scan_traffic(1_000);
+        let reading = RecordCompressionOpt.estimate(&fx.ctx());
+
+        // The same traffic, nine in ten answered by the result cache.
+        let probe = CollectingProbe::new();
+        for i in 0..1_000 {
+            probe.record(Event::Op {
+                collection: "users",
+                kind: OpKind::Scan,
+                shape: QueryShape(2),
+                nanos: 1_000,
+                rows: 12,
+            });
+            probe.record(Event::CacheProbe {
+                name: "result_cache",
+                hit: i % 10 != 0,
+            });
+        }
+        fx.snap = probe.snapshot();
+        let cached = RecordCompressionOpt.estimate(&fx.ctx());
+
+        assert!(cached.cpu_frac < reading.cpu_frac / 5.0, "{cached:?}");
+        assert!(cached.p99_delta.0 < reading.p99_delta.0);
+        assert_eq!(
+            cached.storage_bytes, reading.storage_bytes,
+            "the saving does not depend on the traffic"
+        );
     }
 
     #[test]
