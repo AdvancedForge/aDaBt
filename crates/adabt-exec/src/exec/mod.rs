@@ -270,10 +270,13 @@ pub fn execute_with_budget<S: Source>(
     budget: &ExecBudget,
 ) -> Result<Vec<(RecordId, Record)>> {
     let batches = run(&plan.root, src, stats, budget)?;
-    let mut out = Vec::new();
+    // Sized once and filled straight from each batch's columns, so a large
+    // answer is neither regrown as it accumulates nor staged through a
+    // per-batch row vector on its way here.
+    let mut out = Vec::with_capacity(batches.iter().map(RecordBatch::len).sum());
     for b in batches {
         stats.batches += 1;
-        out.extend(b.into_rows());
+        out.extend(b.ids.into_iter().zip(b.records));
     }
     stats.rows_returned = out.len() as u64;
     Ok(out)
@@ -461,16 +464,23 @@ fn collect_rows<S: Source>(
 ///
 /// Same shape as the disabled result cache: correct answers, doubled work,
 /// invisible to anything that compares answers.
+///
+/// Rows go straight into their batch's columns rather than through an
+/// intermediate chunk vector, which would move every row twice.
 fn batches_of(rows: Vec<(RecordId, Record)>) -> Vec<RecordBatch> {
     let mut out = Vec::with_capacity(rows.len().div_ceil(BATCH_SIZE));
+    let mut remaining = rows.len();
     let mut it = rows.into_iter();
-    loop {
-        let chunk: Vec<(RecordId, Record)> = it.by_ref().take(BATCH_SIZE).collect();
-        if chunk.is_empty() {
-            return out;
+    while remaining > 0 {
+        let size = remaining.min(BATCH_SIZE);
+        let mut batch = RecordBatch::with_capacity(size);
+        for (id, rec) in it.by_ref().take(size) {
+            batch.push(id, rec);
         }
-        out.push(RecordBatch::from_rows(chunk));
+        remaining -= size;
+        out.push(batch);
     }
+    out
 }
 
 /// Order two records by the sort keys. A record missing a key sorts last in

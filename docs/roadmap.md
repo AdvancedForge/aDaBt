@@ -65,9 +65,15 @@ throughout: evidence first, then what it unblocks.
 - **Writes:** bulk load is ~11× and single-row inserts are behind SQLite.
   Per-record MVCC and WAL stay; batching, group commit and WAL-frame cost are
   the levers.
-- **Indexed equality and range** (2.4× and ~1.5× behind): the remainder is
-  per-row projection-record construction, so route covering lookups through
-  `fetch_projected_batches`.
+- **Indexed equality** (~1.6× behind; indexed range has crossed over and
+  now wins). Profiling showed the cost was cache misses and allocator
+  traffic, not record construction as such; shared field names, a hashed
+  projection map and an in-place `Project` cut it (details in
+  `benchmarks/comparison-notes.md`). What is left: the covering source clones
+  every needed field — including the filtered one the plan then drops — where
+  it could filter and project the borrowed stored row; and the compiled
+  predicate allocates its evaluation stacks per row. Routing covering lookups
+  through `fetch_projected_batches` would not help: there is no fetch left.
 
 ### 4. Correctness gaps a user will hit
 - Point-in-time restore from a base image: `open_at` over a heap file that

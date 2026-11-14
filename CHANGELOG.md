@@ -36,6 +36,11 @@ A correctness and code-quality pass. No on-disk format change.
   models and shows full failure output.
 
 ### Changed
+- **Covering-index reads are faster, answers unchanged.** Stored projections
+  share one name per field, the id → projection map is hashed, and `Project`
+  narrows owned rows in place: tuned indexed range went from ~1.3× slower
+  than SQLite to faster (1.3–2.9× across runs), tuned indexed equality from
+  1.7–2.9× slower to ~1.6×. `Record::retain_fields` is new.
 - **Minimum supported Rust is 1.88**, the version the dependency tree has
   actually required; 1.82 was never buildable.
 - **The check gate** (`scripts/check.sh`) now also covers the telemetry

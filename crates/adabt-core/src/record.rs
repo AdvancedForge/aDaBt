@@ -127,6 +127,17 @@ impl Record {
         }
         out
     }
+
+    /// [`Record::project`] in place: keep only the named fields, dropping
+    /// the rest.
+    ///
+    /// For a record the caller owns and will not read again, this is the
+    /// same answer without building a second record — no new field vector,
+    /// no copy of any kept value, and only the dropped values freed. Fields
+    /// stay sorted because removal never reorders what remains.
+    pub fn retain_fields(&mut self, names: &[&str]) {
+        self.fields.retain(|(k, _)| names.contains(&&**k));
+    }
 }
 
 /// Rendered like a map, because that is what it is. A derived `Vec` debug
@@ -162,6 +173,27 @@ mod tests {
         assert_eq!(p.get("a"), Some(&Value::I64(1)));
         assert_eq!(p.get("c"), Some(&Value::I64(3)));
         assert_eq!(p.get("b"), None);
+    }
+
+    /// The in-place projection must be the projection, field for field —
+    /// the executor substitutes one for the other on owned rows.
+    #[test]
+    fn retaining_fields_in_place_equals_projecting() {
+        let r = Record::new()
+            .with("d", "text")
+            .with("a", 1i64)
+            .with("c", Value::Null)
+            .with("b", 2i64);
+        for names in [
+            &["a", "c", "missing"][..],
+            &["d", "b", "d"],
+            &[],
+            &["a", "b", "c", "d"],
+        ] {
+            let mut kept = r.clone();
+            kept.retain_fields(names);
+            assert_eq!(kept, r.project(names), "differed for {names:?}");
+        }
     }
 
     #[test]

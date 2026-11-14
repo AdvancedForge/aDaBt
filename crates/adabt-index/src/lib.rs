@@ -18,6 +18,7 @@ use adabt_core::record::Record;
 use adabt_core::value::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
+use std::sync::Arc;
 
 pub use adabt_core::index_kind::IndexKind;
 
@@ -1132,9 +1133,23 @@ pub fn covering_parts(name: &str) -> (String, Vec<String>) {
 pub struct CoveringIndex {
     inner: Box<dyn Index>,
     covers: Vec<String>,
-    /// Projection per indexed id. Sorted, so `snapshot`-driven rebuilds and
-    /// iteration are deterministic.
-    rows: BTreeMap<RecordId, Record>,
+    /// One shared name per covered field, in `covers` order.
+    ///
+    /// Every stored projection names its fields with these, not with the
+    /// names of whichever record it was built from. A covering read clones
+    /// each projection it returns, and cloning a record bumps one refcount per
+    /// field: with names shared index-wide those counts sit on a handful of
+    /// cache lines that stay hot, where per-record names put every bump on a
+    /// cold line of its own — a cache miss per field per returned row,
+    /// measured at about a third of a covering read's per-row cost.
+    shared_names: Vec<Arc<str>>,
+    /// Projection per indexed id.
+    ///
+    /// Hashed rather than ordered because it is only ever probed by id —
+    /// never iterated — and a covering read probes it once per returned row.
+    /// Row order comes from the inner index's id lists, so the answer's order
+    /// does not depend on this map's.
+    rows: HashMap<RecordId, Record>,
     name: String,
     bytes: usize,
 }
@@ -1150,8 +1165,9 @@ impl CoveringIndex {
         Self {
             name: covering_name(&field, &covers),
             inner,
+            shared_names: covers.iter().map(|c| Arc::from(c.as_str())).collect(),
             covers,
-            rows: BTreeMap::new(),
+            rows: HashMap::new(),
             bytes: 0,
         }
     }
@@ -1169,9 +1185,20 @@ impl CoveringIndex {
         idx
     }
 
+    /// The covered fields of `rec`, named with this index's shared names.
+    ///
+    /// The same fields and values `rec.project(covers)` would keep — a covered
+    /// field the record lacks is absent here too — only the names' owner
+    /// differs, which no comparison of records can observe.
     fn projection_of(&self, rec: &Record) -> Record {
-        let names: Vec<&str> = self.covers.iter().map(String::as_str).collect();
-        rec.project(&names)
+        let mut out = Record::new();
+        out.reserve(self.shared_names.len());
+        for name in &self.shared_names {
+            if let Some(v) = rec.get(name) {
+                out.set_shared(Arc::clone(name), v.clone());
+            }
+        }
+        out
     }
 }
 

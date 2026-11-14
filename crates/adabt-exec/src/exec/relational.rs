@@ -161,15 +161,17 @@ pub(super) fn project<S: Source>(
     budget: &ExecBudget,
 ) -> Result<Vec<RecordBatch>> {
     let refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
-    let mut out = Vec::new();
-    for b in run(input, src, stats, budget)? {
-        let mut p = RecordBatch::with_capacity(b.len());
-        for (id, rec) in b.iter() {
-            p.push(id, rec.project(&refs));
+    let mut batches = run(input, src, stats, budget)?;
+    // The input rows are owned and read by nothing after this, so each is
+    // narrowed where it stands rather than copied into a fresh projection
+    // and then dropped: building a second record per row cost a field
+    // vector, a copy of every kept string and a free of every original one.
+    for b in &mut batches {
+        for rec in &mut b.records {
+            rec.retain_fields(&refs);
         }
-        out.push(p);
     }
-    Ok(out)
+    Ok(batches)
 }
 
 pub(super) fn limit<S: Source>(

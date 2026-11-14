@@ -50,23 +50,27 @@ narrow.
 read within this single table so no ratio crosses runs. Absolute values move
 between machines and between runs on this one; earlier published runs of the
 same harness sit within the ranges noted in parentheses where they differ.
+The two indexed rows are the exception: they were re-measured after the
+covering read path was reworked (see "The covering read path" below), on a
+different and faster machine than the rest of the table, so read their
+ratios within each row and never against another row's absolute values.
 
 | workload | unit | aDaBt L0 | aDaBt tuned | SQLite | verdict |
 |---|---|---:|---:|---:|---|
 | bulk load | ns/row | 17,259 | – | 1,563 | **11.0× slower** — structural: MVCC + WAL per record |
 | point lookup by id | ns/probe | 4,714 | – | 8,870 | **1.9× faster** |
-| indexed equality | ns/query | 51.3 ms | 44.4 ms | 18.3 ms | **2.4× slower** — through `CoveringLookup`, zero fetches; was 3.9× pre-auto-covering |
+| indexed equality | ns/query | 16.3 ms | 6.16 ms | 3.80 ms | **1.6× slower** (1.60–1.64× over four runs) — through `CoveringLookup`, zero fetches; was 1.7–2.9× on the same machine before the covering read path was reworked, 3.9× pre-auto-covering |
 | full scan count | ns/query | 208.4 ms | **967** | 8.65 ms | **~9,000–20,000× faster** across runs |
 | group by, count | ns/query | 296.4 ms | **3,014** | 61.30 ms | **~10,000–24,000× faster** across runs |
-| indexed range | ns/query | 27.8 ms | 18.0 ms | 12.2 ms | **1.5× slower** — through `CoveringRange`, was 1.8–3× |
+| indexed range | ns/query | 10.8 ms | 2.66 ms | 6.50 ms | **faster, 1.3–2.9× across six runs** — through `CoveringRange`; was 1.23–1.30× slower on the same machine before the covering read path was reworked |
 | top-20 sort | ns/query | 512.1 ms | **4.72 ms** | 13.31 ms | **2.8× FASTER than SQLite** after tuning |
 | single-row inserts | ns/row | 31,250 | – | 15,087 | **2.1× slower** |
 
-**At its best configuration aDaBt wins 4 of 8 and loses 4.** Three of the
-four losses are fetch-or-projection cost on shapes that already answer
-through purpose-built structures; the fourth pair (the write paths) is the
-price of the durability-and-exactness posture this project will not trade
-for benchmark points.
+**At its best configuration aDaBt wins 5 of 8 and loses 3.** One loss,
+indexed equality, is per-row materialization cost on a shape that already
+answers through a purpose-built structure; the other two (the write paths)
+are the price of the durability-and-exactness posture this project will not
+trade for benchmark points.
 
 Two rows changed kind since the first published run of this harness:
 
@@ -82,9 +86,9 @@ Two rows changed kind since the first published run of this harness:
   equality-filtered, b-tree-backed where it is range-filtered, the backing
   kind checked at planning so a hash covering can never be asked to walk a
   range. Tuned equality answers through `CoveringLookup` and tuned range
-  through `CoveringRange`, both fetch-free. What remains of those gaps is
-  the projection's own per-row record construction — the borrowed-view
-  work's target, not this document's.
+  through `CoveringRange`, both fetch-free. The per-row cost left after
+  that was measured and cut; range has since crossed over, and what
+  remains of the equality gap is itemized in the next section.
 
 ## Where it genuinely wins
 
@@ -110,15 +114,65 @@ mechanism that produces them also produces the losses.
   surprising — batch writes exist (`insert_batch`, used here) but the
   per-record machinery dominates. Narrowable, not flippable: the bookkeeping
   is the product.
-- **Indexed equality/range, 2.1–4.7×.** The index probe is fast; fetching
-  8–13k records through the owned-`Record` path is the cost. A covering
-  index on the projected fields would answer without fetching at all — the
-  structure exists, nothing proposes it yet. This is the next candidate
-  flip, not this document's last word.
+- **Indexed equality, ~1.6×.** Answered fetch-free through a covering
+  index; the remainder is per-row allocation, broken down below.
 - **Single-row inserts, 2.3–2.5×.** Autocommit on both sides, WAL append on
   both sides; the difference is per-statement bookkeeping.
 - **Untuned scans/sorts** remain decode-and-materialize versus packed pages —
   which is exactly why the tuned rows exist.
+
+## The covering read path: where the time went
+
+Measured on the tuned plans (`Project{Filter{CoveringLookup}}` and
+`Project{Filter{CoveringRange}}`, 12,500 and 8,334 rows returned) with
+per-operator timers and a counting allocator in a scratch harness; `perf`
+was not available. Before the change, per returned row:
+
+| stage | equality | range |
+|---|---:|---:|
+| covering probe + clone of the stored projection | ~275 ns | ~270 ns |
+| filter re-check (compiled predicate) | ~100 ns | ~100 ns |
+| `Project` (build a second record, drop the first) | ~185 ns | ~95 ns |
+| heap allocations | 7.0 | 6.0 |
+
+The record *construction* was not the cost the earlier note assumed; cache
+misses and allocator traffic were. Three things fixed, none of which can
+change an answer:
+
+- **The covering index names its stored fields with one shared `Arc<str>`
+  per covered field.** Before, each stored projection kept the name `Arc`s
+  of the record it was built from, so cloning one bumped a refcount on a cold
+  cache line per field per row. Records compare names by content, so which
+  `Arc` owns a name is invisible to every answer.
+- **The covering index's id → projection map is a `HashMap`, not a
+  `BTreeMap`.** It is only ever probed by id, never iterated; row order comes
+  from the inner index's id lists. A probe dropped from ~100 ns (a pointer
+  walk through a 100k-entry tree) to ~15 ns.
+- **`Project` narrows owned rows in place** (`Record::retain_fields`, tested
+  equal to `Record::project`) instead of building a second record and
+  dropping the first, and batches are filled from the source rows and drained
+  into the answer without an intermediate row vector.
+
+After: equality 7.0 → 5.0 allocations per row, range 6.0 → 4.0; tuned
+equality best-of-runs 6.98 ms → 5.76 ms and tuned range 4.31 ms → 2.62 ms on
+the same machine. Spread is large on this machine (other work was running;
+SQLite's own range time moved between 3.5 and 9.6 ms across runs), so the
+range verdict is stated as a range rather than one ratio.
+
+What remains of the equality gap, in order of size:
+
+1. **The clone of every needed field out of the covering index**, including
+   the filtered field itself, which the plan re-checks and then projects
+   away: two string allocations per row. Avoiding it means evaluating the
+   filter and projection against the borrowed stored projection inside the
+   `Source` implementation, which is engine code this change did not touch.
+2. **The compiled predicate allocates its two evaluation stacks per row**
+   (`adabt_ir::vm::Program::run`), ~100 ns per row on both shapes. Reusing
+   the stacks across rows is the cheapest remaining win.
+3. **Allocator cost lands on the next query.** Freeing a 12,500-row answer
+   leaves tens of thousands of chunks for glibc to sort on its next
+   allocation, which showed up as 0.3–1.3 ms inside the *following* query's
+   first telemetry call. Fewer allocations per row shrink this too.
 
 ## The columnar top-K: how the sort flipped
 
