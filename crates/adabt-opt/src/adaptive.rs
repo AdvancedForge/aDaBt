@@ -456,24 +456,15 @@ impl OptimizationDriver for AdaptiveDriver {
 
     fn decide(&mut self, input: DriverInput<'_>) -> Vec<Decision> {
         self.cycles += 1;
-        let DriverInput {
-            registry,
-            current,
-            policy,
-            telemetry,
-            ctx,
-            under_experiment,
-            pinned,
-        } = input;
 
-        let now = metrics_from(telemetry, ctx.current_bytes);
+        let now = metrics_from(input.telemetry, input.ctx.current_bytes);
         // Fold in anything that has had time to show an effect, so this cycle
         // decides against the most corrected priors available.
         self.learn(now);
 
         // Acting on a handful of operations would be reacting to startup, not
         // to a workload.
-        if telemetry.total_calls() < MIN_OBSERVATIONS {
+        if input.telemetry.total_calls() < MIN_OBSERVATIONS {
             return Vec::new();
         }
 
@@ -483,42 +474,62 @@ impl OptimizationDriver for AdaptiveDriver {
         // hidden from the planner, so its usage figures are a statement about
         // the experiment rather than about the workload, and both retracting it
         // and re-proposing it would be decisions taken on no evidence.
-        let untouchable = |d: &Decision| {
-            under_experiment
-                .iter()
-                .any(|(o, s)| *o == d.optimization && *s == d.scope)
-        };
-
-        let is_pinned = |d: &Decision| {
-            pinned
-                .iter()
-                .any(|(o, s)| *o == d.optimization && *s == d.scope)
-        };
-
-        let mut chosen: Vec<Decision> = Vec::new();
-        for (d, _) in self.removals(registry, current, policy, telemetry, ctx) {
-            if chosen.len() >= MAX_CHANGES_PER_CYCLE {
-                break;
-            }
-            // Never retract something correctness depends on, whatever it scores.
-            if untouchable(&d) || is_pinned(&d) {
-                continue;
-            }
-            chosen.push(d);
-        }
+        let mut chosen = self.choose_retractions(&input);
 
         // What this workload looks like now, and what was learned about a
         // workload shaped like it before.
-        let fingerprint = Fingerprint::of(telemetry);
+        let fingerprint = Fingerprint::of(input.telemetry);
         let recalled = self
             .memory
             .recall(&fingerprint)
             .map(|(cfg, score)| (cfg.clone(), score));
 
+        let additions = self.ranked_additions(&input, recalled.as_ref());
+        choose_additions(&mut chosen, additions, input.registry, input.policy);
+
+        self.remember_if_settled(chosen.is_empty(), fingerprint, input.current);
+        self.record_changes(&chosen, now);
+        self.proposals += chosen.len() as u64;
+        chosen
+    }
+}
+
+/// The steps of [`AdaptiveDriver::decide`], in the order it takes them.
+impl AdaptiveDriver {
+    /// Retractions to propose this cycle, worst first, never touching a scope
+    /// under experiment or pinned.
+    fn choose_retractions(&self, input: &DriverInput<'_>) -> Vec<Decision> {
+        let mut chosen: Vec<Decision> = Vec::new();
+        for (d, _) in self.removals(
+            input.registry,
+            input.current,
+            input.policy,
+            input.telemetry,
+            input.ctx,
+        ) {
+            if chosen.len() >= MAX_CHANGES_PER_CYCLE {
+                break;
+            }
+            // Never retract something correctness depends on, whatever it scores.
+            if names_any(input.under_experiment, &d) || names_any(input.pinned, &d) {
+                continue;
+            }
+            chosen.push(d);
+        }
+        chosen
+    }
+
+    /// Candidate additions not under experiment, best first, with anything a
+    /// recalled configuration used moved to the front.
+    fn ranked_additions(
+        &self,
+        input: &DriverInput<'_>,
+        recalled: Option<&(OptimizationConfig, f64)>,
+    ) -> Vec<(Decision, f64)> {
         let mut additions: Vec<(Decision, f64)> = self
-            .additions(registry, current, policy, ctx)
+            .additions(input.registry, input.current, input.policy, input.ctx)
             .into_iter()
-            .filter(|(d, _)| !untouchable(d))
+            .filter(|(d, _)| !names_any(input.under_experiment, d))
             .collect();
 
         // **Recall reorders; it never admits.** Every candidate here has
@@ -528,62 +539,20 @@ impl OptimizationDriver for AdaptiveDriver {
         // trying first, not evidence that it is still correct. Lowering a bar
         // on the strength of memory would let a stale configuration reapply
         // itself against a workload that has genuinely moved on.
-        if let Some((cfg, similarity)) = &recalled {
-            for (d, _) in additions.iter_mut() {
-                if cfg.is_enabled(d.optimization, &d.scope) {
-                    d.trigger = format!(
-                        "{}; tried first — a workload {:.0}% like this one used it",
-                        d.trigger,
-                        similarity * 100.0
-                    );
-                }
-            }
-            additions.sort_by(|a, b| {
-                let a_known = cfg.is_enabled(a.0.optimization, &a.0.scope);
-                let b_known = cfg.is_enabled(b.0.optimization, &b.0.scope);
-                b_known.cmp(&a_known).then(b.1.total_cmp(&a.1))
-            });
+        if let Some((cfg, similarity)) = recalled {
+            try_recalled_first(&mut additions, cfg, *similarity);
         }
+        additions
+    }
 
-        // Joint search over the combination rather than greedy top-N, so
-        // conflicts, prerequisites and the shared memory budget are judged
-        // against the set actually being proposed. See `crate::search` for
-        // why greedy is provably wrong when optimizations interact.
-        if chosen.len() < MAX_CHANGES_PER_CYCLE && !additions.is_empty() {
-            let candidates: Vec<Candidate<'_>> = additions
-                .iter()
-                .take(crate::search::MAX_EXHAUSTIVE)
-                .filter_map(|(d, s)| {
-                    let meta = registry.meta(d.optimization)?;
-                    Some(Candidate {
-                        key: scope_key(d.optimization, &d.scope),
-                        name: meta.name,
-                        meta,
-                        solo_score: *s,
-                        ram_bytes: 0,
-                    })
-                })
-                .collect();
-            let picked: Vec<String> = match best_combination(&candidates, policy) {
-                Some(c) => c.keys,
-                // Nothing coherent and affordable, or too many candidates to
-                // enumerate exactly — fall back to the greedy order rather
-                // than treat "no combination" as "propose nothing".
-                None => additions
-                    .iter()
-                    .map(|(d, _)| scope_key(d.optimization, &d.scope))
-                    .collect(),
-            };
-            for (d, _) in additions {
-                if chosen.len() >= MAX_CHANGES_PER_CYCLE {
-                    break;
-                }
-                if picked.contains(&scope_key(d.optimization, &d.scope)) {
-                    chosen.push(d);
-                }
-            }
-        }
-
+    /// Counts quiet cycles and, once the configuration has settled, remembers
+    /// it for this workload shape.
+    fn remember_if_settled(
+        &mut self,
+        nothing_chosen: bool,
+        fingerprint: Fingerprint,
+        current: &OptimizationConfig,
+    ) {
         // A configuration is only worth remembering once it has stopped
         // moving. Remembering a half-converged one would teach the memory a
         // waypoint as a destination.
@@ -593,7 +562,7 @@ impl OptimizationDriver for AdaptiveDriver {
         // mid-decision, and recording the configuration then would teach the
         // memory a waypoint as a destination. Settled means quiet *and* with
         // nothing outstanding to learn.
-        if chosen.is_empty() && self.pending.is_empty() {
+        if nothing_chosen && self.pending.is_empty() {
             self.stable_cycles = self.stable_cycles.saturating_add(1);
             if self.stable_cycles >= STABLE_CYCLES_BEFORE_REMEMBERING {
                 self.memory.remember(fingerprint, current.clone());
@@ -601,8 +570,12 @@ impl OptimizationDriver for AdaptiveDriver {
         } else {
             self.stable_cycles = 0;
         }
+    }
 
-        for d in &chosen {
+    /// Starts the cooldown on every chosen scope, queues enables for
+    /// measurement, and bars evidence-based retractions from quick re-proposal.
+    fn record_changes(&mut self, chosen: &[Decision], now: Metrics) {
+        for d in chosen {
             self.mark_changed(d.optimization, &d.scope);
             match d.action {
                 DecisionAction::Enable => self.pending.push(Pending {
@@ -619,8 +592,85 @@ impl OptimizationDriver for AdaptiveDriver {
                 _ => {}
             }
         }
-        self.proposals += chosen.len() as u64;
-        chosen
+    }
+}
+
+/// Whether `d` is about one of the listed `(optimization, scope)` pairs.
+fn names_any(pairs: &[(&'static str, String)], d: &Decision) -> bool {
+    pairs
+        .iter()
+        .any(|(o, s)| *o == d.optimization && *s == d.scope)
+}
+
+/// Moves additions the recalled configuration used to the front, noting why
+/// in their triggers; score order is kept within each group.
+fn try_recalled_first(
+    additions: &mut [(Decision, f64)],
+    cfg: &OptimizationConfig,
+    similarity: f64,
+) {
+    for (d, _) in additions.iter_mut() {
+        if cfg.is_enabled(d.optimization, &d.scope) {
+            d.trigger = format!(
+                "{}; tried first — a workload {:.0}% like this one used it",
+                d.trigger,
+                similarity * 100.0
+            );
+        }
+    }
+    additions.sort_by(|a, b| {
+        let a_known = cfg.is_enabled(a.0.optimization, &a.0.scope);
+        let b_known = cfg.is_enabled(b.0.optimization, &b.0.scope);
+        b_known.cmp(&a_known).then(b.1.total_cmp(&a.1))
+    });
+}
+
+/// Fills what is left of the per-cycle change budget with the additions joint
+/// search picks, in ranked order.
+fn choose_additions(
+    chosen: &mut Vec<Decision>,
+    additions: Vec<(Decision, f64)>,
+    registry: &Registry,
+    policy: &Policy,
+) {
+    // Joint search over the combination rather than greedy top-N, so
+    // conflicts, prerequisites and the shared memory budget are judged
+    // against the set actually being proposed. See `crate::search` for
+    // why greedy is provably wrong when optimizations interact.
+    if chosen.len() >= MAX_CHANGES_PER_CYCLE || additions.is_empty() {
+        return;
+    }
+    let candidates: Vec<Candidate<'_>> = additions
+        .iter()
+        .take(crate::search::MAX_EXHAUSTIVE)
+        .filter_map(|(d, s)| {
+            let meta = registry.meta(d.optimization)?;
+            Some(Candidate {
+                key: scope_key(d.optimization, &d.scope),
+                name: meta.name,
+                meta,
+                solo_score: *s,
+                ram_bytes: 0,
+            })
+        })
+        .collect();
+    let picked: Vec<String> = match best_combination(&candidates, policy) {
+        Some(c) => c.keys,
+        // Nothing coherent and affordable, or too many candidates to
+        // enumerate exactly — fall back to the greedy order rather
+        // than treat "no combination" as "propose nothing".
+        None => additions
+            .iter()
+            .map(|(d, _)| scope_key(d.optimization, &d.scope))
+            .collect(),
+    };
+    for (d, _) in additions {
+        if chosen.len() >= MAX_CHANGES_PER_CYCLE {
+            break;
+        }
+        if picked.contains(&scope_key(d.optimization, &d.scope)) {
+            chosen.push(d);
+        }
     }
 }
 

@@ -16,7 +16,7 @@ use crate::action::{ActionSink, ChangePlan};
 use crate::config::OptimizationConfig;
 use crate::cost::CostEstimate;
 use crate::decision::{Decision, DecisionAction, DecisionLog, Source, Verdict};
-use crate::optimization::{permitted_by, OptContext};
+use crate::optimization::{permitted_by, OptContext, Optimization};
 use crate::registry::Registry;
 
 /// The read-only inputs a decision is judged against.
@@ -91,141 +91,164 @@ impl OptimizationController {
         sink: &mut S,
         source: Source,
     ) -> Result<ApplyReport> {
+        let mut report = ApplyReport::default();
+
+        for decision in decisions {
+            let label = format!("{}[{}]", decision.optimization, decision.scope);
+
+            let Some(opt) = env.registry.get(decision.optimization) else {
+                let refusal = Refusal::new(Verdict::NotApplicable, Some("not registered".into()));
+                self.refuse(decision, label, refusal, &mut report);
+                continue;
+            };
+
+            if decision.action == DecisionAction::Disable {
+                self.disable(decision, env.registry, env.ctx, sink, source, &mut report)?;
+                continue;
+            }
+
+            match self.gate_enable(opt, &decision, &env, sink) {
+                Gated::Refused(refusal) => self.refuse(decision, label, refusal, &mut report),
+                Gated::Admitted(admitted) => {
+                    self.enable(decision, label, admitted, sink, source, &mut report)?
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// Runs an enable through every gate in order, stopping at the first that
+    /// refuses it.
+    fn gate_enable<S: ActionSink>(
+        &self,
+        opt: &dyn Optimization,
+        decision: &Decision,
+        env: &ApplyEnv<'_>,
+        sink: &mut S,
+    ) -> Gated {
         let ApplyEnv {
             registry,
             policy,
             ctx,
-        } = env;
-        let mut report = ApplyReport::default();
+        } = *env;
+        let meta = opt.meta();
 
-        for decision in decisions {
-            let name = decision.optimization;
-            let scope = decision.scope.clone();
-            let label = format!("{name}[{scope}]");
-
-            let Some(opt) = registry.get(name) else {
-                self.reject(
-                    decision,
-                    Verdict::NotApplicable,
-                    Some("not registered".into()),
-                    None,
-                );
-                report.rejected.push((label, Verdict::NotApplicable));
-                continue;
-            };
-            let meta = opt.meta();
-
-            if decision.action == DecisionAction::Disable {
-                self.disable(decision, registry, ctx, sink, source, &mut report)?;
-                continue;
-            }
-
-            // 1. Guarantees. A filter, not a cost. Checked before anything else
-            //    so a forbidden optimization is never even priced.
-            if !permitted_by(meta, policy) {
-                let detail = format!(
-                    "policy requires durability {:?} / consistency {:?}",
-                    policy.guarantees.durability, policy.guarantees.consistency
-                );
-                self.reject(decision, Verdict::ForbiddenByGuarantees, Some(detail), None);
-                report
-                    .rejected
-                    .push((label, Verdict::ForbiddenByGuarantees));
-                continue;
-            }
-
-            // 2. Prerequisites.
-            let missing: Vec<&str> = meta
-                .prerequisites
-                .iter()
-                .filter(|p| !self.config.is_enabled_anywhere(p))
-                .copied()
-                .collect();
-            if !missing.is_empty() {
-                let detail = format!("requires {}", missing.join(", "));
-                self.reject(decision, Verdict::MissingPrerequisite, Some(detail), None);
-                report.rejected.push((label, Verdict::MissingPrerequisite));
-                continue;
-            }
-
-            // 3. Conflicts.
-            let enabled: Vec<String> = self
-                .config
-                .entries()
-                .map(|(n, _, _)| n.to_string())
-                .collect();
-            let conflicts = registry.conflicts_among(name, &enabled);
-            if !conflicts.is_empty() {
-                let detail = format!("conflicts with {}", conflicts.join(", "));
-                self.reject(decision, Verdict::Conflicts, Some(detail), None);
-                report.rejected.push((label, Verdict::Conflicts));
-                continue;
-            }
-
-            // 4. Applicability.
-            let applicability = opt.applicability(ctx);
-            if !applicability.is_applicable() {
-                let detail = applicability.reason().map(str::to_string);
-                self.reject(decision, Verdict::NotApplicable, detail, None);
-                report.rejected.push((label, Verdict::NotApplicable));
-                continue;
-            }
-
-            let estimate = opt.estimate(ctx);
-            let plan = opt.plan_enable(ctx, &scope, &decision.params);
-
-            // 5. Constraints. Hard ceilings, checked against what is already
-            //    committed rather than against this change alone.
-            if let Some(max_ram) = policy.constraints.max_ram_bytes {
-                let projected = self.committed_ram(registry, ctx) + estimate.ram_bytes.max(0);
-                if projected as u64 > max_ram {
-                    let detail = format!(
-                        "would use {:.1} MB against a {:.1} MB ceiling",
-                        projected as f64 / 1e6,
-                        max_ram as f64 / 1e6
-                    );
-                    self.reject(
-                        decision,
-                        Verdict::ExceedsConstraints,
-                        Some(detail),
-                        Some(estimate),
-                    );
-                    report.rejected.push((label, Verdict::ExceedsConstraints));
-                    continue;
-                }
-            }
-
-            // 6. The sink gets the last word: it knows what actually exists.
-            if let Some(bad) = plan.apply.iter().find(|a| !sink.can_apply(a)) {
-                let detail = format!("engine refused: {}", bad.describe());
-                self.reject(
-                    decision,
-                    Verdict::NotApplicable,
-                    Some(detail),
-                    Some(estimate),
-                );
-                report.rejected.push((label, Verdict::NotApplicable));
-                continue;
-            }
-
-            for action in &plan.apply {
-                sink.apply_action(action)?;
-            }
-            self.config
-                .enable(name, scope.clone(), decision.params.clone());
-            self.applied
-                .push((name.to_string(), scope.clone(), plan.clone()));
-            self.log.record(
-                decision,
-                Verdict::Applied,
-                None,
-                Some(estimate),
-                plan,
-                source,
+        // 1. Guarantees. A filter, not a cost. Checked before anything else
+        //    so a forbidden optimization is never even priced.
+        if !permitted_by(meta, policy) {
+            let detail = format!(
+                "policy requires durability {:?} / consistency {:?}",
+                policy.guarantees.durability, policy.guarantees.consistency
             );
-            report.applied.push(label);
+            return Gated::refused(Verdict::ForbiddenByGuarantees, detail);
         }
-        Ok(report)
+
+        // 2. Prerequisites.
+        let missing: Vec<&str> = meta
+            .prerequisites
+            .iter()
+            .filter(|p| !self.config.is_enabled_anywhere(p))
+            .copied()
+            .collect();
+        if !missing.is_empty() {
+            let detail = format!("requires {}", missing.join(", "));
+            return Gated::refused(Verdict::MissingPrerequisite, detail);
+        }
+
+        // 3. Conflicts.
+        let enabled: Vec<String> = self
+            .config
+            .entries()
+            .map(|(n, _, _)| n.to_string())
+            .collect();
+        let conflicts = registry.conflicts_among(decision.optimization, &enabled);
+        if !conflicts.is_empty() {
+            let detail = format!("conflicts with {}", conflicts.join(", "));
+            return Gated::refused(Verdict::Conflicts, detail);
+        }
+
+        // 4. Applicability.
+        let applicability = opt.applicability(ctx);
+        if !applicability.is_applicable() {
+            let detail = applicability.reason().map(str::to_string);
+            return Gated::Refused(Refusal::new(Verdict::NotApplicable, detail));
+        }
+
+        let estimate = opt.estimate(ctx);
+        let plan = opt.plan_enable(ctx, &decision.scope, &decision.params);
+
+        // 5. Constraints. Hard ceilings, checked against what is already
+        //    committed rather than against this change alone.
+        if let Some(max_ram) = policy.constraints.max_ram_bytes {
+            let projected = self.committed_ram(registry, ctx) + estimate.ram_bytes.max(0);
+            if projected as u64 > max_ram {
+                let detail = format!(
+                    "would use {:.1} MB against a {:.1} MB ceiling",
+                    projected as f64 / 1e6,
+                    max_ram as f64 / 1e6
+                );
+                return Gated::refused_after_costing(Verdict::ExceedsConstraints, detail, estimate);
+            }
+        }
+
+        // 6. The sink gets the last word: it knows what actually exists.
+        if let Some(bad) = plan.apply.iter().find(|a| !sink.can_apply(a)) {
+            let detail = format!("engine refused: {}", bad.describe());
+            return Gated::refused_after_costing(Verdict::NotApplicable, detail, estimate);
+        }
+
+        Gated::Admitted(Admitted { estimate, plan })
+    }
+
+    /// Carries out an enable that passed every gate: acts, records the plan
+    /// for exact reversal, and logs it as applied.
+    fn enable<S: ActionSink>(
+        &mut self,
+        decision: Decision,
+        label: String,
+        admitted: Admitted,
+        sink: &mut S,
+        source: Source,
+        report: &mut ApplyReport,
+    ) -> Result<()> {
+        let Admitted { estimate, plan } = admitted;
+        let name = decision.optimization;
+        let scope = decision.scope.clone();
+
+        for action in &plan.apply {
+            sink.apply_action(action)?;
+        }
+        self.config
+            .enable(name, scope.clone(), decision.params.clone());
+        self.applied
+            .push((name.to_string(), scope.clone(), plan.clone()));
+        self.log.record(
+            decision,
+            Verdict::Applied,
+            None,
+            Some(estimate),
+            plan,
+            source,
+        );
+        report.applied.push(label);
+        Ok(())
+    }
+
+    /// Logs a refused decision and reports it as rejected.
+    fn refuse(
+        &mut self,
+        decision: Decision,
+        label: String,
+        refusal: Refusal,
+        report: &mut ApplyReport,
+    ) {
+        let Refusal {
+            verdict,
+            detail,
+            estimate,
+        } = refusal;
+        self.reject(decision, verdict, detail, estimate);
+        report.rejected.push((label, verdict));
     }
 
     fn disable<S: ActionSink>(
@@ -302,5 +325,53 @@ impl OptimizationController {
             ChangePlan::default(),
             Source::Manual,
         );
+    }
+}
+
+/// What gating concluded about one enable.
+enum Gated {
+    Admitted(Admitted),
+    Refused(Refusal),
+}
+
+impl Gated {
+    /// Refused before anything was priced.
+    fn refused(verdict: Verdict, detail: String) -> Self {
+        Gated::Refused(Refusal::new(verdict, Some(detail)))
+    }
+
+    /// Refused once its estimate was known, so the log can show what it would
+    /// have cost.
+    fn refused_after_costing(verdict: Verdict, detail: String, estimate: CostEstimate) -> Self {
+        Gated::Refused(Refusal {
+            verdict,
+            detail: Some(detail),
+            estimate: Some(estimate),
+        })
+    }
+}
+
+/// An enable that passed every gate, with what it is expected to cost and the
+/// plan that carries it out.
+struct Admitted {
+    estimate: CostEstimate,
+    plan: ChangePlan,
+}
+
+/// Why a decision was refused, as it will be logged.
+struct Refusal {
+    verdict: Verdict,
+    detail: Option<String>,
+    estimate: Option<CostEstimate>,
+}
+
+impl Refusal {
+    /// A refusal with no estimate attached.
+    fn new(verdict: Verdict, detail: Option<String>) -> Self {
+        Self {
+            verdict,
+            detail,
+            estimate: None,
+        }
     }
 }
