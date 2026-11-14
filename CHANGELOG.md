@@ -69,6 +69,23 @@ files are new (`base.adabt`, `superseded-log/`).
     backup rebuilt the directory by scanning pages and brought back records
     deleted or overwritten before the backup.
   No API signature changed.
+- **Writes made after the log was damaged back past a checkpoint were lost
+  at the next restart.** The log picked its next LSN from its own last
+  surviving entry. If the log ended below the checkpoint that the catalog,
+  page directory or `base.adabt` records (a lost or truncated segment; a
+  crash cannot do this, because a checkpoint syncs the log first), new
+  writes got LSNs at or below that checkpoint, and the next recovery skipped
+  them as already in the pages. In the reproduction (20 rows, a checkpoint,
+  the log cut to its header, 10 more inserts acknowledged under `Strict`, a
+  restart) the 10 inserts were gone, with no error. The same happened after
+  `open_at` the base image's own LSN and on a restored backup. Opening now
+  restarts the log at the checkpoint's LSN + 1, moves the old segments to
+  `superseded-log/below-<lsn>/`, and discards the derived-structure cache.
+  **Behaviour change:** if the catalog is older than the checkpoint as well,
+  the definitions in between were only in the lost log, and the open is
+  refused with `Corruption` instead of dropping those collections' records
+  (`crates/adabt-storage/src/heap/recovery.rs` has the argument;
+  `log_behind_checkpoint.rs`). The on-disk formats are unchanged.
 - **Manual mode undid its own work:** a second `optimize()` at the same
   level disabled the per-field indexes the level had created, because the
   level's unscoped request was diffed against its own scoped expansion.

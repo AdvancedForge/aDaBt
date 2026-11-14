@@ -442,6 +442,11 @@ pub struct Wal {
 
 impl Wal {
     /// Open the log held in `dir`, which is a directory of segments.
+    ///
+    /// The next LSN follows the last intact entry. That is only as far as the
+    /// log itself can see: a checkpoint recorded in another file may claim
+    /// more, and a caller that holds one must move the log past it with
+    /// [`Wal::restart_at`] before appending anything.
     pub fn open(dir: &Path, durability: Durability) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
         Self::adopt_single_file_log(dir)?;
@@ -777,7 +782,62 @@ impl Wal {
             Self::create_segment(&self.dir, last.0 + 1)?;
         }
         crate::sync_dir(&self.dir)?;
+        self.reopen()?;
+        Ok(true)
+    }
 
+    /// Begin the log afresh at `first`, moving every segment it holds into
+    /// `aside`.
+    ///
+    /// What opening a store does when the log ends below a checkpoint that a
+    /// durable file — the catalog, the directory snapshot, the base-image
+    /// marker — already records; `crate::heap`'s recovery documentation says
+    /// when that can happen and why carrying on is sound. Left as it is, the
+    /// log would hand out LSNs at or below that checkpoint, recovery skips
+    /// every entry there as already folded into the pages, and the writes
+    /// given them would vanish at the next restart without an error.
+    ///
+    /// Everything the segments still hold lies below `first`, so none of it
+    /// would be replayed again anyway. Moving them out rather than leaving
+    /// them in place keeps [`Wal::start_lsn`] honest: what remains is no
+    /// longer a contiguous history from the first entry ever written, and a
+    /// log claiming to be one would let a missing catalog be rebuilt from it.
+    /// They are moved rather than deleted for the reason [`Wal::rewind_to`]
+    /// gives.
+    ///
+    /// Segments go newest first, and the new one is created only once they
+    /// have all gone, so a crash part-way leaves a log that still ends below
+    /// the checkpoint — the state this was called to repair, which the next
+    /// open repairs the same way.
+    ///
+    /// # Panics
+    ///
+    /// If `first` is not past every LSN the log has already handed out:
+    /// restarting there would reissue one, which is the bug this exists to
+    /// prevent.
+    pub fn restart_at(&mut self, first: Lsn, aside: &Path) -> Result<()> {
+        assert!(
+            first.0 >= self.next_lsn,
+            "restarting the log at lsn {} would reissue lsns up to {}",
+            first.0,
+            self.next_lsn - 1
+        );
+        self.writer.flush()?;
+        while let Some(seg) = self.segments.pop() {
+            Self::set_aside(&seg.path, aside, |from, to| std::fs::rename(from, to))?;
+        }
+        crate::sync_dir(aside)?;
+        if let Some(parent) = aside.parent() {
+            crate::sync_dir(parent)?;
+        }
+        Self::create_segment(&self.dir, first.0)?;
+        crate::sync_dir(&self.dir)?;
+        self.reopen()
+    }
+
+    /// Re-read the log from disk, keeping the settings made since it was
+    /// opened.
+    fn reopen(&mut self) -> Result<()> {
         let reopened = Self::open(&self.dir, self.durability)?;
         let archive = self.archive.take();
         let (segment_bytes, group_size) = (self.segment_bytes, self.group_size);
@@ -785,7 +845,7 @@ impl Wal {
         self.archive = archive;
         self.segment_bytes = segment_bytes;
         self.group_size = group_size;
-        Ok(true)
+        Ok(())
     }
 
     /// Put a copy of `segment` in `aside`, by `transfer`, under its own name.
@@ -1239,6 +1299,52 @@ mod tests {
         std::fs::write(&seg, &bytes).unwrap();
         let read = Wal::read_all(t.path()).unwrap();
         assert!(read.len() < 6, "damaged entry did not stop replay");
+    }
+
+    #[test]
+    fn restarting_sets_every_segment_aside_and_begins_at_the_given_lsn() {
+        let t = Tmp::new("restart");
+        let aside = Tmp::new("restart-aside");
+        let mut w = Wal::open(t.path(), Durability::Strict).unwrap();
+        for _ in 0..3 {
+            w.append(TxnId(0), WalOp::Commit { txn: TxnId(0) }).unwrap();
+        }
+        w.sync().unwrap();
+
+        w.restart_at(Lsn(10), aside.path()).unwrap();
+        assert_eq!(w.next_lsn(), Lsn(10));
+        assert_eq!(
+            w.start_lsn(),
+            Lsn(10),
+            "the log no longer reaches back to its first entry, and must not say it does"
+        );
+        assert_eq!(
+            w.append(TxnId(0), WalOp::Commit { txn: TxnId(0) }).unwrap(),
+            Lsn(10)
+        );
+        w.sync().unwrap();
+        drop(w);
+
+        let w = Wal::open(t.path(), Durability::Strict).unwrap();
+        assert_eq!((w.start_lsn(), w.next_lsn()), (Lsn(10), Lsn(11)));
+        let kept: Vec<u64> = Wal::read_all(aside.path())
+            .unwrap()
+            .iter()
+            .map(|e| e.lsn.0)
+            .collect();
+        assert_eq!(kept, vec![1, 2, 3], "the old entries were moved, not lost");
+    }
+
+    #[test]
+    #[should_panic(expected = "would reissue")]
+    fn restarting_refuses_to_reissue_an_lsn() {
+        let t = Tmp::new("restart-reissue");
+        let aside = Tmp::new("restart-reissue-aside");
+        let mut w = Wal::open(t.path(), Durability::Strict).unwrap();
+        for _ in 0..3 {
+            w.append(TxnId(0), WalOp::Commit { txn: TxnId(0) }).unwrap();
+        }
+        let _ = w.restart_at(Lsn(3), aside.path());
     }
 
     #[test]

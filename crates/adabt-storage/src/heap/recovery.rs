@@ -61,6 +61,52 @@
 //! Recovery writes nothing to the log, so a second crash, at any point, is
 //! recovered from the same snapshot and the same log, and reaches the same
 //! state.
+//!
+//! # A log that ends below a checkpoint
+//!
+//! Three durable files say how far through the log the heap already reflects:
+//! the catalog, the directory snapshot and the base-image marker. Call the
+//! newest LSN any of them names `C`. Recovery treats every entry at or below
+//! it as folded into the pages, so **the log must never hand out an LSN at or
+//! below `C`**: a write given one is skipped by the next recovery, and is lost
+//! without an error. The log chooses its next LSN from its own last entry, so
+//! that holds only while the log reaches `C`.
+//!
+//! *When the log can end below `C`.* Not after a crash. A checkpoint flushing
+//! through `C` syncs the log through its own entry, at `C + 1`, before it
+//! writes any of the three files, and a crash only ever takes the unsynced
+//! tail of the log, which lies above that. A log ending below `C` was
+//! damaged after it was written: a segment lost or cut short, a device that
+//! dropped writes it had acknowledged, a backup copied without the whole of
+//! its log.
+//!
+//! *What the damage can have taken*, if the log now ends at `E < C`:
+//!
+//! - **Entries in `E+1..=C`.** Replay never applies a record write at or
+//!   below the snapshot's LSN, and never a definition at or below the
+//!   catalog's. When the catalog reaches `C` these entries were never going
+//!   to be read: losing them changes nothing. When it does not — a crash
+//!   between a checkpoint's directory write and its catalog write leaves it
+//!   one checkpoint behind — the definitions logged between the catalog and
+//!   `C` existed nowhere else, and the snapshot files records under
+//!   collection ids nothing defines any more. That is refused with
+//!   `Corruption` before anything is written (`check_log_reaches`).
+//! - **Entries above `C`.** Writes made after the checkpoint. Nothing records
+//!   how far the log reached, so they are lost as any lost tail of the log
+//!   is, and the database opens as the checkpoint left it — the outcome
+//!   recovery already gives a log cut anywhere above `C`.
+//!
+//! So when the catalog reaches `C`, recovery proceeds to exactly the
+//! checkpoint's state, and then restarts the log at `C + 1`
+//! (`resume_log_after`, [`crate::wal::Wal::restart_at`]). Not later: a restore
+//! from a base image at `C` demands the log after it be contiguous, and the
+//! one LSN reissued, `C + 1`, belonged to the checkpoint's own entry, which
+//! replay never acts on. What the log still held is set aside under
+//! `superseded-log/`, all of it below `C + 1`, so the log no longer claims to
+//! reach back to the first write ever made. The derived-structure cache is
+//! discarded, since it is stamped with the next LSN. Nothing on disk changes
+//! format: the restarted log is an ordinary segment that begins at `C + 1`,
+//! exactly as one does after a checkpoint has discarded those before it.
 
 use adabt_core::error::{Error, Result};
 use adabt_core::ids::{CollectionId, Lsn, RecordId, TxnId};
@@ -86,6 +132,24 @@ enum Base {
     Empty,
 }
 
+/// A checkpoint a durable file records, and which file records it.
+#[derive(Debug, Clone, Copy)]
+struct Checkpoint {
+    /// The LSN through which the heap reflects the log.
+    lsn: u64,
+    recorded_by: &'static str,
+}
+
+impl Checkpoint {
+    fn or_newer(self, lsn: u64, recorded_by: &'static str) -> Self {
+        if lsn > self.lsn {
+            Checkpoint { lsn, recorded_by }
+        } else {
+            self
+        }
+    }
+}
+
 impl HeapStore {
     pub(super) fn recover(&mut self) -> Result<()> {
         // Pass 0: the persisted catalog, if there is one.
@@ -108,12 +172,14 @@ impl HeapStore {
         // checkpoints, whose pages this heap file never received.
         let base = match self.recover_target {
             RecoverTarget::Latest => self.latest_base(from_lsn)?,
-            RecoverTarget::Lsn(target) => {
-                let base = self.restore_base(entries, from_lsn, target)?;
-                self.end_log_at(target)?;
-                base
-            }
+            RecoverTarget::Lsn(target) => self.restore_base(entries, from_lsn, target)?,
         };
+        let checkpoint = self.newest_checkpoint(from_lsn, &base);
+        self.check_log_reaches(from_lsn, checkpoint)?;
+        // Every check has passed: from here on, recovery writes.
+        if let RecoverTarget::Lsn(target) = self.recover_target {
+            self.end_log_at(target)?;
+        }
 
         // Pass 1: collection definitions, for whatever the catalog did not
         // already cover. The snapshot's records are filed under collection
@@ -138,7 +204,93 @@ impl HeapStore {
         // necessary: otherwise every restart doubles the retained history.
         self.reclaim()?;
         self.retained = 0;
-        Ok(())
+
+        // Last, once the state is rebuilt: never hand out an LSN the
+        // checkpoint already covers.
+        self.resume_log_after(checkpoint)
+    }
+
+    /// The newest checkpoint a durable file in this directory records: the
+    /// LSN through which the catalog, the directory snapshot recovery starts
+    /// from, or the base-image marker says the heap already reflects, and the
+    /// file that says so.
+    ///
+    /// The snapshot is the one `base` carries. Crash recovery takes the newest
+    /// there is, and a restore takes one that must match the newest exactly,
+    /// so either way no snapshot on disk is newer.
+    fn newest_checkpoint(&self, catalog_lsn: u64, base: &Base) -> Checkpoint {
+        let mut newest = Checkpoint {
+            lsn: catalog_lsn,
+            recorded_by: "catalog",
+        };
+        if let Base::Snapshot(stamp, _) = base {
+            newest = newest.or_newer(stamp.checkpoint_lsn, "page directory");
+        }
+        if let Some(marker) = crate::base_image::read(&self.dir, self.identity) {
+            newest = newest.or_newer(marker.0, "base-image marker");
+        }
+        newest
+    }
+
+    /// Refuse a log that ends below `checkpoint` when it took with it
+    /// something recovery cannot do without.
+    ///
+    /// Recovery replays record writes only above the snapshot's LSN, and
+    /// definitions only above the catalog's. What the log lost at or below
+    /// `checkpoint` is therefore harmless exactly when the catalog reaches
+    /// `checkpoint` too. When it does not, the definitions logged between the
+    /// two are gone, and the snapshot files records under collection ids that
+    /// nothing defines any more: recovery would drop them as belonging to a
+    /// dropped collection, without an error.
+    fn check_log_reaches(&self, catalog_lsn: u64, checkpoint: Checkpoint) -> Result<()> {
+        let log_end = self.wal.next_lsn().0.saturating_sub(1);
+        if log_end >= checkpoint.lsn || catalog_lsn >= checkpoint.lsn {
+            return Ok(());
+        }
+        let catalog = if catalog_lsn == 0 {
+            "there is no catalog to say what was defined before it".to_string()
+        } else {
+            format!("the catalog reflects only lsn {catalog_lsn}")
+        };
+        Err(Error::Corruption(format!(
+            "the log in {} ends at lsn {log_end}, below the checkpoint at lsn {} that the {} \
+             records, and {catalog}. A checkpoint syncs the log before it records anything, \
+             so the log was damaged after it was written, and the collection definitions \
+             logged up to lsn {} were lost with it. Recover from a backup",
+            Self::wal_path(&self.dir).display(),
+            checkpoint.lsn,
+            checkpoint.recorded_by,
+            checkpoint.lsn
+        )))
+    }
+
+    /// Restart the log just after `checkpoint` if it now ends at or below it,
+    /// setting what it still holds aside.
+    ///
+    /// The derived-structure cache goes first: it is stamped with the next
+    /// LSN, and one written before the damage may carry a stamp the restarted
+    /// log reaches again over a different history.
+    fn resume_log_after(&mut self, checkpoint: Checkpoint) -> Result<()> {
+        if self.wal.next_lsn().0 > checkpoint.lsn {
+            return Ok(());
+        }
+        crate::derived::discard(&self.dir);
+        let aside = self.superseded_log_dir(&format!("below-{:016}", checkpoint.lsn + 1));
+        self.wal.restart_at(Lsn(checkpoint.lsn + 1), &aside)?;
+        crate::sync_dir(&self.dir)
+    }
+
+    /// A fresh directory under `superseded-log/` for log segments recovery
+    /// takes out of the log, named by `label`.
+    fn superseded_log_dir(&self, label: &str) -> std::path::PathBuf {
+        let parent = self.dir.join("superseded-log");
+        let mut aside = parent.join(label);
+        let mut n = 1;
+        while aside.exists() {
+            n += 1;
+            aside = parent.join(format!("{label}-{n}"));
+        }
+        aside
     }
 
     /// The base crash recovery starts from.
@@ -410,13 +562,7 @@ impl HeapStore {
     /// The directory snapshot stays: `restore_base` has just established that
     /// it describes the base image, which precedes the target.
     fn end_log_at(&mut self, target: Lsn) -> Result<()> {
-        let parent = self.dir.join("superseded-log");
-        let mut aside = parent.join(format!("after-{:016}", target.0));
-        let mut n = 1;
-        while aside.exists() {
-            n += 1;
-            aside = parent.join(format!("after-{:016}-{n}", target.0));
-        }
+        let aside = self.superseded_log_dir(&format!("after-{:016}", target.0));
         if self.wal.rewind_to(target, &aside)? {
             crate::sync_dir(&self.dir)?;
             crate::derived::discard(&self.dir);

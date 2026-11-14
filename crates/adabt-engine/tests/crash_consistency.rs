@@ -241,6 +241,57 @@ fn every_truncation_point_recovers_to_a_consistent_database() {
     );
 }
 
+#[test]
+fn writes_after_a_log_cut_below_the_checkpoint_survive_with_their_indexes() {
+    // A log that lost everything back past its checkpoint — damage, not a
+    // crash, since the checkpoint synced it — used to resume at an LSN the
+    // checkpoint already covered, and the next restart skipped every write
+    // made since. The derived-structure cache rides on the same LSNs, so the
+    // indexes are checked against the rows too.
+    let t = Tmp::new("cut-below-checkpoint");
+    {
+        let mut db = seeded(t.path());
+        db.checkpoint().unwrap();
+    }
+    let active = adabt_storage::wal::Wal::active_segment(&HeapStore::wal_path(t.path()))
+        .unwrap()
+        .expect("a checkpointed workload leaves a segment");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&active)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+
+    {
+        let mut db = Database::open(t.path(), Policy::manual(4)).unwrap();
+        assert_eq!(
+            db.scan("c").unwrap().len() as u64,
+            N,
+            "the checkpoint's rows"
+        );
+        wave(t.path(), &mut db, N);
+    }
+    for restart in ["first", "second"] {
+        let mut db = Database::open(t.path(), Policy::manual(4)).unwrap();
+        let rows = db.scan("c").unwrap();
+        assert_eq!(
+            rows.len() as u64,
+            N + N / 2,
+            "{restart} restart: the writes made after the cut came back missing"
+        );
+        for (id, rec) in &rows {
+            expect_intact(rec, *id);
+        }
+        let report = db.verify().unwrap();
+        assert!(
+            report.problems.is_empty(),
+            "{restart} restart: {}",
+            report.problems.join("\n")
+        );
+    }
+}
+
 /// A small deterministic generator, so a failure names a seed that replays it.
 struct Rng(u64);
 impl Rng {

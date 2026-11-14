@@ -71,6 +71,13 @@ Catalog v4 (`delta_encoding`/`thread_per_core`) is authoritative; loss rebuilds 
 
 The page directory (`directory.adabt`, rewritten by every checkpoint) is authoritative too: crash recovery starts from it and replays the log, because the heap file alone cannot tell a live record from a deleted or superseded one. A checkpointed database whose directory is missing, damaged or copied from another database refuses to open with `Corruption` naming the page directory, and nothing is changed; put the file back or recover from a backup.
 
+### A log that ends below the last checkpoint
+
+A crash cannot do this: a checkpoint syncs the log before it writes the catalog, the page directory or `base.adabt`. If the log ends below the LSN one of those files records anyway — a segment deleted or cut short, a device that lost writes it had acknowledged, a backup copied without its whole `wal/` — the log was damaged afterwards. On open:
+
+- **If the catalog reaches the checkpoint** (the normal case), the database opens as that checkpoint left it. Writes made after the checkpoint that were only in the lost part of the log are gone, as with any lost log tail. The log then restarts just past the checkpoint, so nothing written from now on can be mistaken for something the checkpoint already holds. The segments it held move to `superseded-log/below-<lsn>/` (all of their entries are below `<lsn>`, the new start of the log), kept rather than deleted, and the derived-structure cache is discarded and rebuilt. After this, the log no longer reaches back to the database's first write, so a later loss of `catalog.adabt` is refused instead of rebuilt from the log.
+- **If the catalog is older than the checkpoint** (a crash between a checkpoint's directory write and its catalog write, then the log damaged too), the open is refused with `Corruption` naming the catalog and the checkpoint LSN, and nothing is changed: collection definitions logged between the two were only in the lost part of the log. Recover from a backup.
+
 ## Tuning
 
 `Policy::manual(level)`, or `policy.mode = Mode::Adaptive`. Levels are cumulative presets (`adabt-opt/src/levels.rs`): 0 conventional → 11 maximum. `adabt-engine/src/optimizations/` 15 optimizations, all level-reachable (`every_registered_optimization_is_reachable_from_some_level`). `explain_optimizations()` / decision log + `to_prometheus_text`.

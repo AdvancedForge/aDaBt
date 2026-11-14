@@ -214,8 +214,10 @@ fn a_directory_from_another_database_is_not_adopted() {
 #[test]
 fn a_truncated_log_is_never_recovered_against_a_newer_directory() {
     // The dangerous combination: the directory describes a checkpoint that the
-    // log no longer records. Cutting the log back must send recovery to the
-    // scan, because the cache is now describing a future that did not happen.
+    // log no longer records. Everything the cut took was already folded into
+    // that checkpoint, so recovery starts from the directory and comes back
+    // with exactly the checkpoint's state — not a mixture of it and whatever
+    // prefix of the log survived.
     let t = Tmp::new("truncated-log");
     {
         let mut h = filled(t.path());
@@ -224,28 +226,49 @@ fn a_truncated_log_is_never_recovered_against_a_newer_directory() {
         }
         h.checkpoint().unwrap();
     }
-    let wal = adabt_storage::wal::Wal::active_segment(&HeapStore::wal_path(t.path()))
+    let active = adabt_storage::wal::Wal::active_segment(&HeapStore::wal_path(t.path()))
         .unwrap()
         .expect("no log segment");
-    let full = std::fs::metadata(&wal).unwrap().len();
+    let segment = active.file_name().expect("a segment has a name");
+    let full = std::fs::metadata(&active).unwrap().len();
     for cut in [full / 4, full / 2, full * 3 / 4, full - 1] {
-        let f = std::fs::OpenOptions::new().write(true).open(&wal).unwrap();
+        // Each cut on its own copy: opening a log cut below a checkpoint
+        // restarts it past the checkpoint, so the copy is not cut again.
+        let victim = Tmp::new(&format!("truncated-log-{cut}"));
+        copy_dir(t.path(), victim.path());
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(HeapStore::wal_path(victim.path()).join(segment))
+            .unwrap();
         f.set_len(cut).unwrap();
         f.sync_all().unwrap();
-        let mut h = match HeapStore::open(t.path(), Durability::Strict, 64) {
+        let mut h = match HeapStore::open(victim.path(), Durability::Strict, 64) {
             Ok(h) => h,
             Err(e) => panic!("cutting the log to {cut} made the store unopenable: {e}"),
         };
-        // Whatever survived must be internally consistent: every record the
-        // store believes exists must decode and read back.
         let rows = h.scan("c").unwrap();
+        assert_eq!(rows.len() as u64, N + 300, "after a cut at {cut}");
         assert_eq!(rows.len(), h.count("c").unwrap());
         for (id, got) in rows {
+            assert_eq!(got, rec(id.0), "record {id} after a cut at {cut}");
             assert_eq!(
                 h.get("c", id).unwrap(),
                 Some(got),
                 "record {id} disagrees with itself after a cut at {cut}"
             );
+        }
+    }
+}
+
+fn copy_dir(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for entry in std::fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let to = dst.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &to);
+        } else {
+            std::fs::copy(entry.path(), &to).unwrap();
         }
     }
 }
