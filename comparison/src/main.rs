@@ -148,7 +148,7 @@ fn main() {
 
     // Progress goes to stderr as each workload STARTS: results print only at
     // the end, and this project has already lost one benchmark run to a
-    // timeout with nothing to show for it (`docs/m36-notes.md`). A harness
+    // timeout with nothing to show for it (`docs/history/m36-notes.md`). A harness
     // that dies without evidence is worse than no harness.
     let stages: [(&str, fn(u64) -> Row); 8] = [
         ("bulk load", bulk_load),

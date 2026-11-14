@@ -13,7 +13,7 @@
 //! backwards. A cache that cannot be read costs a rebuild; a heap that is
 //! misread costs the data.
 //!
-//! The consequence is recorded in `docs/diagnosis.md`: "the record encoding has
+//! The consequence is recorded in `docs/history/diagnosis.md`: "the record encoding has
 //! changed twice this month with no migration path". Twice, silently, because
 //! nothing on disk said what encoding it was. A database opened by a build that
 //! disagrees with it now stops, and says both version numbers.

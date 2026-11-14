@@ -37,7 +37,7 @@ Until either fires, "how big can it go" is answered by measurement:
 
 | rows | marginal bytes/row | source |
 |---|---|---|
-| 100k → 1.6M | 470–758, converging near 470 | `docs/m36-notes.md`, scale rungs |
+| 100k → 1.6M | 470–758, converging near 470 | `docs/history/m36-notes.md`, scale rungs |
 
 At ~470 B/row: **1 GB of RAM ≈ 2M records; 10 GB ≈ 20M.** The practical
 ceiling on ordinary developer hardware is single-digit millions of records.

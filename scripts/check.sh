@@ -2,7 +2,7 @@
 set -euo pipefail
 # Enforced continuous check — local replacement for the removed GH Actions.
 # Private repo has no Actions runner; this script is the gate. Run before
-# every push or via `cargo xtask check`.
+# every push, or enable the pre-push hook (`git config core.hooksPath .githooks`).
 
 echo "== fmt =="
 cargo fmt --all -- --check

@@ -82,7 +82,7 @@ const MIN_SCORE: f64 = 0.5;
 /// pulls a score down toward zero, not below it, so a change admitted on a
 /// 40%-confidence guess settles at 0.2 and stays forever.
 ///
-/// That is not hypothetical. `docs/diagnosis.md` records a standing measurement
+/// That is not hypothetical. `docs/history/diagnosis.md` records a standing measurement
 /// of it: across every soak run the aggregate phase fails to improve, because
 /// `column_store` is applied on a 40%-confidence prior, scores 0.54, and is
 /// never re-examined.

@@ -239,7 +239,7 @@ fn the_driver_folds_measurements_in_over_cycles() {
 /// that band: correcting an optimistic prior pulls the score toward zero, not
 /// below it.
 ///
-/// `docs/diagnosis.md` records the standing measurement of this — the soak's
+/// `docs/history/diagnosis.md` records the standing measurement of this — the soak's
 /// aggregate phase never improves, because `column_store` is applied on a
 /// 40%-confidence prior, scores 0.54, and is then never re-examined.
 #[test]

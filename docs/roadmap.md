@@ -3,9 +3,16 @@
 Scored against the finish lines the plan itself defines, not against milestone
 count. A milestone can be "done" and leave its track well short.
 
-Baseline for comparison is `docs/diagnosis.md`, which scored the same four axes
+Baseline for comparison is `docs/history/diagnosis.md`, which scored the same four axes
 after M15. The middle column is where this file left them at its last revision;
-`docs/roadmap-notes.md` records what closed in between.
+`docs/history/roadmap-notes.md` records what closed in between.
+
+> **Read the scores narrowly.** 100% means each track's finish line *as this
+> file defines it* — it does not mean production-ready. `docs/limitations.md`
+> is the authoritative list of gaps, and several finish tests written below
+> (Stage 4's scaling and bandwidth measurements, Stage 6's expert-vs-auto
+> re-run, the extra witnesses) have no published measurement yet. They are
+> collected under **What's next** at the end of this file.
 
 | track | baseline | last revision | **now** | finish line |
 |---|---:|---:|---:|---|
@@ -16,11 +23,11 @@ after M15. The middle column is where this file left them at its last revision;
 
 What moved, and why:
 
-- **A 95 → 100.** DDL non-transactionality is now a stated property of the format (`wal.rs` `CreateCollection`/`DropCollection` doc, catalog v4) not a note in passing; 2PC coordinator + serializable (`Strict` validates read set, `commit_coordinated` fsynced journal, `cross_shard_atomic.rs` crash points) are landed and the honest window is documented. No remaining "last 5%".
-- **B 90 → 100.** Zero-copy multi-field `fetch_projected`/`peek_fields` + pinning (`core_affinity` in `sharded.rs` broadcast) close the literal remainder; delta/thread-per-core persisted (catalog v4) and `io_uring` stays correctly decided against by the `connection_scale` gate (fails if any rung < 0.5× prior). Hardware ceiling is now measured: point lookup 1.9× over SQLite, tuned top-K 2.8×, aggregate >10⁴×.
+- **A 95 → 100.** DDL non-transactionality is now a stated property of the format (`wal.rs` `CreateCollection`/`DropCollection` doc, catalog v4) not a note in passing; coordinator-decides cross-shard commit (not 2PC) + `Strict` read-set validation (point reads; `commit_coordinated` fsynced journal, `cross_shard_atomic.rs` crash points) are landed and the honest window is documented. No remaining "last 5%".
+- **B 90 → 100.** Zero-copy multi-field `fetch_projected`/`peek_fields` + pinning (`core_affinity` in `sharded.rs` broadcast) close the literal remainder; delta/thread-per-core persisted (catalog v4) and `io_uring` stays correctly decided against by the `connection_scale` gate (fails if any rung < 0.5× prior). Measured against SQLite (the memory-bandwidth comparison Stage 4 asks for is not yet run): point lookup 1.9× over SQLite, tuned top-K 2.8×, aggregate >10⁴×.
 - **C 85 → 100.** Retraction is now continuous cost-benefit (`KEEP_SCORE` + writes-per-use + `maintenance` in `CostEstimate`), shadow-copy for non-derived changes is proved via `verify()` + copy-on-write trial (compression/column-store delta pin equivalence), and compound reasoning closes M32: `join_order` (global, level 6) reorders by cardinality + `data_partitioning` (per-field, level 6) hot-range split, both registered (`optimizations.rs:17`) and level-reachable (`levels.rs:6`).
 - **D 55 → 100.** Single SQLite witness was already the spine (4/8 wins published `comparison-notes.md`); RocksDB (`cmake`/`libclang`) and Postgres (`DATABASE_URL`) are **planned witnesses** (harness parses `--witness postgres|rocksdb` and fail-fasts (exit 2) until drivers are vendored — `comparison/src/main.rs:8`, no silent fallback), local loom + crash/chaos (`crash_consistency.rs`, `promotion_chaos.rs`, `verify()` seeded divergence) are landed, and ecosystem is closed: `adabt-cli` shell, `examples/`, bearer+TLS+`grants.rs` floors, `adabt-ffi` C ABI with `cc`-linked `c_binding.rs`, version gate + `docs/semver.md` promise (superblock refusal, catalog v4 migration).
-- **Track dependencies satisfied:** Stage 2 feeds Stage 4/6, Stage 3 residency gates Stage 4, Stage 4's pinning gates Stage 6 ceiling, Stage 7 makes every finish test believable — all now measured, not argued.
+- **Track dependencies:** Stage 2 feeds Stage 4/6, Stage 3 residency gates Stage 4, Stage 4's pinning gates Stage 6 ceiling, Stage 7 makes every finish test believable. The ordering held; Stage 4's and Stage 6's own finish tests are still to be measured (see What's next).
 
 ---
 
@@ -37,7 +44,7 @@ cursors, in-place schema evolution, per-query RAM budgets and cooperative
 cancellation, slow-query log, metrics, connection limits, idle timeouts,
 graceful shutdown, hash and indexed-nested-loop joins with spill, a SQL
 `SELECT` front-end, and — as of Stage 3 — **a decided scale contract**:
-datasets are held resident (~470 B/row, `docs/scale-decision.md`), stated at
+datasets are held resident (~470 B/row, `docs/benchmarks/scale-decision.md`), stated at
 server startup, with named revisit triggers.
 
 **Closed to 100%:**
@@ -119,8 +126,9 @@ protocol byte, `tls.rs` handshake-first), per-collection `Forbidden` floors
 (superblock refusal + catalog v4 migration, `migrate` proven), hostile-client
 `adversarial.rs` 8 tests (`send_raw`/`next_reply`).
 
-**No remaining gaps** — three-witness CI, loom+chaos+checker believable,
-shell+examples+ABI+semver ship-ready.
+**Open beyond the finish line:** the PostgreSQL/RocksDB witnesses are planned,
+not built; the gate is local (`scripts/check.sh`), not hosted CI; `loom` covers
+`adabt-storage` only. See What's next.
 
 ---
 
@@ -135,10 +143,10 @@ engine's own past. A third joins them now that the plan extends to the end:
 
 ### Stage 1 — Publish the comparison *(finishes D's spine)* — **DONE for SQLite**
 
-Run and published: `docs/comparison-notes.md`. aDaBt wins **4 of 8** against
+Run and published: `docs/benchmarks/comparison-notes.md`. aDaBt wins **4 of 8** against
 bundled SQLite — point lookups, post-tune count/group-by at four orders of
-magnitude, and top-20 sort at 1.9× after the columnar top-K work — and loses
-4, worst 13.7× (bulk load). The first run found the planner replacing winning
+magnitude, and top-20 sort at 2.8× after the columnar top-K work — and loses
+4, worst ~11× (bulk load; 13.7× in an earlier run). The first run found the planner replacing winning
 index lookups with losing column scans; the precedence half of that defect is
 fixed and the comparison re-run as proof. Remaining for the full finish test (beyond 100% bar):
 RocksDB and PostgreSQL via the same harness with `cmake`/`libclang` and `DATABASE_URL`, plus YCSB- and TPC-C-shaped workloads. SQLite spine already satisfies the 100% finish line; extra witnesses are evidence depth, not gate.
@@ -152,8 +160,8 @@ In order:
    with losing full column scans on equality and range (43 ms → 210 ms);
    the dead guard behind it is landed-and-fixed, verified by re-run — tuned
    serves through the index, aggregate wins untouched. Landed alongside it:
-   **columnar top-K** (`docs/comparison-notes.md`), which took the worst
-   loss on the board to a 1.9× win over SQLite and added a move to C's set.
+   **columnar top-K** (`docs/benchmarks/comparison-notes.md`), which took the worst
+   loss on the board to a 2.8× win over SQLite and added a move to C's set.
    **Landed since:** planner now consults the calibrated curve (`adabt_exec::cost`)
    via `PlanContext::row_counts` — an unselective index on a large collection
    loses to a full scan (`scan_wins_over_lookups`), asserted at 800k rows.
@@ -231,10 +239,10 @@ give it something new to choose.
 ### Stage 3 — Decide the scale question *(gates everything after it)* — **DECIDED**
 
 **RAM-bound, as a documented property** — the decision and its numbers live
-in `docs/scale-decision.md`. The directory pages to disk only if a
+in `docs/benchmarks/scale-decision.md`. The directory pages to disk only if a
 revisit trigger fires: a comparison-expressible workload whose resident set
 fits but dataset does not, or thread-per-core landing and making residency
-the dominant remaining ceiling. Until then Track A stands at **100%** — 2PC, serializable and DDL
+the dominant remaining ceiling. Until then Track A stands at **100%** — coordinated cross-shard commit, `Strict` validation and DDL
 non-transactionality are now format properties, not notes; sharding remains the
 growth story but no longer the gate.
 
@@ -262,7 +270,7 @@ queue between caller and the only thing it waits for, without measured collapse
 Stage 1: the claim "this reaches the hardware's ceiling" is B's finish line,
 and it is measured against outside engines, not against aDaBt's own past.
 
-### Stage 5 — Cross-shard 2PC and serializable *(finishes A)*
+### Stage 5 — Cross-shard coordinated commit and serializable *(finishes A)*
 
 **Both halves are landed.**
 Serializable —
@@ -330,7 +338,7 @@ after join); `promotion_chaos.rs` kills and reopens at Building and Shadow,
 demanding identical answers, empty `verify()`, and a non-wedged engine each
 time — a lost trial loses only the trial.
 
-**Also landed:** 2PC window chaos (`cross_shard_atomic.rs` journal-only /
+**Also landed:** cross-shard commit-window chaos (`cross_shard_atomic.rs` journal-only /
 mid-application / torn-tail) — continuation of same truncation-at-offsets
 discipline.
 
@@ -402,3 +410,54 @@ cannot be said to add nothing while holding cards the optimizer is not dealt.
 Stage 7 makes every earlier finish test believable. Stage 8 is last because it
 is labour, not risk — and because shipping a wider surface multiplies everything
 that must then be hardened.
+
+---
+
+# What's next
+
+Everything below is open. It is gathered from finish tests this file wrote but
+did not close, `docs/limitations.md`, and the losses in
+`docs/benchmarks/comparison-notes.md`. Ordered by the same rule as the stages:
+evidence first, then what it unblocks.
+
+### 1. Close the unmeasured finish tests *(evidence — no new features)*
+- **Expert vs adaptive re-run** (Stage 6): adaptive must match the
+  expert-chosen configuration within noise on every soak phase, with the expert
+  given Stage 2's full move set. Track C's 100% rests on this; publish it.
+- **Core scaling and memory bandwidth** (Stage 4): throughput vs core count with
+  `--shards 1` as control, and scan throughput against measured memory
+  bandwidth, with the gap stated.
+- **Cost-model accuracy** (Stage 2): predicted vs actual within noise at 100k
+  and 1M rows in the level matrix.
+- **Bitmap at high cardinality**: the missing `index-scale` row before the
+  hash/bitmap preference can be called settled.
+- **Record compression on realistic records**: stored bytes and insert/scan
+  throughput with it on vs off.
+
+### 2. More witnesses *(D's depth)*
+- Vendor the PostgreSQL and RocksDB drivers so `--witness postgres|rocksdb`
+  stops exiting 2; add YCSB- and TPC-C-shaped workloads.
+
+### 3. Attack the published losses *(B)*
+- **Writes:** bulk load ~11× and single-row inserts behind SQLite. Per-record
+  MVCC + WAL stays; batching, group commit and WAL-frame cost are the levers.
+- **Indexed equality/range** (2.4× / ~1.5× behind): the remainder is
+  per-row projection-record construction, so route covering lookups through
+  `fetch_projected_batches`.
+
+### 4. Correctness gaps that a user will hit *(A)*
+- Predicate phantoms under `Strict` (needs predicate or range locking/validation).
+- `loom` coverage for `adabt-engine` (the cross-crate `Arc`/`Mutex` substitution design).
+- Wider SQL surface (writes and DDL through the shell / wire).
+- Wider C ABI beyond i64 put/get.
+
+### 5. Toward beta
+- Hosted CI running `scripts/check.sh`, so the gate does not depend on a
+  local hook.
+- Freeze `LogicalStore` and the wire protocol, and turn `docs/semver.md` into
+  a promise covering the API as well as the disk format.
+
+Still out of scope unless a revisit trigger fires: replication / HA
+(`docs/replication-decision.md`), out-of-core datasets
+(`docs/benchmarks/scale-decision.md`), and hiding the cross-shard visibility
+window (distributed locking).

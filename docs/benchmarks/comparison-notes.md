@@ -247,7 +247,7 @@ calibration is the work still open in Stage 2.
 ## Three harness defects this stage caught in itself
 
 Recorded because each would have shipped a wrong number, and two repeat
-patterns already in `docs/m36-notes.md`:
+patterns already in `docs/history/m36-notes.md`:
 
 1. **Timed trials, not structures.** `tuned_query` never called
    `advance_experiments()`, so any experiment started by `optimize()` sat in

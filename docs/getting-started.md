@@ -1,69 +1,58 @@
 # Getting Started
 
-**Status:** `0.1.0-alpha.1` — experimental, not production-ready. See `limitations.md`.
+**Status:** `0.1.0-alpha.1` — experimental, not production-ready. See `docs/limitations.md`.
 
-## Five-minute embedded quickstart
+Requires a C linker and Rust 1.82+.
+
+## Embedded: two runnable examples
+
+```sh
+cargo run -p adabt-engine --example quickstart          # open, batch insert, query a logical plan, explain it
+cargo run -p adabt-engine --example watch_it_optimize   # same queries before and after; the plan changes, answers don't
+```
+
+The sources are in `crates/adabt-engine/examples/` (`examples/quickstart.rs`
+at the repo root is a copy for browsing; it is not built). The core of the
+quickstart:
 
 ```rust
-use std::path::Path;
-use adabt_core::record::Record;
-use adabt_engine::{Database};
-use adabt_core::policy::{Policy, Mode};
+let mut policy = Policy::manual(0);                    // level 0: conventional, nothing specialised
+policy.guarantees.durability = Durability::Relaxed;    // fast demo; keep Strict when data matters
+let mut db = Database::open(&dir, policy)?;            // &Path
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Policy: conventional (strict durability, strict consistency, adaptive disabled)
-    let policy = Policy::conventional();
+db.create_collection("users", Schema::dynamic())?;
+db.insert_batch("users", batch)?;                      // Vec<(RecordId, Record)>
 
-    // Open (directory is created automatically; uses real Path, not a string)
-    let mut db = Database::open(Path::new("/tmp/demo"), policy)?;
-
-    // Create a dynamic-schema collection
-    use adabt_core::schema::{Schema, SchemaMode};
-    db.create_collection("users", Schema::dynamic())?;
-
-    // Insert via Record
-    let mut rec = Record::new();
-    rec.set("name", "Alice");
-    db.insert_auto("users", rec)?;
-
-    // Query: use a logical plan (subset SQL; full SQL not supported)
-    use adabt_ir::plan::LogicalPlan;
-    // Actual query API requires LogicalPlan construction; see architecture.md
-    // for the planner interface. The quick version:
-    println!("See docs/architecture.md for query examples.");
-
-    Ok(())
-}
+let plan = LogicalPlan::new(
+    LogicalOp::scan("users")
+        .filter(Expr::eq("country", "NO"))
+        .project(vec!["age".into()]),
+);
+let rows = db.query(&plan)?;
+println!("{}", db.explain(&plan));
 ```
 
 Notes:
-- `Database::open` takes `&Path`, not `&str`.
-- `Policy::conventional()` is the safe default; `Policy::manual(level)` selects an optimization ladder level.
-- SQL subset only: no arbitrary `CREATE`/`INSERT` string statements; use `Schema`, `Record`, `insert_auto`.
-- See `docs/architecture.md` for planner and optimization demonstration.
-
-## Adaptive optimization
-
-Start with `Policy::conventional()` or `Policy::manual(level)`. The optimizer creates indexes, covering indexes, columnar scans and materialized views based on telemetry (`docs/benchmarks/`). Print decisions with `db.optimize()`.
+- Queries from Rust are logical plans (`adabt-ir`); there is no SQL string API in the engine. The `adabt-cli` shell accepts a `SELECT` subset.
+- `Policy::conventional()` is the safe default; `Policy::manual(level)` selects a ladder level (0–11); set `policy.mode = Mode::Adaptive` to let the engine choose.
+- `db.optimize()` applies what the policy allows and returns a report; `db.explain_optimizations()` prints the decision log.
 
 ## Server quickstart
 
 ```bash
-adabt-server \
+cargo run -p adabt-server --release -- \
   --data ./demo-data \
   --listen 127.0.0.1:8443 \
+  --auth-token "$ADMIN_TOKEN" \
   --tls-cert server.crt \
   --tls-key server.key
 ```
 
-Required: `--data`. Flags: `--listen`, `--tls-cert`, `--tls-key` (not `--cert`, `--key`, `--port`).
+Required: `--data`. Other flags: `--listen`, `--level`, `--adaptive`, `--shards`,
+`--auth-token`, `--read-token`, `--tls-cert`, `--tls-key`, `--max-connections`,
+`--idle-timeout-secs`, `--slow-query-log-ms`, `--version`, `--help`.
 
-Connect with TLS and static admin/reader tokens.
+## Next
 
-## Limitations
-
-Not production-ready. See `docs/limitations.md`:
-- No replication (permanently out of scope)
-- Memory-bound (resident; no disk overflow)
-- Predicate phantoms remain under `Strict`
-- Cross-shard writes: coordinator-decides durability (`XSH1`), not atomic 2PC
+`docs/architecture.md` for how it fits together, `docs/api.md` for the surface,
+`docs/operations.md` for running it, `docs/limitations.md` before relying on it.

@@ -6,10 +6,20 @@ adapts to how the database is actually being used.
 Database specialization can be done manually, or through the automated engine.
 
 ### Status
-`0.1.0-alpha.1`: experimental public alpha. See docs for more.
+`0.1.0-alpha.1`: experimental public alpha, not production-ready.
 
-### Docs explanation
-Start with **`docs/getting-started.md`** — embedded quickstart, server quickstart with correct flags (`--data`, `--listen`, `--tls-cert`, `--tls-key`), and the adaptive optimization demonstration. `docs/architecture.md` explains the design. `docs/limitations.md` is an explanation of what the database can't do just yet. Measurements are in `docs/benchmarks/`.
+### Docs
+| Read | For |
+|---|---|
+| `docs/getting-started.md` | Runnable examples, server quickstart |
+| `docs/architecture.md` | How the crates fit together, the level ladder |
+| `docs/api.md` | The engine, sharded and wire surfaces |
+| `docs/operations.md` | Build/verify gate, scale, backup/PITR, tuning |
+| `docs/limitations.md` | What it can't do — **the authoritative list** |
+| `docs/roadmap.md` | What was finished, and what comes next |
+| `docs/semver.md`, `docs/replication-decision.md` | Format-compatibility promise; why no replication |
+| `docs/benchmarks/` | Measurements, including the SQLite comparison |
+| `docs/history/` | Milestone notes, kept as written at the time (paths and claims in them may be stale) |
 
 ## Layout
 
@@ -27,6 +37,7 @@ Start with **`docs/getting-started.md`** — embedded quickstart, server quickst
 | `adabt-bench` | Workloads and measurement harnesses. |
 | `adabt-server` | TCP listener, binary protocol, blocking client. No lock around the engine — the shards hold their own. |
 | `adabt-cli` | The SQL shell: open a directory, SELECT through the M37 parser, `.explain` plans. Thin on purpose — one evaluation path. |
+| `adabt-ffi` | C ABI (`cdylib` + `include/adabt.h`): open/close, create-collection, i64 field put/get, count. |
 
 ## What the measurements say
 
@@ -52,7 +63,12 @@ And what it does unaided, from `adabt-bench soak`: five workloads back to back,
 | identity lookups | 1,099 ns | 436 ns | **−60%** |
 | point filters | 7,079 µs | 1,069 µs | **−85%** |
 | range filters | 12,373 µs | 490 µs | **−96%** |
-| grouped aggregates | 1,824 µs | 1,850 µs | 1% |
+| grouped aggregates | 1,824 µs | 1,850 µs | +1% (flat) |
+
+The last row is a historical measurement: it is what forced the driver to
+re-score settled decisions every cycle (`docs/roadmap.md`, Track C). Against
+SQLite, tuned group-by now wins by four orders of magnitude
+(`docs/benchmarks/comparison-notes.md`).
 
 
 ## Ideas behind the design
@@ -102,7 +118,7 @@ Artefacts go to the workspace `target/` directory (default Cargo behavior).
 
 ```sh
 cargo build --profile bench-fast -p adabt-bench
-B=~/.cargo-target/adabt/bench-fast/adabt-bench
+B=target/bench-fast/adabt-bench
 
 $B matrix       --engine engine --levels 0,1,2,3,10
 $B query-matrix --levels 0,1,2,4,10 --disable result_cache
@@ -153,15 +169,16 @@ after one there is no old path left to compare against.
 
 ## What is not built
 
-No replication as it is explicitly out of scope (`docs/history/replication-decision.md`). Everything else on the roadmap is landed: cross-shard coordinator-decides durability (`ShardedDatabase::commit_coordinated`, `XSH1` journal, torn-tail safe, windowed visibility), strict read-set validation (`Consistency::Strict`, predicate phantoms remain documented in `docs/limitations.md`), TLS (`--tls-cert`/`--tls-key`), roles + per-collection `Forbidden` floors, best-effort core-pinned shard execution (`core_affinity` burst pinning in broadcast, per-shard `BufferPool` = per-core memory, persistent workers rejected by `connection_scale` gate), compound reasoning (`join_order` + `data_partitioning` level 6). The page directory and every index remain fully resident by design (~470 B/row, `docs/benchmarks/scale-decision.md`), so the practical ceiling is a few million rows per shard as sharding is the growth story.
+No replication as it is explicitly out of scope (`docs/replication-decision.md`). The rest of the gaps are listed in `docs/limitations.md`. What has landed: cross-shard coordinator-decides durability (`ShardedDatabase::commit_coordinated`, `XSH1` journal, torn-tail safe, windowed visibility), strict read-set validation (`Consistency::Strict`, predicate phantoms remain documented in `docs/limitations.md`), TLS (`--tls-cert`/`--tls-key`), roles + per-collection `Forbidden` floors, best-effort core-pinned shard execution (`core_affinity` burst pinning in broadcast, per-shard `BufferPool` = per-core memory, persistent workers rejected by `connection_scale` gate), compound reasoning (`join_order` + `data_partitioning` level 6). The page directory and every index remain fully resident by design (~470 B/row, `docs/benchmarks/scale-decision.md`), so the practical ceiling is a few million rows per shard as sharding is the growth story.
 
 Joins (hash and indexed nested loop, with spill), multi-statement transactions
 with single-shard snapshot isolation, a SQL `SELECT` front-end, segmented WAL
 with log truncation at checkpoint, and backup/restore/PITR have all landed
-since this file was last revised. The milestone notes in `docs/` are the
-record.
+as well. The milestone notes in `docs/history/` are the record.
 
 `SUM` is materialized only while integer arithmetic stays exact, aggregates are
 never combined across shards, and `MIN`/`MAX` are not maintained at all. Each is
 a place where a faster implementation was available and was rejected because it
 would have moved an answer in the last decimal place.
+
+`docs/roadmap.md` has the full accounting and the next steps.

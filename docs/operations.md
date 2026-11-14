@@ -1,8 +1,8 @@
 # Operations
 
-## Build & verify (private repo, no GH Actions)
+## Build & verify
 
-Enforced locally, not via Actions (private repo has no runner):
+There is no hosted CI; `scripts/check.sh` is the gate:
 
 ```sh
 bash scripts/check.sh          # fmt --check + clippy -D warnings + test --workspace + loom subset + comparison sanity + doc
@@ -15,7 +15,7 @@ Or manually:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo test --workspace --features loom   # TxId allocator model-check
+cargo test -p adabt-storage --features loom   # TxId allocator model-check (engine not yet covered)
 cargo doc --workspace --no-deps
 ```
 
@@ -31,7 +31,7 @@ target/bench-fast/adabt-bench soak --data-dir /var/tmp/soak --size 3000 --ops-pe
 
 ## Runtime
 
-Scale is **RAM-bound by design** (`docs/scale-decision.md`): ~470 B/row, page directory + every index resident. Ceiling stated at server startup; revisit triggers: resident set fits but dataset does not, or thread-per-core makes residency dominant.
+Scale is **RAM-bound by design** (`docs/benchmarks/scale-decision.md`): ~470 B/row, page directory + every index resident. Ceiling stated at server startup; revisit triggers: resident set fits but dataset does not, or thread-per-core makes residency dominant.
 
 Sharding is the growth story: `ShardedDatabase::open(dir, shards, policy)` → `dir/shard-{i}`, `RecordId % shards` routing, `commit_coordinated` for cross-shard durability (see `docs/api.md` windowed visibility). `--shards 1` is the honest unpartitioned control.
 
@@ -51,7 +51,7 @@ Catalog v4 (`delta_encoding`/`thread_per_core`) is authoritative; loss rebuilds 
 
 ## Tuning
 
-`Policy::manual(level)` or `Policy::adaptive`. Levels are cumulative presets (`adabt-opt/src/levels.rs`): 0 conventional → 11 maximum. `adabt-engine/src/optimizations.rs` 17 optimizations, all level-reachable (`every_registered_optimization_is_reachable_from_some_level`). `explain_optimizations()` / decision log + `to_prometheus_text`.
+`Policy::manual(level)`, or `policy.mode = Mode::Adaptive`. Levels are cumulative presets (`adabt-opt/src/levels.rs`): 0 conventional → 11 maximum. `adabt-engine/src/optimizations.rs` 17 optimizations, all level-reachable (`every_registered_optimization_is_reachable_from_some_level`). `explain_optimizations()` / decision log + `to_prometheus_text`.
 
 ## Hardening you can run
 

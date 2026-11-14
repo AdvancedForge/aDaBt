@@ -85,7 +85,7 @@ pub trait Index: Send {
     /// An index that carries a projection of each indexed record can answer a
     /// query *entirely from the index*, with no fetch at all. That matters
     /// here more than it does in most engines: the fetch is the measured
-    /// majority of what a lookup costs (see `docs/m36-notes.md`), so removing
+    /// majority of what a lookup costs (see `docs/history/m36-notes.md`), so removing
     /// it is not a constant-factor saving but the removal of the dominant
     /// term.
     fn covers(&self) -> &[String] {
