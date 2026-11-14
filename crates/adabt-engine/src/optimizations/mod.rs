@@ -88,7 +88,7 @@ mod tests {
     use adabt_core::index_kind::IndexKind;
     use adabt_core::policy::Policy;
     use adabt_opt::config::Params;
-    use adabt_opt::optimization::{OptContext, Optimization as _, Reversibility};
+    use adabt_opt::optimization::{OptContext, Optimization as _, RecordBytes, Reversibility};
     use adabt_telemetry::event::{Event, OpKind, QueryShape};
     use adabt_telemetry::{CollectingProbe, Probe as _, Snapshot};
 
@@ -99,7 +99,9 @@ mod tests {
         max_ids: Vec<(String, u64)>,
         pub(super) indexes: Vec<(String, String, IndexKind)>,
         pub(super) snap: Snapshot,
-        policy: Policy,
+        pub(super) policy: Policy,
+        pub(super) record_bytes: Vec<(String, RecordBytes)>,
+        pub(super) current_bytes: u64,
     }
 
     impl Fx {
@@ -112,6 +114,8 @@ mod tests {
                 indexes: vec![],
                 snap: Snapshot::default(),
                 policy: Policy::conventional(),
+                record_bytes: vec![],
+                current_bytes: 0,
             }
         }
         /// Record `n` queries that pinned `fields` to literals together.
@@ -176,7 +180,8 @@ mod tests {
                 fixed_size_collections: &self.fixed,
                 max_ids: &self.max_ids,
                 existing_indexes: &self.indexes,
-                current_bytes: 0,
+                current_bytes: self.current_bytes,
+                record_bytes: &self.record_bytes,
             }
         }
     }

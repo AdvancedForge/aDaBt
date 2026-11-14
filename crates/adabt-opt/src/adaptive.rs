@@ -901,6 +901,7 @@ mod wiring {
                 max_ids: &self.max_ids,
                 existing_indexes: &self.indexes,
                 current_bytes: 4_000_000,
+                record_bytes: &[],
             }
         }
     }

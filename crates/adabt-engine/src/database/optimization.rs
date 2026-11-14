@@ -11,6 +11,7 @@ use adabt_opt::controller::ApplyReport;
 use adabt_opt::decision::{Decision, DecisionAction, Source as DecisionSource};
 use adabt_opt::driver::{ManualDriver, OptimizationDriver};
 use adabt_opt::experiment::Guardrails;
+use adabt_opt::optimization::RecordBytes;
 use adabt_opt::{OptimizationConfig, OptimizationController, Registry};
 use adabt_telemetry::{Event, Probe};
 
@@ -230,6 +231,7 @@ impl Database {
             existing: self.existing_index_tuples(),
             max_ids: self.max_ids()?,
             current_bytes: self.stored_bytes()? + self.derived_memory_bytes() as u64,
+            record_bytes: self.record_bytes()?,
             policy: self.policy.clone(),
             snapshot,
             collections,
@@ -284,6 +286,28 @@ impl Database {
             out.push((n, c));
         }
         Ok(out)
+    }
+
+    /// What each collection's records take uncompressed, and the ratio
+    /// compression was measured to store them at.
+    ///
+    /// Both are read the same way whether compression is on or off, which is
+    /// what keeps its estimate from claiming less once it has been made.
+    fn record_bytes(&mut self) -> Result<Vec<(String, RecordBytes)>> {
+        Ok(self
+            .store
+            .record_footprint()?
+            .into_iter()
+            .map(|(name, fp)| {
+                (
+                    name,
+                    RecordBytes {
+                        raw: fp.raw_bytes,
+                        compression_ratio: fp.compression_ratio,
+                    },
+                )
+            })
+            .collect())
     }
 
     /// Highest record id per collection, for density estimates.

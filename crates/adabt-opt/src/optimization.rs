@@ -109,9 +109,38 @@ pub struct OptContext<'a> {
     /// charged in full. "Fraction of what this database costs" is the unit that
     /// means the same thing at every size.
     pub current_bytes: u64,
+    /// What each collection's records take uncompressed, and how well they
+    /// compress, as `(collection, sizes)`.
+    ///
+    /// Deliberately not the stored size. A saving judged against what is
+    /// stored now looks smaller once it has been made, so an estimate built
+    /// on it argues for a change before it is made and against it after.
+    /// Empty when the engine does not report it.
+    pub record_bytes: &'a [(String, RecordBytes)],
+}
+
+/// One collection's records, sized before compression and measured for how
+/// far it would shrink them. See [`OptContext::record_bytes`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RecordBytes {
+    /// Bytes the live records take uncompressed, whether or not they are
+    /// stored compressed.
+    pub raw: u64,
+    /// Compressed over uncompressed bytes, measured on the stored records as
+    /// compression would store them: 1.0 when nothing shrinks. `None` when
+    /// there was nothing to measure.
+    pub compression_ratio: Option<f64>,
 }
 
 impl OptContext<'_> {
+    /// What `collection`'s records take uncompressed, if reported.
+    pub fn record_bytes_of(&self, collection: &str) -> Option<RecordBytes> {
+        self.record_bytes
+            .iter()
+            .find(|(c, _)| c == collection)
+            .map(|(_, b)| *b)
+    }
+
     pub fn rows_in(&self, collection: &str) -> usize {
         self.collections
             .iter()

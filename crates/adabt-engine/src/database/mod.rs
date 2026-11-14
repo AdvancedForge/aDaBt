@@ -137,6 +137,7 @@ struct OptInputs {
     existing: Vec<(String, String, IndexKind)>,
     max_ids: Vec<(String, u64)>,
     current_bytes: u64,
+    record_bytes: Vec<(String, adabt_opt::optimization::RecordBytes)>,
     policy: Policy,
 }
 
@@ -151,6 +152,7 @@ impl OptInputs {
             max_ids: &self.max_ids,
             existing_indexes: &self.existing,
             current_bytes: self.current_bytes,
+            record_bytes: &self.record_bytes,
         }
     }
 }

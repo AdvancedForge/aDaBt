@@ -169,6 +169,7 @@ impl Fixture {
             max_ids: &self.max_ids,
             existing_indexes: &self.indexes,
             current_bytes: 0,
+            record_bytes: &[],
         }
     }
 }
