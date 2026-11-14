@@ -28,6 +28,6 @@ step "comparison harness builds (separate workspace)"
 cargo build --manifest-path comparison/Cargo.toml --release
 
 step "docs"
-cargo doc --workspace --no-deps --quiet
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --quiet
 
 printf '\nall checks passed\n'
