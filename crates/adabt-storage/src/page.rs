@@ -23,6 +23,40 @@ pub const MAX_PAYLOAD: usize = PAGE_SIZE - HEADER_SIZE - SLOT_SIZE;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PageId(pub u32);
 
+/// A map keyed by page id, for the structures every page access goes through:
+/// the buffer pool's frames, its eviction state, the free-space map.
+///
+/// Hashed with [`PageIdHasher`] rather than the standard library's default,
+/// which is built to resist keys an adversary chooses. Page ids are chosen by
+/// the store — small, dense, handed out in order — so that resistance buys
+/// nothing here, and its cost is paid several times on every write.
+pub type PageMap<V> = std::collections::HashMap<PageId, V, PageIdHashBuilder>;
+
+/// Builds a [`PageIdHasher`] for [`PageMap`].
+pub type PageIdHashBuilder = std::hash::BuildHasherDefault<PageIdHasher>;
+
+/// A multiplicative (Fibonacci) hash of a page id: one multiply, spreading
+/// consecutive ids across the whole word.
+#[derive(Default)]
+pub struct PageIdHasher(u64);
+
+impl std::hash::Hasher for PageIdHasher {
+    fn write_u32(&mut self, id: u32) {
+        self.0 = (self.0 ^ u64::from(id)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // `PageId` hashes through `write_u32`; this only has to be correct.
+        for &b in bytes {
+            self.write_u32(u32::from(b));
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SlotId(pub u16);
 
@@ -36,6 +70,12 @@ pub struct RecordLocation {
 #[derive(Clone)]
 pub struct Page {
     bytes: Box<[u8; PAGE_SIZE]>,
+    /// Every slot below this index is live. Lets an insert start its search
+    /// for a dead slot to reuse past the run of live ones a page that is only
+    /// ever appended to consists of, instead of rereading all of them each
+    /// time. A lower bound kept in memory, never stored: zero is always
+    /// correct, and is what a page read from disk starts with.
+    live_prefix: u16,
 }
 
 impl std::fmt::Debug for Page {
@@ -59,6 +99,7 @@ impl Page {
     pub fn new() -> Self {
         let mut p = Page {
             bytes: Box::new([0u8; PAGE_SIZE]),
+            live_prefix: 0,
         };
         p.set_free_end(PAGE_SIZE as u16);
         p
@@ -161,8 +202,9 @@ impl Page {
             )));
         }
 
-        // Prefer a dead slot: it costs no additional slot space.
-        let reuse = (0..self.slot_count()).find(|i| !self.is_live(*i));
+        // Prefer a dead slot: it costs no additional slot space. The first
+        // one, as ever; none lies below `live_prefix`.
+        let reuse = (self.live_prefix..self.slot_count()).find(|i| !self.is_live(*i));
         let needs_slot = reuse.is_none();
         let need = payload.len() + if needs_slot { SLOT_SIZE } else { 0 };
         if self.free_space() < need {
@@ -185,6 +227,9 @@ impl Page {
             }
         };
         self.set_slot(slot, off as u16, payload.len() as u16);
+        // Every slot before the one taken was live, or the search would have
+        // stopped there; the one taken is live now.
+        self.live_prefix = slot + 1;
         Ok(SlotId(slot))
     }
 
@@ -220,6 +265,7 @@ impl Page {
         // The payload stays where it is until compaction; only the slot dies,
         // so surviving slot ids keep their meaning.
         self.set_slot(slot.0, 0, 0);
+        self.live_prefix = self.live_prefix.min(slot.0);
         Ok(())
     }
 
@@ -269,6 +315,7 @@ impl Page {
         let lsn = self.lsn();
         self.bytes[HEADER_SIZE..].fill(0);
         self.set_slot_count(highest_live);
+        self.live_prefix = self.live_prefix.min(highest_live);
         self.set_free_end(PAGE_SIZE as u16);
         self.set_lsn(lsn);
         for (i, payload) in live {
@@ -320,6 +367,7 @@ impl Page {
         }
         let p = Page {
             bytes: Box::new(bytes),
+            live_prefix: 0,
         };
         // A checksum proves the bytes are as written, not that they are sane:
         // validate the header before anything indexes with it.
@@ -390,6 +438,32 @@ mod tests {
         let c = p.insert(b"cccc").unwrap();
         assert_eq!(c, a, "a dead slot should be reused");
         assert_eq!(p.slot_count(), count_before);
+    }
+
+    #[test]
+    fn the_lowest_dead_slot_is_reused_first_however_slots_died() {
+        let mut p = Page::new();
+        let ids: Vec<SlotId> = (0..6u8).map(|i| p.insert(&[i; 8]).unwrap()).collect();
+        p.delete(ids[4]).unwrap();
+        p.delete(ids[1]).unwrap();
+        assert_eq!(p.insert(b"x").unwrap(), ids[1]);
+        assert_eq!(p.insert(b"y").unwrap(), ids[4]);
+        assert_eq!(p.insert(b"z").unwrap(), SlotId(6), "no dead slot is left");
+
+        // Compaction keeps slot ids, dead ones included, and drops trailing
+        // dead slots; the next insert still finds the lowest dead one.
+        p.delete(SlotId(6)).unwrap();
+        p.delete(ids[2]).unwrap();
+        p.compact();
+        assert_eq!(p.slot_count(), 6);
+        assert_eq!(p.insert(b"w").unwrap(), ids[2]);
+        assert_eq!(p.insert(b"v").unwrap(), SlotId(6));
+
+        // A page read back from its bytes knows nothing of its history.
+        p.delete(ids[0]).unwrap();
+        p.seal();
+        let mut q = Page::from_bytes(*p.as_bytes()).unwrap();
+        assert_eq!(q.insert(b"u").unwrap(), ids[0]);
     }
 
     #[test]
@@ -528,6 +602,7 @@ mod tests {
         bytes[12..14].copy_from_slice(&u16::MAX.to_le_bytes());
         let mut tmp = Page {
             bytes: Box::new(bytes),
+            live_prefix: 0,
         };
         tmp.seal();
         assert!(Page::from_bytes(*tmp.as_bytes()).is_err());

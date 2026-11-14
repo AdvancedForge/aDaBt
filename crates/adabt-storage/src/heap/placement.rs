@@ -2,10 +2,10 @@
 //! general case, and the clustering hint's key ranges for keyed inserts.
 
 use adabt_core::error::Result;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use super::HeapStore;
-use crate::page::{Page, PageId, RecordLocation};
+use crate::page::{Page, PageId, PageMap, RecordLocation};
 
 /// The clustering hint's bookkeeping: the integer key range each page was
 /// filled under.
@@ -28,64 +28,50 @@ impl ClusterState {
     }
 }
 
-/// Pages bucketed by how much free space they have.
+/// Every known page, ordered by how much free space it has.
 ///
-/// A linear scan for a page with room is O(pages) per insert, which dominates
-/// everything else once a heap grows. Buckets make it near-constant while
-/// staying simple enough to be obviously correct.
+/// Finding a page with room is a single ordered lookup — the page with the
+/// least free space that still fits, ties going to the lower page id — so it
+/// costs O(log pages) however large the heap grows. An earlier version kept
+/// coarse buckets and scanned the bucket a request fell into page by page;
+/// once a heap had filled a few hundred pages, that bucket held every nearly
+/// full one, and the scan was most of the cost of an insert.
+///
+/// Least-free-that-fits keeps the property the buckets had: nearly full pages
+/// are topped up before emptier ones are touched, so a sequential load fills
+/// pages in turn and space freed by reclamation is reused before the file
+/// grows.
 #[derive(Default)]
 pub(super) struct FreeSpaceMap {
-    pub(super) free: HashMap<PageId, usize>,
-    buckets: Vec<Vec<PageId>>,
+    pub(super) free: PageMap<usize>,
+    by_free: BTreeSet<(usize, PageId)>,
 }
-
-const BUCKET_COUNT: usize = 8;
-const BUCKET_SPAN: usize = crate::page::PAGE_SIZE / BUCKET_COUNT;
 
 impl FreeSpaceMap {
     pub(super) fn new() -> Self {
-        Self {
-            free: HashMap::new(),
-            buckets: vec![Vec::new(); BUCKET_COUNT],
-        }
-    }
-
-    fn class_of(free: usize) -> usize {
-        (free / BUCKET_SPAN).min(BUCKET_COUNT - 1)
+        Self::default()
     }
 
     pub(super) fn set(&mut self, page: PageId, free: usize) {
         if let Some(old) = self.free.insert(page, free) {
-            let b = &mut self.buckets[Self::class_of(old)];
-            if let Some(i) = b.iter().position(|p| *p == page) {
-                b.swap_remove(i);
-            }
+            self.by_free.remove(&(old, page));
         }
-        self.buckets[Self::class_of(free)].push(page);
+        self.by_free.insert((free, page));
     }
 
     /// Forget a page entirely, so it is never offered again.
     pub(super) fn forget(&mut self, page: PageId) {
         if let Some(old) = self.free.remove(&page) {
-            let b = &mut self.buckets[Self::class_of(old)];
-            if let Some(i) = b.iter().position(|p| *p == page) {
-                b.swap_remove(i);
-            }
+            self.by_free.remove(&(old, page));
         }
     }
 
     /// A page with at least `need` bytes free, if one is known.
     pub(super) fn find(&self, need: usize) -> Option<PageId> {
-        // Only the top of the class containing `need` is guaranteed to fit, so
-        // search that class candidate-by-candidate and higher classes freely.
-        for class in Self::class_of(need)..BUCKET_COUNT {
-            for &p in &self.buckets[class] {
-                if self.free.get(&p).copied().unwrap_or(0) >= need {
-                    return Some(p);
-                }
-            }
-        }
-        None
+        self.by_free
+            .range((need, PageId(0))..)
+            .next()
+            .map(|&(_, page)| page)
     }
 }
 
@@ -203,5 +189,47 @@ impl HeapStore {
         self.fsm.set(pid, free);
         cluster.ranges.insert(pid, (key, key));
         Ok(RecordLocation { page: pid, slot })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_fullest_page_that_fits_is_offered() {
+        let mut fsm = FreeSpaceMap::new();
+        fsm.set(PageId(0), 40);
+        fsm.set(PageId(1), 900);
+        fsm.set(PageId(2), 120);
+        fsm.set(PageId(3), 120);
+        assert_eq!(fsm.find(100), Some(PageId(2)), "ties go to the lower id");
+        assert_eq!(fsm.find(40), Some(PageId(0)));
+        assert_eq!(fsm.find(500), Some(PageId(1)));
+        assert_eq!(fsm.find(901), None);
+    }
+
+    #[test]
+    fn a_page_is_offered_by_its_latest_free_space_only() {
+        let mut fsm = FreeSpaceMap::new();
+        fsm.set(PageId(7), 800);
+        fsm.set(PageId(7), 30);
+        assert_eq!(fsm.find(100), None, "the stale entry must be gone");
+        assert_eq!(fsm.find(30), Some(PageId(7)));
+        fsm.forget(PageId(7));
+        assert_eq!(fsm.find(1), None);
+        assert!(fsm.free.is_empty());
+    }
+
+    /// Thousands of full pages must not stand between a write and the one
+    /// page with room: scanning past them used to be most of an insert.
+    #[test]
+    fn many_full_pages_do_not_hide_the_one_with_room() {
+        let mut fsm = FreeSpaceMap::new();
+        for p in 0..10_000 {
+            fsm.set(PageId(p), 10);
+        }
+        fsm.set(PageId(10_000), 4000);
+        assert_eq!(fsm.find(64), Some(PageId(10_000)));
     }
 }

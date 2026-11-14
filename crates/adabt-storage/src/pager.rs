@@ -6,12 +6,13 @@
 //! access path.
 
 use adabt_core::error::{Error, Result};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-use crate::page::{Page, PageId, PAGE_SIZE};
+use crate::page::{Page, PageId, PageMap, PAGE_SIZE};
 
 /// A file addressed as an array of fixed-size pages.
 pub struct PagedFile {
@@ -114,11 +115,16 @@ impl PagedFile {
     }
 
     pub fn write_page(&mut self, id: PageId, page: &mut Page) -> Result<()> {
-        self.invalidate_base_image()?;
         page.seal();
+        self.write_sealed(id, page.as_bytes())
+    }
+
+    /// Write bytes that already carry their checksum.
+    fn write_sealed(&mut self, id: PageId, bytes: &[u8; PAGE_SIZE]) -> Result<()> {
+        self.invalidate_base_image()?;
         self.file
             .seek(SeekFrom::Start(id.0 as u64 * PAGE_SIZE as u64))?;
-        self.file.write_all(page.as_bytes())?;
+        self.file.write_all(bytes)?;
         if id.0 >= self.page_count {
             self.page_count = id.0 + 1;
         }
@@ -126,9 +132,17 @@ impl PagedFile {
     }
 
     pub fn allocate(&mut self) -> Result<PageId> {
+        // Every new page starts as the same empty page, so its checksum — a
+        // pass over all of its bytes — is computed once per process rather
+        // than once per page a load allocates.
+        static EMPTY: OnceLock<Page> = OnceLock::new();
+        let empty = EMPTY.get_or_init(|| {
+            let mut p = Page::new();
+            p.seal();
+            p
+        });
         let id = PageId(self.page_count);
-        let mut p = Page::new();
-        self.write_page(id, &mut p)?;
+        self.write_sealed(id, empty.as_bytes())?;
         Ok(id)
     }
 
@@ -191,10 +205,30 @@ impl EvictionPolicy for Lru {
 }
 
 /// Second-chance (clock): approximates LRU without reordering on every hit.
+///
+/// The ring holds page ids in the order they joined it; each page's reference
+/// bit lives in a map beside it. A hit — which the pool records on every page
+/// access, every insert included — is then one map lookup, where finding the
+/// page in the ring would be a pass over every resident frame. Only eviction
+/// and `forget` walk the ring, and both remove an entry from it anyway.
 #[derive(Default)]
 pub struct Clock {
-    entries: Vec<(PageId, bool)>,
+    ring: Vec<PageId>,
+    referenced: PageMap<bool>,
     hand: usize,
+}
+
+impl Clock {
+    /// Take the entry at `i` out of the ring, keeping the hand on the entry it
+    /// pointed at.
+    fn remove_at(&mut self, i: usize) -> PageId {
+        let id = self.ring.remove(i);
+        self.referenced.remove(&id);
+        if self.hand > i {
+            self.hand -= 1;
+        }
+        id
+    }
 }
 
 impl EvictionPolicy for Clock {
@@ -202,40 +236,43 @@ impl EvictionPolicy for Clock {
         "clock"
     }
     fn touch(&mut self, id: PageId) {
-        match self.entries.iter_mut().find(|(p, _)| *p == id) {
-            Some(e) => e.1 = true,
-            None => self.entries.push((id, true)),
+        if let Some(bit) = self.referenced.get_mut(&id) {
+            *bit = true;
+        } else {
+            self.referenced.insert(id, true);
+            self.ring.push(id);
         }
     }
     fn forget(&mut self, id: PageId) {
-        if let Some(i) = self.entries.iter().position(|(p, _)| *p == id) {
-            self.entries.remove(i);
-            if self.hand > i {
-                self.hand -= 1;
+        if self.referenced.contains_key(&id) {
+            if let Some(i) = self.ring.iter().position(|p| *p == id) {
+                self.remove_at(i);
             }
         }
     }
     fn victim(&mut self) -> Option<PageId> {
-        if self.entries.is_empty() {
+        if self.ring.is_empty() {
             return None;
         }
         // Every full sweep clears at least one reference bit, so this
         // terminates within two passes.
-        for _ in 0..self.entries.len() * 2 {
-            if self.hand >= self.entries.len() {
+        for _ in 0..self.ring.len() * 2 {
+            if self.hand >= self.ring.len() {
                 self.hand = 0;
             }
-            let (id, referenced) = self.entries[self.hand];
-            if referenced {
-                self.entries[self.hand].1 = false;
+            let bit = self
+                .referenced
+                .get_mut(&self.ring[self.hand])
+                .expect("every page in the ring has a reference bit");
+            if *bit {
+                *bit = false;
                 self.hand += 1;
             } else {
-                self.entries.remove(self.hand);
-                return Some(id);
+                // The hand stays where it is: the next entry moves under it.
+                return Some(self.remove_at(self.hand));
             }
         }
-        let (id, _) = self.entries.remove(0);
-        Some(id)
+        Some(self.remove_at(0))
     }
 }
 
@@ -287,7 +324,7 @@ const READ_AHEAD_PAGES: u32 = 16;
 
 pub struct BufferPool {
     file: PagedFile,
-    frames: HashMap<PageId, Frame>,
+    frames: PageMap<Frame>,
     capacity: usize,
     policy: Box<dyn EvictionPolicy>,
     stats: BufferStats,
@@ -303,7 +340,7 @@ impl BufferPool {
         assert!(capacity > 0, "a buffer pool needs at least one frame");
         Self {
             file,
-            frames: HashMap::new(),
+            frames: PageMap::default(),
             capacity,
             policy,
             stats: BufferStats::default(),
@@ -698,6 +735,27 @@ mod tests {
         }
         p.touch(PageId(0)); // 0 is now the most recent, so 1 is the oldest
         assert_eq!(p.victim(), Some(PageId(1)));
+    }
+
+    #[test]
+    fn clock_sweeps_in_arrival_order_and_spares_a_page_touched_since() {
+        let mut p = Clock::default();
+        for i in 0..3 {
+            p.touch(PageId(i));
+        }
+        // The first sweep clears every bit; the hand comes round to page 0.
+        assert_eq!(p.victim(), Some(PageId(0)));
+        // Page 1, touched again, gets its second chance; page 2 does not.
+        p.touch(PageId(1));
+        assert_eq!(p.victim(), Some(PageId(2)));
+        // A forgotten page is never offered, and touching it again re-admits
+        // it at the back of the ring.
+        p.touch(PageId(5));
+        p.forget(PageId(1));
+        p.touch(PageId(1));
+        assert_eq!(p.victim(), Some(PageId(5)));
+        assert_eq!(p.victim(), Some(PageId(1)));
+        assert_eq!(p.victim(), None);
     }
 
     #[test]
