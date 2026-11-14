@@ -24,7 +24,8 @@ pub const FOOTPRINT_SAMPLE: usize = 256;
 pub struct RecordFootprint {
     /// Live records.
     pub records: u64,
-    /// Bytes those records take uncompressed, whatever is stored now.
+    /// Bytes those records take uncompressed, whatever is stored now,
+    /// extrapolated from the sample.
     pub raw_bytes: u64,
     /// Compressed over uncompressed bytes, on a sample of the records, as
     /// compression would store them: 1.0 when nothing shrinks. `None` with
@@ -112,11 +113,13 @@ impl HeapStore {
     /// What each collection's live records take uncompressed, and how far
     /// compression would shrink them.
     ///
-    /// The uncompressed total is exact and read from each slot's framing, so
-    /// it is the same whether compression is on or off. The ratio is
-    /// measured on an evenly spaced sample of at most [`FOOTPRINT_SAMPLE`]
-    /// records, each sized as `maybe_compress` would store it. That is also
-    /// independent of the current setting, since a record already compressed
+    /// Both figures come from an evenly spaced sample of at most
+    /// [`FOOTPRINT_SAMPLE`] records, so a measurement reads a bounded number
+    /// of pages however large the collection: the optimizer asks every
+    /// cycle, and a full pass would put a scan of the database inside every
+    /// measured window. Each sampled record is sized from its slot's framing
+    /// (no decompression) and as `maybe_compress` would store it, and neither
+    /// depends on the current setting, since a record already compressed
     /// holds the body `maybe_compress` chose. An estimate built on these
     /// claims the same saving before and after it is acted on, rather than a
     /// smaller one once the saving has been made.
@@ -125,16 +128,9 @@ impl HeapStore {
     pub fn record_footprint(&mut self) -> Result<Vec<(String, RecordFootprint)>> {
         let mut out = Vec::new();
         for name in self.store_collection_names() {
-            let locs: Vec<RecordLocation> = self
-                .coll(&name)?
-                .directory
-                .values()
-                .filter_map(|v| v.newest())
-                .collect();
-            let stride = locs.len().div_ceil(FOOTPRINT_SAMPLE).max(1);
-            let mut fp = RecordFootprint::default();
+            let (records, sample) = self.sample_live(&name)?;
             let (mut sampled_raw, mut sampled_packed) = (0u64, 0u64);
-            for (i, loc) in locs.iter().enumerate() {
+            for loc in &sample {
                 let page = self.pool.get(loc.page)?;
                 let payload = page.get(loc.slot)?;
                 if payload.len() < SLOT_PREFIX {
@@ -144,15 +140,17 @@ impl HeapStore {
                 }
                 let encoding = Encoding::from_bit(payload[SLOT_PREFIX - 1])?;
                 let body = &payload[SLOT_PREFIX..];
-                let raw = decoded_len(encoding, body).ok_or_else(|| {
+                sampled_raw += decoded_len(encoding, body).ok_or_else(|| {
                     Error::Corruption("compressed record is missing its length".into())
                 })? as u64;
-                fp.records += 1;
-                fp.raw_bytes += raw;
-                if i % stride == 0 {
-                    sampled_raw += raw;
-                    sampled_packed += compressed_len(encoding, body)? as u64;
-                }
+                sampled_packed += compressed_len(encoding, body)? as u64;
+            }
+            let mut fp = RecordFootprint {
+                records: records as u64,
+                ..RecordFootprint::default()
+            };
+            if !sample.is_empty() {
+                fp.raw_bytes = (sampled_raw as f64 * records as f64 / sample.len() as f64) as u64;
             }
             if sampled_raw > 0 {
                 fp.compression_ratio = Some(sampled_packed as f64 / sampled_raw as f64);
@@ -160,6 +158,41 @@ impl HeapStore {
             out.push((name, fp));
         }
         Ok(out)
+    }
+
+    /// [`stored_bytes`](Self::stored_bytes) estimated from the same bounded
+    /// sample [`record_footprint`](Self::record_footprint) reads, for callers
+    /// that ask every optimization cycle and cannot afford a pass over every
+    /// record.
+    pub fn sampled_stored_bytes(&mut self) -> Result<u64> {
+        let mut total = 0.0;
+        for name in self.store_collection_names() {
+            let (records, sample) = self.sample_live(&name)?;
+            if sample.is_empty() {
+                continue;
+            }
+            let mut sampled = 0u64;
+            for loc in &sample {
+                sampled += self.pool.get(loc.page)?.get(loc.slot)?.len() as u64;
+            }
+            total += sampled as f64 * records as f64 / sample.len() as f64;
+        }
+        Ok(total as u64)
+    }
+
+    /// How many live records a collection holds, and an evenly spaced
+    /// sample of at most [`FOOTPRINT_SAMPLE`] of their locations. Reads only
+    /// the in-memory directory.
+    fn sample_live(&self, name: &str) -> Result<(usize, Vec<RecordLocation>)> {
+        let directory = &self.coll(name)?.directory;
+        let records = directory.values().filter(|v| v.newest().is_some()).count();
+        let stride = records.div_ceil(FOOTPRINT_SAMPLE).max(1);
+        let sample = directory
+            .values()
+            .filter_map(|v| v.newest())
+            .step_by(stride)
+            .collect();
+        Ok((records, sample))
     }
 
     /// Bytes after which a log segment is sealed. See [`crate::wal::Wal::set_segment_bytes`].

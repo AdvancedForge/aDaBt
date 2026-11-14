@@ -13,6 +13,7 @@ use adabt_opt::driver::{ManualDriver, OptimizationDriver};
 use adabt_opt::experiment::Guardrails;
 use adabt_opt::optimization::RecordBytes;
 use adabt_opt::{OptimizationConfig, OptimizationController, Registry};
+use adabt_storage::heap::RecordFootprint;
 use adabt_telemetry::{Event, Probe};
 
 use super::{Database, OptInputs};
@@ -226,12 +227,16 @@ impl Database {
         let snapshot = self.telemetry.probe.snapshot();
         let collections = self.collection_sizes()?;
         let filtered = snapshot.most_filtered_fields();
+        // Sampled, not summed over every record: this runs every cycle, and
+        // inside the windows the optimizer measures.
+        let footprint = self.store.record_footprint()?;
+        let stored = self.store.sampled_stored_bytes()?;
         Ok(OptInputs {
             fixed: self.fixed_size_collections(),
             existing: self.existing_index_tuples(),
             max_ids: self.max_ids()?,
-            current_bytes: self.stored_bytes()? + self.derived_memory_bytes() as u64,
-            record_bytes: self.record_bytes()?,
+            current_bytes: stored + self.derived_memory_bytes() as u64,
+            record_bytes: record_bytes(footprint),
             policy: self.policy.clone(),
             snapshot,
             collections,
@@ -288,28 +293,6 @@ impl Database {
         Ok(out)
     }
 
-    /// What each collection's records take uncompressed, and the ratio
-    /// compression was measured to store them at.
-    ///
-    /// Both are read the same way whether compression is on or off, which is
-    /// what keeps its estimate from claiming less once it has been made.
-    fn record_bytes(&mut self) -> Result<Vec<(String, RecordBytes)>> {
-        Ok(self
-            .store
-            .record_footprint()?
-            .into_iter()
-            .map(|(name, fp)| {
-                (
-                    name,
-                    RecordBytes {
-                        raw: fp.raw_bytes,
-                        compression_ratio: fp.compression_ratio,
-                    },
-                )
-            })
-            .collect())
-    }
-
     /// Highest record id per collection, for density estimates.
     fn max_ids(&mut self) -> Result<Vec<(String, u64)>> {
         let mut out = Vec::new();
@@ -339,4 +322,24 @@ impl Database {
             .map(|s| (s.collection, s.field, s.kind))
             .collect()
     }
+}
+
+/// What each collection's records take uncompressed, and the ratio
+/// compression was measured to store them at.
+///
+/// Both are read the same way whether compression is on or off, which is
+/// what keeps its estimate from claiming less once it has been made.
+fn record_bytes(footprint: Vec<(String, RecordFootprint)>) -> Vec<(String, RecordBytes)> {
+    footprint
+        .into_iter()
+        .map(|(name, fp)| {
+            (
+                name,
+                RecordBytes {
+                    raw: fp.raw_bytes,
+                    compression_ratio: fp.compression_ratio,
+                },
+            )
+        })
+        .collect()
 }
