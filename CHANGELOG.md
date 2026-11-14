@@ -6,6 +6,19 @@ A correctness and code-quality pass. The existing formats are unchanged; two
 files are new (`base.adabt`, `superseded-log/`).
 
 ### Fixed
+- **The adaptive driver scores on evidence instead of fixed priors.** The
+  result cache is judged on its measured or ghost hit rate and resident
+  bytes; scan-, grouping-, lookup- and range-helping optimizations claim
+  their gain only on the share of traffic they can affect; memory spent and
+  saved weigh the same; calibration measures each change on its own query's
+  samples since it was made, skips windows an experiment overlapped, and
+  reads a measurement as a correction to the prediction; and the driver
+  decides nothing while an experiment runs. On `expert-vs-adaptive`,
+  adaptive now matches the expert on 3 of 5 phases at 5k rows and 1 of 5 at
+  20k (was 1 and 0), and the point-filter and aggregate gaps fell from
+  ~1,000× to at most 1.7× (`docs/benchmarks/expert-vs-adaptive.md`).
+  Structures from ended phases are now retracted. Record compression's
+  over-claiming estimate is the known remaining cause at 20k rows.
 - **Crash recovery brought deleted records back and could return an
   overwritten record's old version.** Version reclamation is lazy, so a
   checkpoint can flush the slots of records deleted or overwritten before

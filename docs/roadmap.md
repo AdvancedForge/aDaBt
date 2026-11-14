@@ -7,7 +7,7 @@ when the goal is met, as opposed to a list of features.
 |---|---|---|
 | **Usable** | you could ship on it | Met, for a single node with sharding as the growth story |
 | **Manually optimal** | the engine's ceiling is the hardware's ceiling | Met against SQLite; not yet measured against memory bandwidth or core count |
-| **Automatically optimal** | an expert tuning by hand adds nothing | Not met: adaptive matches the expert on 1 of 5 soak phases at 5k rows and 0 of 5 at 20k, mostly because it enables the result cache late or never ([`benchmarks/expert-vs-adaptive.md`](benchmarks/expert-vs-adaptive.md)) |
+| **Automatically optimal** | an expert tuning by hand adds nothing | Not met: adaptive matches the expert on 3 of 5 soak phases at 5k rows and 1 of 5 at 20k (was 1 and 0), and is 1.35–1.8× behind on the rest (was up to ~1,000×) ([`benchmarks/expert-vs-adaptive.md`](benchmarks/expert-vs-adaptive.md)) |
 | **Good** | there is a workload where it is demonstrably the right answer | Met: 4 of 8 workloads won against SQLite, losses published alongside |
 
 "Met" means the finish line as defined here. It does not mean production-ready;
@@ -60,13 +60,17 @@ throughout: evidence first, then what it unblocks.
 
 ### 3. Attack the published losses
 - **Adaptive behind the expert** ([`benchmarks/expert-vs-adaptive.md`](benchmarks/expert-vs-adaptive.md)):
-  - The driver admits the result cache late or never. Its fixed 1 MiB
-    reservation costs the whole resource budget on a small database, and its
-    speed estimate ignores how often queries repeat. That leaves point filters
-    about 1,000× behind and, at 5k rows, aggregates too.
-  - At 20k rows the identity phase ends without direct lookup (2.65× behind).
-  - Structures from ended phases are not retracted when they cost no
-    maintenance (identity-again, 1.2–1.8× behind).
+  - Fixed in the 2026-11-14 re-run: the result cache is admitted on its
+    measured hit rate (point filters now match at both sizes), direct lookup
+    is chosen at 20k rows, and structures from ended phases are retracted.
+  - **Record compression's estimate** claims a fixed 64 bytes a row, more
+    than the 20k-row soak's records occupy, so it scores as freeing the whole
+    database and is enabled in every phase at 20k rows. It is the one
+    configuration difference on the identity phases (1.36–1.41× behind). The
+    estimate needs the uncompressed size of what is stored.
+  - **Aggregate** (1.35–1.68×) and **range filter** (1.55–1.77×): adaptive
+    has the expert's core structures; the plan cache (still a workload-blind
+    5% prior) and the remaining preset structures are not yet separated.
 
   Re-run `adabt-bench expert-vs-adaptive` after any change to the driver's
   scoring. Matching on every phase is the finish line.

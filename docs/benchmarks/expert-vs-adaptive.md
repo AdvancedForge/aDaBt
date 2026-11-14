@@ -3,11 +3,21 @@
 The "automatically optimal" goal says an expert tuning by hand adds nothing
 over the adaptive engine. This is the measurement of that claim.
 
-**Result: the claim does not hold yet.** At 5,000 rows adaptive matches the
-expert on one of five soak phases. At 20,000 rows it matches on none. Where
-it is behind, the gap runs from 1.2× to more than 1,000×. The large gaps come
-from one cause: the adaptive driver turns the result cache on late or not at
-all. It never does at 5,000 rows, and at 20,000 rows only in the third phase.
+**Result (latest, 2026-11-14 re-run): the claim does not hold yet, but the
+gaps are now small.** After the scoring fixes described in
+[the re-run section](#re-run-2026-11-14-scoring-on-evidence), adaptive
+matches the expert on three of five phases at 5,000 rows and one of five at
+20,000. The 1,000×-class gaps are gone; what is left is 1.35–1.8×. At 20,000
+rows the one configuration difference on the identity phases, and the one
+structure adaptive carries through every phase, is record compression: it
+trades latency for memory, the expert (optimizing latency alone) never picks
+it, and adaptive picks it on an estimate that claims to save more bytes than
+the database holds.
+
+The original measurement follows unchanged. At the time adaptive matched one
+of five phases at 5,000 rows and none at 20,000, behind by 1.2× to more than
+1,000×, because the adaptive driver turned the result cache on late or not
+at all.
 
 ## Method
 
@@ -191,3 +201,119 @@ records the result cache's admission, the identity phase's missed direct
 lookup, and retraction after a phase ends as the work between the engine and
 the claim. The comparison is the test for
 both: re-run it after any change to the adaptive driver's scoring.
+
+## Re-run 2026-11-14: scoring on evidence
+
+The first measurement traced most of the gap to the adaptive driver's
+scoring: estimates that ignored evidence the engine either had or could
+cheaply collect. Commit `b23d802` added that evidence (a ghost result cache
+that counts the hits a disabled cache would have had and the bytes it would
+hold; compiled identity lookups reported to telemetry again). This re-run
+measures the scoring changes that use it:
+
+| commit | change |
+|---|---|
+| `16c0739` | The result cache is judged on its measured (or ghost) hit rate, with confidence growing with probes, and on its resident bytes instead of its 1 MiB capacity. |
+| `707e6a9` | Calibration measures a change on the samples of its query recorded since it was made (latency histograms never decay), only when before and after are the same query with at least 100 samples, and never across a running experiment. |
+| `e6ca365` | Memory is judged as the change in footprint relative to the larger of before and after, so doubling and halving the database weigh the same. Spending used to count twice as much as saving. |
+| `5957b6e` | Column store, delta encoding, read-ahead, per-core workers, materialized views, direct lookup and clustering claim their gain only on the share of traffic they can help (scans, unfiltered groupings, identity lookups, range reads), inferred from telemetry. |
+| `5fe1509` | The driver decides nothing while an experiment runs, since queries then skip the caches and are planned around a hidden candidate. |
+| `990be61` | A measurement is read as a correction to what the estimate predicted, so a gain measured on one workload is not claimed on another. |
+
+Same command, data directory layout, contestants and noise rules as above;
+the binary was built from `990be61`. **Load:** the machine was shared again.
+One-minute load average during the 5,000-row run was 1.9–6.0 (median 3.7),
+and during the 20,000-row run 1.1–2.2 (median 1.8). Wall time was 29 minutes
+and 76 minutes. Every manual cell's sampled answers matched level 0 (6,426
+checks per size), and the soaks behind the adaptive cells checked theirs
+against their own level-0 reference: **no divergences**.
+
+### 5,000 rows
+
+| phase | expert p50 (range) | adaptive p50 before → after | adaptive / expert before → after | verdict before → after | adaptive ended with |
+|---|---|---|---|---|---|
+| identity | 204 ns (191–289) | 228 ns → 197 ns (192–202) | 0.98× → 0.97× | matches → **matches** | direct_lookup |
+| point filter | 1.75 µs (1.75–1.76) | 328 µs → 1.74 µs (1.72–2.33) | 178× → 0.99× | behind → **matches** | auto_index[country], result_cache |
+| range filter | 118 µs (116–119) | 205 µs → 182 µs (178–230) | 1.47× → 1.55× | behind → behind | auto_index[age], clustered_sort[age], result_cache |
+| aggregate | 929 ns (927–932) | 1.66 ms → 1.25 µs (1.21–1.52) | 1,569× → 1.35× | behind → behind | auto_index[age], clustered_sort[age], result_cache |
+| identity again | 190 ns (187–200) | 315 ns → 200 ns (197–209) | 1.79× → 1.05× | behind → **matches** | direct_lookup |
+
+p99 (median of repeats), expert / adaptive: identity 354 / 282 ns; point
+filter 229 / 354 µs; range filter 201 / 318 µs; aggregate 0.69 / 2.56 ms;
+identity again 263 / 326 ns.
+
+### 20,000 rows
+
+| phase | expert p50 (range) | adaptive p50 before → after | adaptive / expert before → after | verdict before → after | adaptive ended with |
+|---|---|---|---|---|---|
+| identity | 194 ns (193–200) | 524 ns → 263 ns (262–266) | 2.65× → 1.36× | behind → behind | direct_lookup, record_compression |
+| point filter | 1.72 µs (1.72–1.76) | 1.77 ms → 1.75 µs (1.74–1.76) | 1,019× → 1.01× | behind → **matches** | auto_index[country], record_compression, result_cache |
+| range filter | 408 µs (403–411) | 650 µs → 721 µs (713–726) | 1.37× → 1.77× | behind → behind | auto_index[age], clustered_sort[age], record_compression, result_cache |
+| aggregate | 953 ns (946–982) | 1.8 µs → 1.61 µs (1.57–1.62) | 1.60× → 1.68× | behind → behind | auto_index[age], clustered_sort[age], record_compression, result_cache |
+| identity again | 198 ns (194–200) | 277 ns → 279 ns (277–283) | 1.23× → 1.41× | behind → behind | direct_lookup, record_compression |
+
+p99 (median of repeats), expert / adaptive: identity 325 / 438 ns; point
+filter 5.71 / 1.56 ms; range filter 484 / 948 µs; aggregate 2.74 / 9.83 ms;
+identity again 335 / 455 ns.
+
+(The "before" columns are the first measurement's adaptive figures; the
+experts were re-measured in this run and moved by a few percent, within
+their published ranges, except the 20,000-row identity expert, now
+`plan cache + direct lookup`.)
+
+### Reading the re-run
+
+**The result cache now arrives in the phase that needs it.** On the point
+filters the ghost measures an 85% would-be hit rate on about 40 KB, the
+cache scores 1.82 in the phase's first decision cycle and stays on. The
+point-filter phase now matches at both sizes, from 178× and 1,019× behind,
+and the aggregate phase closes from 1,569× to 1.35× at 5,000 rows. In the
+range phase the cache is admitted once the hit rate and resident bytes are
+measured (about 45% of queries repeat, on up to ~600 KB), and it is kept
+through the aggregate phase.
+
+**Each phase now ends with that phase's structures.** At 5,000 rows the
+adaptive configuration at the end of every phase is the expert's core: direct
+lookup alone for identity (the first measurement also carried delta
+encoding, read-ahead and, transiently, a column store and views), index plus
+cache for point filters, b-tree and clustering on `age` plus cache for
+ranges. The decision log of a 5,000-row soak at `990be61` has 16 decisions
+and no add-then-drop of the same structure within a phase. Each structure is
+dropped once, after its phase ends (an index "not chosen in the last 2,007
+operations"; clustering, cache and direct lookup when they fall below the
+keep score), and direct lookup is re-added in the last phase. That is the
+retraction the first measurement found missing.
+
+**What is still behind, and why:**
+
+- **Record compression at 20,000 rows.** It is the only configuration
+  difference on both identity phases, and the only structure adaptive
+  carries through every phase. Its estimate saves a fixed 64 bytes a row;
+  these records occupy about 56, so it claims to save more than the database
+  holds, which scores as freeing all of it. Against a 5% latency cost and
+  `resources: 3` that clears the bar. A cap at a fraction of the footprint
+  was tried and withdrawn: once compression is on, the footprint it is
+  judged against is the compressed one, the claim halves, and the change is
+  retracted and re-admitted. A sound estimate needs the uncompressed size
+  of what is stored, which `OptContext` does not carry. This is the next
+  fix, and it most likely accounts for the 1.36–1.41× on the identity
+  phases and part of the range and aggregate gaps.
+- **Aggregate, 1.35× (5,000) and 1.68× (20,000).** Both sides answer most
+  queries from the result cache. The expert's hits take ~0.95 µs, adaptive's
+  ~1.25–1.6 µs. The expert carries the plan cache, a column store and views
+  and no `age` index or clustering. This run does not separate which
+  difference costs the 0.3–0.6 µs; the plan cache's estimate is still a
+  workload-blind 5% prior that never clears the bar.
+- **Range filter, 1.55× (5,000) and 1.77× (20,000).** Adaptive builds the
+  winning presets' core (b-tree and clustering on `age`, result cache). The
+  winning presets, level 10 and 11, add the plan cache, buffer pool, column
+  store and the rest of the high levels; as in the first run, this was not
+  separated further. At 20,000 rows record compression is a plausible part
+  of it.
+
+## What the re-run means for the goal
+
+Still **not met**: 3 of 5 phases at 5,000 rows, 1 of 5 at 20,000. The
+1,000×-class failures were scoring, and they are fixed. The remaining
+1.35–1.8× gaps have a named first suspect (record compression's estimate)
+and two unexplained ones (the plan cache and the aggregate hit path).
