@@ -10,6 +10,7 @@ use adabt_ir::plan::{Agg, AggKind, SortKey};
 use adabt_ir::Expr;
 use std::collections::BTreeMap;
 
+use super::index::covering_filtered;
 use super::{
     batches_of, collect_rows, compare_rows, fetch_batches, run, ExecBudget, ExecStats, Source,
     CANCEL_CHECK_INTERVAL,
@@ -24,6 +25,12 @@ pub(super) fn filter<S: Source>(
     stats: &mut ExecStats,
     budget: &ExecBudget,
 ) -> Result<Vec<RecordBatch>> {
+    // Over a covering index the rows can be judged where they are stored,
+    // so the ones the predicate rejects are never copied out.
+    if let Some(batches) = covering_filtered(input, predicate, None, src, stats)? {
+        return Ok(batches);
+    }
+
     // Compiled once per execution of this node, then run per row —
     // the whole point of `adabt_ir::vm`. Tree-walking `Expr::matches`
     // re-descends `Box`ed nodes and (for `Like`) re-parses the
@@ -161,6 +168,19 @@ pub(super) fn project<S: Source>(
     budget: &ExecBudget,
 ) -> Result<Vec<RecordBatch>> {
     let refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
+    // The covering plan's usual shape. Filtering and projecting the stored
+    // rows in place copies out only the returned fields of the surviving
+    // rows — not the filtered field, which is checked and then projected
+    // away, and which otherwise cost a clone per row.
+    if let PhysicalOp::Filter {
+        input: below,
+        predicate,
+    } = input
+    {
+        if let Some(batches) = covering_filtered(below, predicate, Some(&refs), src, stats)? {
+            return Ok(batches);
+        }
+    }
     let mut batches = run(input, src, stats, budget)?;
     // The input rows are owned and read by nothing after this, so each is
     // narrowed where it stands rather than copied into a fresh projection

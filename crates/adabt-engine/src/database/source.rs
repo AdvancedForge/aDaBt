@@ -11,6 +11,51 @@ use std::ops::Bound;
 
 use super::Database;
 
+impl Database {
+    /// The covering index on `field` whose projection holds every field in
+    /// `needed` — and, when `range` is asked for, whose backing can walk a
+    /// range. `None` when there is none, which the caller reports as "cannot
+    /// serve" rather than as an empty answer.
+    fn covering_index(
+        &self,
+        collection: &str,
+        field: &str,
+        needed: &[String],
+        range: bool,
+    ) -> Option<&dyn adabt_index::Index> {
+        self.derived
+            .indexes
+            .get(collection)?
+            .iter()
+            .find(|i| {
+                let covers = i.covers();
+                (!range || i.kind().supports_range())
+                    && !covers.is_empty()
+                    && adabt_index::covering_parts(i.field()).0 == field
+                    && needed.iter().all(|n| covers.contains(n))
+            })
+            .map(|i| &**i)
+    }
+}
+
+/// Lend `visit` the stored projection of each id, in the order given.
+fn lend_covered(
+    idx: &dyn adabt_index::Index,
+    ids: Vec<RecordId>,
+    visit: &mut dyn FnMut(RecordId, &Record),
+) {
+    for id in ids {
+        // An id from the index with no projection beside it would mean the
+        // two halves had drifted apart. `CoveringIndex` maintains them
+        // together precisely so this cannot happen; skipping rather than
+        // fabricating an empty record keeps that a missing row rather than a
+        // wrong one if it ever does.
+        if let Some(rec) = idx.covered(id) {
+            visit(id, rec);
+        }
+    }
+}
+
 impl Source for Database {
     fn peek_field(
         &mut self,
@@ -220,30 +265,12 @@ impl Source for Database {
         key: &Value,
         needed: &[String],
     ) -> Result<Option<Vec<(RecordId, Record)>>> {
-        let Some(list) = self.derived.indexes.get(collection) else {
-            return Ok(None);
-        };
-        let found = list.iter().find(|i| {
-            let covers = i.covers();
-            !covers.is_empty()
-                && adabt_index::covering_parts(i.field()).0 == field
-                && needed.iter().all(|n| covers.contains(n))
-        });
-        let Some(idx) = found else {
-            return Ok(None);
-        };
         let mut rows = Vec::new();
-        for id in idx.lookup(key) {
-            // An id from the index with no projection beside it would mean the
-            // two halves had drifted apart. `CoveringIndex` maintains them
-            // together precisely so this cannot happen; skipping rather than
-            // fabricating an empty record keeps that a missing row rather than
-            // a wrong one if it ever does.
-            if let Some(rec) = idx.covered(id) {
-                rows.push((id, rec.clone()));
-            }
-        }
-        Ok(Some(rows))
+        let served =
+            self.visit_covering_lookup(collection, field, key, needed, &mut |id, rec| {
+                rows.push((id, rec.clone()))
+            })?;
+        Ok(served.then_some(rows))
     }
 
     /// The range sibling of `covering_lookup`: ids from the inner index's
@@ -263,32 +290,51 @@ impl Source for Database {
         hi: Bound<&Value>,
         needed: &[String],
     ) -> Result<Option<Vec<(RecordId, Record)>>> {
-        let Some(list) = self.derived.indexes.get(collection) else {
-            return Ok(None);
+        let mut rows = Vec::new();
+        let served =
+            self.visit_covering_range(collection, field, lo, hi, needed, &mut |id, rec| {
+                rows.push((id, rec.clone()))
+            })?;
+        Ok(served.then_some(rows))
+    }
+
+    /// The stored projections themselves, lent in place: the executor
+    /// filters and projects them before copying, so a field the plan only
+    /// checks is never cloned. `covering_lookup` is this plus a clone.
+    fn visit_covering_lookup(
+        &mut self,
+        collection: &str,
+        field: &str,
+        key: &Value,
+        needed: &[String],
+        visit: &mut dyn FnMut(RecordId, &Record),
+    ) -> Result<bool> {
+        let Some(idx) = self.covering_index(collection, field, needed, false) else {
+            return Ok(false);
         };
-        let found = list.iter().find(|i| {
-            i.kind().supports_range() && {
-                let covers = i.covers();
-                !covers.is_empty()
-                    && adabt_index::covering_parts(i.field()).0 == field
-                    && needed.iter().all(|n| covers.contains(n))
-            }
-        });
-        let Some(idx) = found else {
-            return Ok(None);
+        lend_covered(idx, idx.lookup(key), visit);
+        Ok(true)
+    }
+
+    /// The range form of `visit_covering_lookup`, on `covering_range`'s
+    /// refusals.
+    fn visit_covering_range(
+        &mut self,
+        collection: &str,
+        field: &str,
+        lo: Bound<&Value>,
+        hi: Bound<&Value>,
+        needed: &[String],
+        visit: &mut dyn FnMut(RecordId, &Record),
+    ) -> Result<bool> {
+        let Some(idx) = self.covering_index(collection, field, needed, true) else {
+            return Ok(false);
         };
         let Some(ids) = idx.range(lo, hi) else {
-            return Ok(None);
+            return Ok(false);
         };
-        let mut rows = Vec::new();
-        for id in ids {
-            // Same drift guard as `covering_lookup`: skip rather than
-            // fabricate.
-            if let Some(rec) = idx.covered(id) {
-                rows.push((id, rec.clone()));
-            }
-        }
-        Ok(Some(rows))
+        lend_covered(idx, ids, visit);
+        Ok(true)
     }
 
     /// A composite index answers to the NUL-joined name of its fields, so

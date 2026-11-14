@@ -59,7 +59,7 @@ ratios within each row and never against another row's absolute values.
 |---|---|---:|---:|---:|---|
 | bulk load | ns/row | 17,259 | – | 1,563 | **11.0× slower** — structural: MVCC + WAL per record |
 | point lookup by id | ns/probe | 4,714 | – | 8,870 | **1.9× faster** |
-| indexed equality | ns/query | 16.3 ms | 6.16 ms | 3.80 ms | **1.6× slower** (1.60–1.64× over four runs) — through `CoveringLookup`, zero fetches; was 1.7–2.9× on the same machine before the covering read path was reworked, 3.9× pre-auto-covering |
+| indexed equality | ns/query | 11.5 ms | 5.00 ms | 3.50 ms | **~1.4–1.5× slower** in the quietest paired runs (1.43×, 1.55×; up to 1.0–1.3× when SQLite's own time swung) — through `CoveringLookup`, zero fetches, rows filtered and projected before they are copied; 1.6–1.7× on the same machine just before that, 1.7–2.9× before the covering read path was reworked, 3.9× pre-auto-covering |
 | full scan count | ns/query | 208.4 ms | **967** | 8.65 ms | **~9,000–20,000× faster** across runs |
 | group by, count | ns/query | 296.4 ms | **3,014** | 61.30 ms | **~10,000–24,000× faster** across runs |
 | indexed range | ns/query | 10.8 ms | 2.66 ms | 6.50 ms | **faster, 1.3–2.9× across six runs** — through `CoveringRange`; was 1.23–1.30× slower on the same machine before the covering read path was reworked |
@@ -159,17 +159,41 @@ the same machine. Spread is large on this machine (other work was running;
 SQLite's own range time moved between 3.5 and 9.6 ms across runs), so the
 range verdict is stated as a range rather than one ratio.
 
+### Filtering covering rows before copying them
+
+The covering source used to clone every needed field of every stored row —
+including the filtered field, which the plan re-checks and then projects
+away — so the equality shape paid a string clone per row for `country` only
+to free it. Now `Source::visit_covering_lookup` / `visit_covering_range`
+lend each stored projection, and the executor runs `Filter` (and the
+`Project` above it) on the borrowed row, copying only the returned fields of
+the rows that survive. The answer is the separate operators' answer batch
+for batch — batches are cut where the unfiltered rows would have been, so
+even `stats.batches` is unchanged — and a unit test pins rows and stats
+against the operators run one by one. The defaults lend the rows
+`covering_lookup` returns, so no other `Source` changed.
+
+Measured on the same machine, before and after interleaved, at load 4–10
+(other benchmarks were running):
+
+| | equality | range |
+|---|---:|---:|
+| heap allocations per returned row | 5.01 → 4.03 | 4.01 → 4.03 |
+| scratch harness, best ms/query (4 runs each) | 4.30–6.13 → 3.14–4.31 | 1.95–2.83 → 1.82–2.65 |
+| comparison harness, tuned (5–8 runs each) | 5.50–7.80 → 5.00–6.81 ms | 3.0–4.2 → 3.1–5.1 ms |
+
+Equality gained roughly 10–25%; the gap to SQLite narrowed but did not
+close. Range did not move — its filtered field is an integer, so there was no
+string to skip — and its row is unchanged. The extra 0.02 allocations per row
+on range are batch vectors grown instead of presized, since the row count is
+not known before visiting.
+
 What remains of the equality gap, in order of size:
 
-1. **The clone of every needed field out of the covering index**, including
-   the filtered field itself, which the plan re-checks and then projects
-   away: two string allocations per row. Avoiding it means evaluating the
-   filter and projection against the borrowed stored projection inside the
-   `Source` implementation, which is engine code this change did not touch.
-2. **The compiled predicate allocates its two evaluation stacks per row**
+1. **The compiled predicate allocates its two evaluation stacks per row**
    (`adabt_ir::vm::Program::run`), ~100 ns per row on both shapes. Reusing
    the stacks across rows is the cheapest remaining win.
-3. **Allocator cost lands on the next query.** Freeing a 12,500-row answer
+2. **Allocator cost lands on the next query.** Freeing a 12,500-row answer
    leaves tens of thousands of chunks for glibc to sort on its next
    allocation, which showed up as 0.3–1.3 ms inside the *following* query's
    first telemetry call. Fewer allocations per row shrink this too.

@@ -218,6 +218,34 @@ pub trait Source {
         Ok(None)
     }
 
+    /// [`Source::covering_lookup`] with the rows lent rather than given:
+    /// `visit` sees each stored projection in the same order, borrowed, and
+    /// keeps what it needs. `false` means no covering index can serve the
+    /// query, exactly as `None` does there; `visit` is then never called.
+    ///
+    /// It exists because an owned row is the wrong shape for the plan above
+    /// a covering access. That plan filters the rows and projects them, and
+    /// the filtered field is usually not projected — so handing over owned
+    /// rows clones a value per row only for it to be checked and dropped, and
+    /// clones whole rows the filter then rejects. Lent rows let the caller
+    /// test the predicate first and copy only the fields it will return.
+    ///
+    /// The default lends the rows `covering_lookup` returns, so a `Source`
+    /// that overrides only that (or nothing) behaves as before.
+    fn visit_covering_lookup(
+        &mut self,
+        collection: &str,
+        field: &str,
+        key: &Value,
+        needed: &[String],
+        visit: &mut dyn FnMut(RecordId, &Record),
+    ) -> Result<bool> {
+        Ok(lend_rows(
+            self.covering_lookup(collection, field, key, needed)?,
+            visit,
+        ))
+    }
+
     /// Ids in an indexed range, or `None` when no index can serve it.
     fn index_range(
         &mut self,
@@ -239,6 +267,38 @@ pub trait Source {
     ) -> Result<Option<Vec<(RecordId, Record)>>> {
         Ok(None)
     }
+
+    /// [`Source::covering_range`] with the rows lent rather than given, for
+    /// the reasons and on the terms of [`Source::visit_covering_lookup`].
+    fn visit_covering_range(
+        &mut self,
+        collection: &str,
+        field: &str,
+        lo: Bound<&Value>,
+        hi: Bound<&Value>,
+        needed: &[String],
+        visit: &mut dyn FnMut(RecordId, &Record),
+    ) -> Result<bool> {
+        Ok(lend_rows(
+            self.covering_range(collection, field, lo, hi, needed)?,
+            visit,
+        ))
+    }
+}
+
+/// The default `visit_covering_*`: lend owned rows one at a time, and say
+/// whether there were any rows to lend at all.
+fn lend_rows(
+    rows: Option<Vec<(RecordId, Record)>>,
+    visit: &mut dyn FnMut(RecordId, &Record),
+) -> bool {
+    let Some(rows) = rows else {
+        return false;
+    };
+    for (id, rec) in &rows {
+        visit(*id, rec);
+    }
+    true
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1187,5 +1247,159 @@ mod tests {
             }]),
         );
         assert_eq!(rows.len(), 500);
+    }
+
+    /// A source with covering access and nothing else of note: rows come
+    /// back owned, so the borrowed-row path runs through the trait's default
+    /// `visit_covering_*` — the shape every non-engine source has.
+    struct CoveringSource(MemSource);
+
+    impl CoveringSource {
+        fn rows_where(
+            &self,
+            keep: impl Fn(&Value) -> bool,
+            field: &str,
+        ) -> Vec<(RecordId, Record)> {
+            self.0
+                .records
+                .iter()
+                .filter(|(_, r)| r.get(field).is_some_and(&keep))
+                .map(|(id, r)| (*id, r.clone()))
+                .collect()
+        }
+    }
+
+    impl Source for CoveringSource {
+        fn fetch(&mut self, c: &str, id: RecordId) -> Result<Option<Record>> {
+            self.0.fetch(c, id)
+        }
+        fn all_ids(&mut self, c: &str) -> Result<Vec<RecordId>> {
+            self.0.all_ids(c)
+        }
+        fn index_lookup(&mut self, c: &str, f: &str, k: &Value) -> Result<Option<Vec<RecordId>>> {
+            self.0.index_lookup(c, f, k)
+        }
+        fn index_range(
+            &mut self,
+            c: &str,
+            f: &str,
+            lo: Bound<&Value>,
+            hi: Bound<&Value>,
+        ) -> Result<Option<Vec<RecordId>>> {
+            self.0.index_range(c, f, lo, hi)
+        }
+        fn covering_lookup(
+            &mut self,
+            _c: &str,
+            field: &str,
+            key: &Value,
+            _needed: &[String],
+        ) -> Result<Option<Vec<(RecordId, Record)>>> {
+            Ok(Some(self.rows_where(|v| v == key, field)))
+        }
+        fn covering_range(
+            &mut self,
+            _c: &str,
+            field: &str,
+            lo: Bound<&Value>,
+            hi: Bound<&Value>,
+            _needed: &[String],
+        ) -> Result<Option<Vec<(RecordId, Record)>>> {
+            use std::ops::RangeBounds;
+            Ok(Some(self.rows_where(|v| (lo, hi).contains(v), field)))
+        }
+    }
+
+    /// What `Project{Filter{leaf}}` produced before covering rows were
+    /// filtered in place: the leaf's batches, masked, emptied batches
+    /// dropped, then narrowed — counted the way `execute` counts them.
+    fn operator_by_operator(
+        leaf: &PhysicalOp,
+        predicate: &Expr,
+        fields: Option<&[&str]>,
+        src: &mut CoveringSource,
+    ) -> (Vec<(RecordId, Record)>, ExecStats) {
+        let mut stats = ExecStats::default();
+        let program = adabt_ir::vm::Program::compile(predicate);
+        let mut rows = Vec::new();
+        for mut b in run(leaf, src, &mut stats, &ExecBudget::default()).unwrap() {
+            let keep: Vec<bool> = b.records.iter().map(|r| program.matches(r)).collect();
+            b.retain_mask(&keep);
+            if b.is_empty() {
+                continue;
+            }
+            stats.batches += 1;
+            for (id, mut rec) in b.into_rows() {
+                if let Some(f) = fields {
+                    rec.retain_fields(f);
+                }
+                rows.push((id, rec));
+            }
+        }
+        stats.rows_returned = rows.len() as u64;
+        (rows, stats)
+    }
+
+    #[test]
+    fn covering_rows_filtered_in_place_match_the_operators_run_one_by_one() {
+        // Bucket 0 of 12,000 rows is 2,400 rows: three unfiltered batches.
+        // The predicate keeps the first 100 and the last 100 and empties the
+        // middle batch, so batching by survivors alone would yield one batch
+        // where the operators yield two — the stats would differ.
+        let predicate = Expr::And(vec![
+            Expr::eq("bucket", 0i64),
+            Expr::Or(vec![
+                Expr::cmp("id", CmpOp::Lt, 500u64),
+                Expr::cmp("id", CmpOp::Ge, 11_500u64),
+            ]),
+        ]);
+        let needed: Vec<String> = ["bucket", "id", "name"].map(String::from).to_vec();
+        let leaves = [
+            PhysicalOp::CoveringLookup {
+                collection: "c".into(),
+                field: "bucket".into(),
+                key: Value::I64(0),
+                needed: needed.clone(),
+            },
+            PhysicalOp::CoveringRange {
+                collection: "c".into(),
+                field: "bucket".into(),
+                lo: Bound::Included(Value::I64(0)),
+                hi: Bound::Excluded(Value::I64(1)),
+                needed,
+            },
+        ];
+        for leaf in leaves {
+            for projection in [None, Some(vec!["name".to_string()])] {
+                let mut src = CoveringSource(MemSource::new(12_000));
+                let filtered = PhysicalOp::Filter {
+                    input: Box::new(leaf.clone()),
+                    predicate: predicate.clone(),
+                };
+                let root = match &projection {
+                    Some(fields) => PhysicalOp::Project {
+                        input: Box::new(filtered),
+                        fields: fields.clone(),
+                    },
+                    None => filtered,
+                };
+                let plan = PhysicalPlan {
+                    root,
+                    rationale: String::new(),
+                };
+                let mut stats = ExecStats::default();
+                let rows = execute(&plan, &mut src, &mut stats).unwrap();
+
+                let refs: Option<Vec<&str>> = projection
+                    .as_ref()
+                    .map(|f| f.iter().map(String::as_str).collect());
+                let (want_rows, want_stats) =
+                    operator_by_operator(&leaf, &predicate, refs.as_deref(), &mut src);
+                assert_eq!(rows.len(), 200);
+                assert_eq!(rows, want_rows, "{leaf:?} {projection:?}");
+                assert_eq!(stats, want_stats, "{leaf:?} {projection:?}");
+                assert_eq!(stats.batches, 2);
+            }
+        }
     }
 }

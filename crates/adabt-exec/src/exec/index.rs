@@ -3,12 +3,17 @@
 //! answer when the index the planner chose is not there, and counts the miss.
 
 use adabt_core::error::Result;
+use adabt_core::ids::RecordId;
+use adabt_core::record::Record;
 use adabt_core::value::Value;
+use adabt_ir::vm::Program;
+use adabt_ir::Expr;
 use std::ops::Bound;
 
 use super::access::scan_heap;
 use super::{batches_of, fetch_batches, ExecBudget, ExecStats, Source};
-use crate::batch::RecordBatch;
+use crate::batch::{RecordBatch, BATCH_SIZE};
+use crate::physical::PhysicalOp;
 
 pub(super) fn index_lookup<S: Source>(
     collection: &str,
@@ -65,6 +70,109 @@ pub(super) fn covering_lookup<S: Source>(
                 None => scan_heap(collection, src, stats, budget),
             }
         }
+    }
+}
+
+/// A `Filter` over a covering access — and the `Project` above it, when
+/// there is one — evaluated against the index's stored rows while they are
+/// still borrowed, so a row is copied only if it survives and only in the
+/// fields the plan returns. `None` when `input` is not a covering access or
+/// no covering index can serve it; the caller then runs the operators one by
+/// one, which is the same answer at the cost of cloning every stored row.
+///
+/// The answer is the separate operators' answer, batch for batch. Rows are
+/// visited in the order the covering operator would have returned them, and
+/// batches are cut where `batches_of` would have cut the unfiltered rows, so
+/// the filter's dropping of emptied batches — and with it the `batches`
+/// count — is unchanged. `Record::project` on the borrowed row equals
+/// `Record::retain_fields` on an owned copy of it. Stats count what the
+/// covering operator counts: one probe, and every row visited as scanned.
+/// Nothing is counted on a miss, because the caller's fallback counts it.
+pub(super) fn covering_filtered<S: Source>(
+    input: &PhysicalOp,
+    predicate: &Expr,
+    projection: Option<&[&str]>,
+    src: &mut S,
+    stats: &mut ExecStats,
+) -> Result<Option<Vec<RecordBatch>>> {
+    let program = Program::compile(predicate);
+    let mut sink = FilteredBatches::new(&program, projection);
+    let served = match input {
+        PhysicalOp::CoveringLookup {
+            collection,
+            field,
+            key,
+            needed,
+        } => src.visit_covering_lookup(collection, field, key, needed, &mut |id, rec| {
+            sink.offer(id, rec)
+        })?,
+        PhysicalOp::CoveringRange {
+            collection,
+            field,
+            lo,
+            hi,
+            needed,
+        } => src.visit_covering_range(
+            collection,
+            field,
+            lo.as_ref(),
+            hi.as_ref(),
+            needed,
+            &mut |id, rec| sink.offer(id, rec),
+        )?,
+        _ => return Ok(None),
+    };
+    if !served {
+        return Ok(None);
+    }
+    stats.index_probes += 1;
+    stats.rows_scanned += sink.visited as u64;
+    Ok(Some(sink.finish()))
+}
+
+/// Batches built from lent rows: what `Filter` (and `Project`) would have
+/// produced from the same rows handed over in `batches_of`'s batches.
+struct FilteredBatches<'a> {
+    program: &'a Program,
+    projection: Option<&'a [&'a str]>,
+    visited: usize,
+    current: RecordBatch,
+    done: Vec<RecordBatch>,
+}
+
+impl<'a> FilteredBatches<'a> {
+    fn new(program: &'a Program, projection: Option<&'a [&'a str]>) -> Self {
+        Self {
+            program,
+            projection,
+            visited: 0,
+            current: RecordBatch::new(),
+            done: Vec::new(),
+        }
+    }
+
+    fn offer(&mut self, id: RecordId, rec: &Record) {
+        // An unfiltered batch would have ended here, so this one ends here
+        // too — unless the filter left it empty, and `Filter` drops those.
+        if self.visited > 0 && self.visited.is_multiple_of(BATCH_SIZE) && !self.current.is_empty() {
+            self.done.push(std::mem::take(&mut self.current));
+        }
+        self.visited += 1;
+        if !self.program.matches(rec) {
+            return;
+        }
+        let row = match self.projection {
+            Some(fields) => rec.project(fields),
+            None => rec.clone(),
+        };
+        self.current.push(id, row);
+    }
+
+    fn finish(mut self) -> Vec<RecordBatch> {
+        if !self.current.is_empty() {
+            self.done.push(self.current);
+        }
+        self.done
     }
 }
 

@@ -88,6 +88,14 @@ files are new (`base.adabt`, `superseded-log/`).
   narrows owned rows in place: tuned indexed range went from ~1.3× slower
   than SQLite to faster (1.3–2.9× across runs), tuned indexed equality from
   1.7–2.9× slower to ~1.6×. `Record::retain_fields` is new.
+- **Covering rows are filtered before they are copied, answers and stats
+  unchanged.** The executor runs `Filter` and `Project` on the covering
+  index's stored rows in place, so a rejected row is never cloned and the
+  filtered-only field never is: equality allocates 4.0 instead of 5.0 times
+  per returned row and runs roughly 10–25% faster, ~1.4–1.5× behind SQLite in
+  the quietest runs. Range is unchanged. New `Source::visit_covering_lookup`
+  and `visit_covering_range` lend the rows; their defaults wrap the existing
+  methods, so other sources need no change.
 - **Minimum supported Rust is 1.88**, the version the dependency tree has
   actually required; 1.82 was never buildable.
 - **The check gate** (`scripts/check.sh`) now also covers the telemetry
