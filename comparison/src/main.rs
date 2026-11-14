@@ -2,8 +2,8 @@
 //!
 //! # Why this exists
 //!
-//! `docs/roadmap.md` sets Track D's finish line as "there is a workload where
-//! it is the right answer, demonstrably." Every performance number this
+//! `docs/roadmap.md` sets the "Good" goal's finish line as "there is a
+//! workload where it is the right answer, demonstrably." Every performance number this
 //! project has produced so far compares aDaBt against its own past. That can
 //! show a change helped; it cannot show whether the result is any good.
 //!
@@ -36,7 +36,7 @@
 //! neither can be built or run in this environment: RocksDB's Rust bindings
 //! need `cmake` and `libclang`, PostgreSQL needs a server installed, and
 //! nothing here has root. Reporting numbers for either would mean inventing
-//! them. The gap is recorded in `docs/roadmap.md` instead.
+//! them. The gap is recorded in `docs/roadmap.md` ("More witnesses") instead.
 
 use adabt_core::ids::RecordId;
 use adabt_core::index_kind::IndexKind;
@@ -98,6 +98,9 @@ struct Row {
     note: &'static str,
 }
 
+/// One comparison workload: its name and the function that measures it.
+type Stage = (&'static str, fn(u64) -> Row);
+
 fn main() {
     // Fail-fast witness harness: `--witness postgres|rocksdb` must not silently
     // become a SQLite-only run. If the requested witness cannot be reached or
@@ -114,10 +117,17 @@ fn main() {
                 }
                 // Try a TCP connect to the Postgres host to fail fast before
                 // running the 8-workload harness against the wrong witness.
-                if let Some(host) = url.split('@').last().and_then(|s| s.split('/').next()).and_then(|s| s.split(':').next()) {
+                if let Some(host) = url
+                    .split('@')
+                    .next_back()
+                    .and_then(|s| s.split('/').next())
+                    .and_then(|s| s.split(':').next())
+                {
                     let addr = format!("{}:5432", host);
                     if std::net::TcpStream::connect(&addr).is_err() {
-                        eprintln!("--witness postgres: cannot connect to {addr} (DATABASE_URL={url})");
+                        eprintln!(
+                            "--witness postgres: cannot connect to {addr} (DATABASE_URL={url})"
+                        );
                         std::process::exit(2);
                     }
                 }
@@ -138,11 +148,13 @@ fn main() {
         }
     }
 
-    let rows: u64 = std::env::args()
-        .skip_while(|a| a != "--size")
-        .nth(1)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(100_000);
+    let rows: u64 = match std::env::args().skip_while(|a| a != "--size").nth(1) {
+        None => 100_000,
+        Some(v) => v.parse().unwrap_or_else(|_| {
+            eprintln!("--size expects a number, got {v:?}");
+            std::process::exit(2)
+        }),
+    };
 
     println!("# aDaBt vs SQLite — {rows} rows\n");
 
@@ -150,7 +162,7 @@ fn main() {
     // the end, and this project has already lost one benchmark run to a
     // timeout with nothing to show for it (`docs/history/m36-notes.md`). A harness
     // that dies without evidence is worse than no harness.
-    let stages: [(&str, fn(u64) -> Row); 8] = [
+    let stages: [Stage; 8] = [
         ("bulk load", bulk_load),
         ("point lookup", point_lookup),
         ("indexed equality", indexed_equality),
@@ -163,9 +175,7 @@ fn main() {
     let mut out: Vec<Row> = Vec::new();
     // `--only NAME` runs a single workload (matched on its stage name), for
     // iterating on one row of the table without paying for the other seven.
-    let only = std::env::args()
-        .skip_while(|a| a != "--only")
-        .nth(1);
+    let only = std::env::args().skip_while(|a| a != "--only").nth(1);
     let total = stages.len();
     for (i, (name, f)) in stages.iter().enumerate() {
         if only.as_deref().is_some_and(|o| !name.contains(o)) {
@@ -188,8 +198,8 @@ fn main() {
     };
 
     println!(
-        "{:<24} {:>11} {:>11} {:>11} {:>12}  {}",
-        "workload", "aDaBt L0", "aDaBt tuned", "SQLite", "tuned vs sql", "note"
+        "{:<24} {:>11} {:>11} {:>11} {:>12}  note",
+        "workload", "aDaBt L0", "aDaBt tuned", "SQLite", "tuned vs sql"
     );
     println!("{}", "-".repeat(115));
     for r in &out {
@@ -203,7 +213,14 @@ fn main() {
                 r.tuned_ns.to_string()
             },
             r.sqlite_ns,
-            verdict(if r.tuned_ns == 0 { r.adabt_ns } else { r.tuned_ns }, r.sqlite_ns),
+            verdict(
+                if r.tuned_ns == 0 {
+                    r.adabt_ns
+                } else {
+                    r.tuned_ns
+                },
+                r.sqlite_ns
+            ),
             r.note
         );
     }
@@ -211,7 +228,13 @@ fn main() {
     println!("\nns per operation, best of several passes. `tuned` is after optimize()");
     println!("at a level that permits column stores and materialized views; `-` means");
     println!("the workload is a write path, where those do not apply.");
-    let best = |r: &Row| if r.tuned_ns == 0 { r.adabt_ns } else { r.tuned_ns };
+    let best = |r: &Row| {
+        if r.tuned_ns == 0 {
+            r.adabt_ns
+        } else {
+            r.tuned_ns
+        }
+    };
     let losses = out.iter().filter(|r| r.sqlite_ns < best(r)).count();
     println!(
         "\nAt its best configuration aDaBt wins {} of {} and loses {}.",
@@ -293,7 +316,6 @@ fn fill_sqlite(c: &mut rusqlite::Connection, rows: u64) {
     tx.commit().expect("commit");
 }
 
-
 /// Run the same plan against an aDaBt that has been allowed to optimize.
 ///
 /// Level 4 is the lowest that permits a column store and a materialized
@@ -303,7 +325,13 @@ fn fill_sqlite(c: &mut rusqlite::Connection, rows: u64) {
 /// what lets an indexed lookup skip its fetches entirely, which matters
 /// against an opponent whose rows are packed pages. Both sides get the
 /// indexes they would actually have.
-fn tuned_query(tag: &str, rows: u64, plan: &LogicalPlan, reps: u32, indexes: &[(&str, IndexKind)]) -> u64 {
+fn tuned_query(
+    tag: &str,
+    rows: u64,
+    plan: &LogicalPlan,
+    reps: u32,
+    indexes: &[(&str, IndexKind)],
+) -> u64 {
     let (mut db, p) = fresh_adabt(tag, 5);
     fill_adabt(&mut db, rows);
     for (field, kind) in indexes {
@@ -335,7 +363,8 @@ fn tuned_query(tag: &str, rows: u64, plan: &LogicalPlan, reps: u32, indexes: &[(
         }
         db.advance_experiments().expect("advance");
         if Instant::now() > settle_deadline {
-            db.abort_experiment("comparison harness settle deadline").expect("abort");
+            db.abort_experiment("comparison harness settle deadline")
+                .expect("abort");
             break;
         }
     }
@@ -409,7 +438,9 @@ fn point_lookup(rows: u64) -> Row {
         fill_sqlite(&mut c, rows);
         (c, sp)
     };
-    let mut stmt = c.prepare("SELECT country, age, name FROM users WHERE id = ?1").unwrap();
+    let mut stmt = c
+        .prepare("SELECT country, age, name FROM users WHERE id = ?1")
+        .unwrap();
     let sqlite_ns = best_of(5, probes.len() as u64, || {
         for i in &probes {
             let r: (String, i64, String) = stmt
@@ -451,7 +482,8 @@ fn indexed_equality(rows: u64) -> Row {
     let (c, sp) = {
         let (mut c, sp) = fresh_sqlite("q");
         fill_sqlite(&mut c, rows);
-        c.execute_batch("CREATE INDEX idx_country ON users(country);").expect("index");
+        c.execute_batch("CREATE INDEX idx_country ON users(country);")
+            .expect("index");
         (c, sp)
     };
     let mut stmt = c
@@ -460,7 +492,9 @@ fn indexed_equality(rows: u64) -> Row {
     let sqlite_ns = best_of(5, 200, || {
         for _ in 0..200 {
             let n: usize = stmt
-                .query_map(["NO"], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                .query_map(["NO"], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                })
                 .unwrap()
                 .count();
             std::hint::black_box(n);
@@ -482,10 +516,7 @@ fn indexed_equality(rows: u64) -> Row {
 fn full_scan_count(rows: u64) -> Row {
     let (mut db, p) = fresh_adabt("scan", 0);
     fill_adabt(&mut db, rows);
-    let plan = LogicalPlan::new(LogicalOp::scan("users").aggregate(
-        vec![],
-        vec![Agg::count("n")],
-    ));
+    let plan = LogicalPlan::new(LogicalOp::scan("users").aggregate(vec![], vec![Agg::count("n")]));
     db.query(&plan).expect("warm");
     // Per QUERY, all three engines: this workload's question is "what does it
     // cost to count the table", and per-row numbers hide what a derived
@@ -528,10 +559,9 @@ fn full_scan_count(rows: u64) -> Row {
 fn grouped_aggregate(rows: u64) -> Row {
     let (mut db, p) = fresh_adabt("group", 0);
     fill_adabt(&mut db, rows);
-    let plan = LogicalPlan::new(LogicalOp::scan("users").aggregate(
-        vec!["country".into()],
-        vec![Agg::count("n")],
-    ));
+    let plan = LogicalPlan::new(
+        LogicalOp::scan("users").aggregate(vec!["country".into()], vec![Agg::count("n")]),
+    );
     db.query(&plan).expect("warm");
     // Per QUERY, all three engines — same reasoning as `full_scan_count`.
     let adabt_ns = best_of(5, 20, || {
@@ -573,7 +603,8 @@ fn grouped_aggregate(rows: u64) -> Row {
 fn range_scan(rows: u64) -> Row {
     let (mut db, p) = fresh_adabt("range", 0);
     fill_adabt(&mut db, rows);
-    db.create_index("users", "age", IndexKind::BTree).expect("index");
+    db.create_index("users", "age", IndexKind::BTree)
+        .expect("index");
     let plan = LogicalPlan::new(
         LogicalOp::scan("users")
             .filter(Expr::And(vec![
@@ -592,7 +623,8 @@ fn range_scan(rows: u64) -> Row {
     let (c, sp) = {
         let (mut c, sp) = fresh_sqlite("r");
         fill_sqlite(&mut c, rows);
-        c.execute_batch("CREATE INDEX idx_age ON users(age);").expect("index");
+        c.execute_batch("CREATE INDEX idx_age ON users(age);")
+            .expect("index");
         (c, sp)
     };
     let mut stmt = c
@@ -600,7 +632,10 @@ fn range_scan(rows: u64) -> Row {
         .unwrap();
     let sqlite_ns = best_of(5, 200, || {
         for _ in 0..200 {
-            let n = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap().count();
+            let n = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .count();
             std::hint::black_box(n);
         }
     });

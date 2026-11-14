@@ -25,12 +25,16 @@ fn main() {
             let c = ["NO", "SE", "DK", "FI", "IS", "NL", "BE", "IE"][(i % 8) as usize];
             (
                 RecordId(i),
-                Record::new().with("id", i).with("country", c).with("age", (18 + i % 60) as i64),
+                Record::new()
+                    .with("id", i)
+                    .with("country", c)
+                    .with("age", (18 + i % 60) as i64),
             )
         })
         .collect();
     db.insert_batch("users", batch).unwrap();
-    db.create_index("users", "country", IndexKind::Hash).unwrap();
+    db.create_index("users", "country", IndexKind::Hash)
+        .unwrap();
 
     let plan = LogicalPlan::new(
         LogicalOp::scan("users")
@@ -43,7 +47,9 @@ fn main() {
     println!("before optimize: {:?} for {n} rows", t.elapsed());
     println!("last_stats: {:?}", db.last_exec_stats());
     println!("plan:\n{}", db.explain(&plan));
-    for _ in 0..40 { db.query(&plan).unwrap(); }
+    for _ in 0..40 {
+        db.query(&plan).unwrap();
+    }
     let report = db.optimize().unwrap();
     println!("\noptimize report: {:?}", report.applied);
     println!("live experiments: {}", db.experiments().count());
@@ -51,7 +57,9 @@ fn main() {
     // Settle any experiment like the harness now does.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while db.experiments().next().is_some() {
-        for _ in 0..50 { let _ = db.query(&plan); }
+        for _ in 0..50 {
+            let _ = db.query(&plan);
+        }
         db.advance_experiments().unwrap();
         if std::time::Instant::now() > deadline {
             db.abort_experiment("probe deadline").unwrap();
@@ -60,7 +68,11 @@ fn main() {
     }
     println!("finished experiments: {}", db.finished_experiments().len());
     for e in db.finished_experiments() {
-        println!("  verdict: {} -> {:?}", e.experiment.decision.optimization, e.phase());
+        println!(
+            "  verdict: {} -> {:?}",
+            e.experiment.decision.optimization,
+            e.phase()
+        );
     }
 
     let t = std::time::Instant::now();
@@ -77,14 +89,20 @@ fn main() {
     );
     let t = std::time::Instant::now();
     let n = db.query(&gplan).unwrap().len();
-    println!("\ngroup-by after optimize: {:?} for {n} groups", t.elapsed());
+    println!(
+        "\ngroup-by after optimize: {:?} for {n} groups",
+        t.elapsed()
+    );
     for k in 1..=3 {
         let t = std::time::Instant::now();
         db.query(&gplan).unwrap();
         println!("group-by repeat #{k}: {:?}", t.elapsed());
     }
     // Same question without any tuning, as a control.
-    println!("matviews before any of the above:\n{}", db.explain_materialized_views());
+    println!(
+        "matviews before any of the above:\n{}",
+        db.explain_materialized_views()
+    );
     println!("last_stats: {:?}", db.last_exec_stats());
     println!("plan:\n{}", db.explain(&gplan));
     println!("\nmaterialized views:\n{}", db.explain_materialized_views());

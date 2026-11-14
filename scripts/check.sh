@@ -30,8 +30,9 @@ step "loom model checks (adabt-storage)"
 # docs/limitations.md.
 cargo test -p adabt-storage --features loom --lib loom_tests
 
-step "comparison harness builds (separate workspace)"
-cargo build --manifest-path comparison/Cargo.toml --release
+step "comparison harness (separate workspace)"
+cargo fmt --manifest-path comparison/Cargo.toml -- --check
+cargo clippy --manifest-path comparison/Cargo.toml --all-targets -- -D warnings
 
 step "docs"
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --quiet
