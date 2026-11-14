@@ -19,7 +19,7 @@ cargo test -p adabt-storage --features loom --lib loom_tests   # TxId allocator 
 cargo doc --workspace --no-deps
 ```
 
-Separate workspace harness (planned witnesses are *not yet real drivers* — harness is fail-fast until `postgres`/`rocksdb` deps exist, see `comparison/src/main.rs:8`):
+Separate workspace harness (planned witnesses are *not yet real drivers* — harness is fail-fast until `postgres`/`rocksdb` deps exist, see the header of `comparison/src/main.rs`):
 
 ```sh
 cargo run --manifest-path comparison/Cargo.toml --release              # SQLite witness (bundled, always)

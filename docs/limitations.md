@@ -5,7 +5,7 @@ format stability are not promised until beta (`docs/semver.md` describes the
 version gate that exists today).
 
 This file is the authoritative list of what aDaBt does not do. Where another
-document (including `docs/roadmap.md`'s "100%" scores) seems to say more, this
+document (including the goal status in `docs/roadmap.md`) seems to say more, this
 file wins.
 
 ## What it is

@@ -3,7 +3,7 @@
 aDaBt against SQLite, same records, same queries, matched durability posture
 (`synchronous = OFF` against `Durability::Relaxed`; prepared statements on both
 sides; neither side warmed differently). This is the measurement
-`docs/roadmap.md` asked for before any further optimization work, and it found
+the roadmap asked for before any further optimization work, and it found
 exactly the kind of thing internal benchmarking cannot find — including one
 regression the project's own optimizer was committing against itself, which is
 also fixed in this document.

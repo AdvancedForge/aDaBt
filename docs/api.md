@@ -24,7 +24,7 @@ db.policy() -> &Policy; db.telemetry() -> Snapshot; db.last_exec_stats() -> Exec
 
 `Transaction` is a value buffering writes against a fixed `Snapshot`; `commit` is all-or-nothing, sorted-key order, first-committer-wins, `Strict` also validates point reads (write-skew closed, predicate phantoms documented as not yet prevented — `serializable.rs:phantom`).
 
-**DDL is not transactional** (`wal.rs:61`): `CreateCollection`/`DropCollection`/`AlterSchemaInPlace`/`AdoptMigration` commit on write, not rolled back with a `Transaction`. Catalog v4 persists `delta_encoding`/`thread_per_core`.
+**DDL is not transactional** (see `WalOp` in `adabt-storage`): `CreateCollection`/`DropCollection`/`AlterSchemaInPlace`/`AdoptMigration` commit on write, not rolled back with a `Transaction`. Catalog v4 persists `delta_encoding`/`thread_per_core`.
 
 ## Sharded (`ShardedDatabase`)
 

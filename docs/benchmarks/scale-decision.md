@@ -1,6 +1,6 @@
 # The scale question, decided
 
-`docs/roadmap.md` Stage 3 forced a choice: is this engine for datasets that
+Stage 3 of the roadmap (`docs/history/roadmap-stages.md`) forced a choice: is this engine for datasets that
 fit in RAM, or not? Everything after the decision — thread-per-core's
 per-core memory model, the value of further layout work — assumes an answer.
 This document is that answer, with the numbers that forced it.
