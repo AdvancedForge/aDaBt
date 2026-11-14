@@ -56,6 +56,10 @@ pub struct WorkloadMix {
     pub unfiltered_scans: u64,
     /// Reads that constrained a field to a range.
     pub ranges: u64,
+    /// Reads that reached stored records, which is every read the result
+    /// cache did not answer: what a change to how records are stored, such
+    /// as compressing them, makes cheaper or dearer.
+    pub record_reads: u64,
 }
 
 impl WorkloadMix {
@@ -120,6 +124,7 @@ impl WorkloadMix {
             filtered_scans: filtered.saturating_sub(served + cache_answered),
             unfiltered_scans: unfiltered - identity,
             ranges,
+            record_reads: reads - cache_answered.min(reads),
         }
     }
 
@@ -150,6 +155,12 @@ impl WorkloadMix {
     /// Share of operations that constrained a field to a range.
     pub fn range_share(&self) -> f64 {
         self.share(self.ranges)
+    }
+
+    /// Share of operations that read stored records, by any path but the
+    /// result cache.
+    pub fn record_read_share(&self) -> f64 {
+        self.share(self.record_reads)
     }
 }
 
@@ -209,6 +220,29 @@ mod tests {
         assert!((mix.scan_share() - 0.6).abs() < 1e-9, "{mix:?}");
         assert!((mix.range_share() - 0.4).abs() < 1e-9, "{mix:?}");
         assert_eq!(mix.identity_share(), 0.0);
+    }
+
+    #[test]
+    fn every_read_but_a_cache_hit_reads_records_and_writes_do_not() {
+        let p = CollectingProbe::new();
+        for i in 0..80 {
+            query(&p, 1, 20, &[("country", true)], i % 2 == 0);
+            p.record(Event::CacheProbe {
+                name: "result_cache",
+                hit: i < 20,
+            });
+        }
+        for _ in 0..20 {
+            p.record(Event::Op {
+                collection: "users",
+                kind: OpKind::Insert,
+                shape: QueryShape::UNKNOWN,
+                nanos: 1_000,
+                rows: 1,
+            });
+        }
+        let mix = WorkloadMix::of(&p.snapshot());
+        assert!((mix.record_read_share() - 0.6).abs() < 1e-9, "{mix:?}");
     }
 
     #[test]
