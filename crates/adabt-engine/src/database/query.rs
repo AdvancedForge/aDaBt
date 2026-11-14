@@ -9,9 +9,9 @@ use adabt_core::record::Record;
 use adabt_core::store::LogicalStore;
 use adabt_exec::exec::{execute_with_budget, ExecBudget, ExecStats};
 use adabt_exec::physical::PhysicalPlan;
-use adabt_exec::planner::{plan as make_plan, PlanContext};
+use adabt_exec::planner::{plan as make_plan, PlanContext, PlanDecision};
 use adabt_ir::plan::{LogicalOp, LogicalPlan};
-use adabt_ir::QueryKey;
+use adabt_ir::{QueryKey, QueryShape};
 use adabt_telemetry::event::Event;
 use adabt_telemetry::Probe;
 #[cfg(feature = "loom")]
@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::{Database, QueryMode, SlowQueryEvent};
+use crate::experiment::Candidates;
 
 /// How many `Join` nodes appear anywhere in `op` — `query_join`'s check for
 /// "at most one," since `LogicalOp::contains_join` only ever answers whether
@@ -32,58 +33,134 @@ fn count_joins(op: &adabt_ir::plan::LogicalOp) -> usize {
     this + op.children().iter().map(|c| count_joins(c)).sum::<usize>()
 }
 
+/// What a running experiment hides from the planner, and which experiment's
+/// candidates it may nonetheless see.
+#[derive(Clone, Copy)]
+struct PlannerMask<'a> {
+    hidden: Option<&'a Candidates>,
+    revealed: Option<u64>,
+}
+
+impl PlannerMask<'_> {
+    /// Whether the planner must not see this index.
+    fn hides_index(&self, collection: &str, field: &str, kind: IndexKind) -> bool {
+        self.hidden
+            .is_some_and(|h| h.hides_index(self.revealed, collection, field, kind))
+    }
+
+    /// Whether the planner must not see this collection's column store.
+    fn hides_column_store(&self, collection: &str) -> bool {
+        self.hidden
+            .is_some_and(|h| h.hides_column_store(self.revealed, collection))
+    }
+}
+
+/// The indexes the planner treats specially rather than as plain field lookups.
+#[derive(Default)]
+struct SpecialIndexes<'a> {
+    composite: HashMap<&'a str, Vec<Vec<String>>>,
+    covering: HashMap<&'a str, Vec<adabt_exec::planner::CoveringEntry<'a>>>,
+    partial: HashMap<&'a str, Vec<(&'a str, adabt_ir::Expr, IndexKind)>>,
+}
+
 impl Database {
     // -- queries -----------------------------------------------------------
 
     fn plan_context(&self) -> PlanContext<'_> {
-        let masked = self.experiments.masked();
-        let revealed = self.experiments.revealed();
-        let mut m = HashMap::new();
+        let mask = PlannerMask {
+            hidden: self.experiments.masked(),
+            revealed: self.experiments.revealed(),
+        };
+        let indexes = self.visible_indexes(mask);
+        let cardinality = self.index_cardinality();
+        let columnar = self.visible_column_stores(mask);
+        let columnar_fields = self.visible_columnar_fields(mask);
+        let SpecialIndexes {
+            composite,
+            covering,
+            partial,
+        } = self.special_indexes(mask);
+        let row_counts = self.row_counts(indexes.keys().copied().chain(columnar.iter().copied()));
+        PlanContext {
+            indexes,
+            composite,
+            covering,
+            partial,
+            columnar,
+            columnar_fields,
+            cardinality,
+            row_counts,
+        }
+    }
+
+    /// Every index per collection, as `(field, kind)`, minus those an experiment hides.
+    fn visible_indexes(&self, mask: PlannerMask<'_>) -> HashMap<&str, Vec<(&str, IndexKind)>> {
+        self.derived
+            .indexes
+            .iter()
+            .map(|(c, list)| {
+                let visible = list
+                    .iter()
+                    .map(|i| (i.field(), i.kind()))
+                    .filter(|(f, k)| !mask.hides_index(c, f, *k))
+                    .collect();
+                (c.as_str(), visible)
+            })
+            .collect()
+    }
+
+    /// The distinct key count of every index, per collection and field.
+    fn index_cardinality(&self) -> HashMap<&str, HashMap<&str, u64>> {
         // Selectivity estimates, read where they are cheapest: an index's
         // own key count. Only indexed fields get one, which is the right
         // boundary — the planner consults cardinality to choose between
         // serving structures, never to invent one.
-        let mut card: HashMap<&str, HashMap<&str, u64>> = HashMap::new();
-        for (c, list) in &self.derived.indexes {
-            m.insert(
-                c.as_str(),
-                list.iter()
-                    .map(|i| (i.field(), i.kind()))
-                    .filter(|(f, k)| !masked.is_some_and(|h| h.hides_index(revealed, c, f, *k)))
-                    .collect(),
-            );
-            card.insert(
-                c.as_str(),
-                list.iter()
+        self.derived
+            .indexes
+            .iter()
+            .map(|(c, list)| {
+                let counts = list
+                    .iter()
                     .map(|i| (i.field(), i.key_count() as u64))
-                    .collect(),
-            );
-        }
+                    .collect();
+                (c.as_str(), counts)
+            })
+            .collect()
+    }
+
+    /// The collections with a column store no experiment hides.
+    fn visible_column_stores(&self, mask: PlannerMask<'_>) -> Vec<&str> {
         // Filtered per collection, not wiped wholesale: an experiment
         // trialling a column store on one collection must not blind the
         // planner to another collection's already-promoted one.
-        let columnar: Vec<&str> = self
-            .derived
+        self.derived
             .columns
             .keys()
             .map(|k| k.as_str())
-            .filter(|c| !masked.is_some_and(|h| h.hides_column_store(revealed, c)))
-            .collect();
+            .filter(|c| !mask.hides_column_store(c))
+            .collect()
+    }
+
+    /// The fields each visible column store can reconstruct.
+    fn visible_columnar_fields(&self, mask: PlannerMask<'_>) -> HashMap<&str, Vec<String>> {
         // And which fields each of those stores can reconstruct — the
         // membership test a top-K decision needs before it may order by a
         // field, because a columnar projection silently omits the rest.
-        let columnar_fields: HashMap<&str, Vec<String>> = self
-            .derived
+        self.derived
             .columns
             .iter()
-            .filter(|(c, _)| !masked.is_some_and(|h| h.hides_column_store(revealed, c)))
+            .filter(|(c, _)| !mask.hides_column_store(c))
             .map(|(c, store)| {
                 (
                     c.as_str(),
                     store.fields().into_iter().map(String::from).collect(),
                 )
             })
-            .collect();
+            .collect()
+    }
+
+    /// The partial, covering and composite indexes, sorted by what they are.
+    fn special_indexes(&self, mask: PlannerMask<'_>) -> SpecialIndexes<'_> {
         // Composite indexes, recognised by their NUL-joined name. Reported
         // separately because the planner asks a different question of them.
         //
@@ -94,9 +171,7 @@ impl Database {
         // which any record has. The planner would then choose it for a
         // predicate it cannot serve and get nothing back. Exactly the failure
         // the composite restore path already had once, in a new place.
-        let mut composite: HashMap<&str, Vec<Vec<String>>> = HashMap::new();
-        let mut covering: HashMap<&str, Vec<adabt_exec::planner::CoveringEntry>> = HashMap::new();
-        let mut partial: HashMap<&str, Vec<(&str, adabt_ir::Expr, IndexKind)>> = HashMap::new();
+        let mut out = SpecialIndexes::default();
         for (c, list) in &self.derived.indexes {
             for i in list {
                 let name = i.field();
@@ -106,45 +181,41 @@ impl Database {
                     // using it would mean reading a subset as if it were the
                     // whole collection.
                     if let Ok(cond) = crate::exprcodec::decode_expr_hex(encoded) {
-                        if !masked.is_some_and(|h| h.hides_index(revealed, c, name, i.kind())) {
-                            partial
+                        if !mask.hides_index(c, name, i.kind()) {
+                            out.partial
                                 .entry(c.as_str())
                                 .or_default()
                                 .push((name, cond, i.kind()));
                         }
                     }
                 } else if !i.covers().is_empty() {
-                    if !masked.is_some_and(|h| h.hides_index(revealed, c, name, i.kind())) {
-                        covering.entry(c.as_str()).or_default().push((
+                    if !mask.hides_index(c, name, i.kind()) {
+                        out.covering.entry(c.as_str()).or_default().push((
                             name,
                             i.covers().to_vec(),
                             i.kind(),
                         ));
                     }
                 } else if name.contains(adabt_index::COMPOSITE_SEP) {
-                    composite
+                    out.composite
                         .entry(c.as_str())
                         .or_default()
                         .push(adabt_index::composite_fields(name));
                 }
             }
         }
-        let mut row_counts: HashMap<&str, u64> = HashMap::new();
-        for c in m.keys().copied().chain(columnar.iter().copied()) {
+        out
+    }
+
+    /// The live record count of each named collection that reports one.
+    fn row_counts<'a>(&self, collections: impl Iterator<Item = &'a str>) -> HashMap<&'a str, u64> {
+        let mut row_counts = HashMap::new();
+        for c in collections {
             if let Some(n) = self.store.live_count(c) {
                 row_counts.insert(c, n);
             }
         }
-        PlanContext {
-            indexes: m,
-            composite,
-            covering,
-            partial,
-            columnar,
-            columnar_fields,
-            cardinality: card,
-            row_counts,
-        }
+        row_counts
     }
 
     pub fn plan(&self, logical: &LogicalPlan) -> PhysicalPlan {
@@ -205,27 +276,8 @@ impl Database {
         }
         let started = Instant::now();
         let physical = adabt_exec::planner::plan(&logical.root, &self.plan_context());
-        let mut stats = ExecStats::default();
-        let budget = ExecBudget {
-            max_ram_bytes: self.policy.constraints.max_query_ram_bytes,
-            cancel: self.execution.pending_cancel.clone(),
-        };
-        let rows = execute_with_budget(&physical, self, &mut stats, &budget)?;
-        self.execution.last_stats = stats;
-        if let Some((threshold, _)) = &self.execution.slow_query {
-            let elapsed = started.elapsed();
-            if elapsed >= *threshold {
-                let event = SlowQueryEvent {
-                    elapsed,
-                    rows_scanned: stats.rows_scanned,
-                    rows_returned: rows.len() as u64,
-                    explain: physical.explain(),
-                };
-                if let Some((_, sink)) = &mut self.execution.slow_query {
-                    sink(&event);
-                }
-            }
-        }
+        let (rows, stats) = self.execute_physical(&physical)?;
+        self.report_if_slow(started, &stats, &rows, |_| physical.explain());
         Ok(rows)
     }
 
@@ -327,25 +379,10 @@ impl Database {
         // The specialised path, taken before any of the general machinery. For
         // a hot identity lookup this is the whole query: no filter accounting,
         // no cache probes, no plan, no operators, no batching.
-        if mode.uses_caches() && self.caches.compiled.get(shape).is_some() {
-            if let adabt_ir::plan::LogicalOp::GetById { collection, id } = &logical.root {
-                let (collection, id) = (collection.clone(), *id);
-                let rec = match self.derived.direct.get(&collection) {
-                    Some(d) => d.get(id)?,
-                    None => self.store.get(&collection, id)?,
-                };
-                return Ok(rec.map(|r| (id, r)).into_iter().collect());
-            }
+        if let Some(rows) = self.try_compiled_lookup(logical, shape, mode)? {
+            return Ok(rows);
         }
-        // Worth specialising? Decided once, not per call.
-        if mode.uses_caches() && self.caches.compiled.observe(shape) {
-            let direct = &self.derived.direct;
-            if let Some(path) =
-                crate::compiled::CompiledPaths::candidate(&logical.root, |c| direct.contains_key(c))
-            {
-                self.caches.compiled.install(shape, path);
-            }
-        }
+        self.consider_compiling(logical, shape, mode);
 
         let collection = logical.collection().to_string();
         let key = QueryKey::of(&logical.root);
@@ -355,35 +392,131 @@ impl Database {
         if mode.is_counted() {
             self.telemetry.note_filtered_fields(logical);
         }
-
-        // A materialized view is a derived representation, not a cache, so it is
-        // consulted even under a trial — masking it is the experiment's job, not
-        // this function's.
-        if let Some(rows) = self.derived.views.answer(&logical.root) {
-            if mode.is_counted() {
-                self.telemetry
-                    .observe_shape(&collection, shape, started, rows.len() as u64);
-            }
+        if let Some(rows) = self.answer_from_view(logical, &collection, shape, started, mode) {
+            return Ok(rows);
+        }
+        if let Some(rows) = self.probe_result_cache(key, epoch, &collection, shape, started, mode) {
             return Ok(rows);
         }
 
+        let decision = self.plan_decision(logical, shape, mode);
+        let physical = adabt_exec::planner::build_from(&logical.root, &decision);
+        if mode.is_counted() {
+            self.record_index_used(&collection, &decision);
+        }
+        let (rows, stats) = self.execute_physical(&physical)?;
+        // `explain` is only ever built when a query actually crossed the
+        // threshold, so a database with no slow-query log configured — the
+        // default — pays for exactly what it already paid for `started` and
+        // nothing more.
+        self.report_if_slow(started, &stats, &rows, |db| db.explain(logical));
+
+        // The query has just been answered by a scan, which is exactly what a
+        // view is built from. Building it here means the first such query pays
+        // what it was going to pay anyway and every later one pays nothing.
+        self.maybe_materialize(&logical.root)?;
         if mode.uses_caches() {
-            if let Some(rows) = self.caches.results.get(key, epoch) {
-                let rows = rows.clone();
-                self.telemetry.probe.record(Event::CacheProbe {
-                    name: "result_cache",
-                    hit: true,
-                });
-                self.telemetry
-                    .observe_shape(&collection, shape, started, rows.len() as u64);
-                return Ok(rows);
+            self.caches
+                .results
+                .insert(key, &collection, epoch, || rows.clone());
+        }
+        if mode.is_counted() {
+            self.telemetry
+                .observe_shape(&collection, shape, started, rows.len() as u64);
+        }
+        Ok(rows)
+    }
+
+    /// Answer a query whose shape has a compiled identity-lookup path installed.
+    fn try_compiled_lookup(
+        &mut self,
+        logical: &LogicalPlan,
+        shape: QueryShape,
+        mode: QueryMode,
+    ) -> Result<Option<Vec<(RecordId, Record)>>> {
+        if mode.uses_caches() && self.caches.compiled.get(shape).is_some() {
+            if let adabt_ir::plan::LogicalOp::GetById { collection, id } = &logical.root {
+                let (collection, id) = (collection.clone(), *id);
+                let rec = match self.derived.direct.get(&collection) {
+                    Some(d) => d.get(id)?,
+                    None => self.store.get(&collection, id)?,
+                };
+                return Ok(Some(rec.map(|r| (id, r)).into_iter().collect()));
             }
+        }
+        Ok(None)
+    }
+
+    /// Count this shape towards compilation, installing a compiled path once it is hot.
+    fn consider_compiling(&mut self, logical: &LogicalPlan, shape: QueryShape, mode: QueryMode) {
+        // Worth specialising? Decided once, not per call.
+        if mode.uses_caches() && self.caches.compiled.observe(shape) {
+            let direct = &self.derived.direct;
+            if let Some(path) =
+                crate::compiled::CompiledPaths::candidate(&logical.root, |c| direct.contains_key(c))
+            {
+                self.caches.compiled.install(shape, path);
+            }
+        }
+    }
+
+    /// Answer the query from a materialized view, if one covers it.
+    fn answer_from_view(
+        &mut self,
+        logical: &LogicalPlan,
+        collection: &str,
+        shape: QueryShape,
+        started: Instant,
+        mode: QueryMode,
+    ) -> Option<Vec<(RecordId, Record)>> {
+        // A materialized view is a derived representation, not a cache, so it is
+        // consulted even under a trial — masking it is the experiment's job, not
+        // this function's.
+        let rows = self.derived.views.answer(&logical.root)?;
+        if mode.is_counted() {
+            self.telemetry
+                .observe_shape(collection, shape, started, rows.len() as u64);
+        }
+        Some(rows)
+    }
+
+    /// Answer the query from the result cache, recording the probe either way.
+    fn probe_result_cache(
+        &mut self,
+        key: QueryKey,
+        epoch: u64,
+        collection: &str,
+        shape: QueryShape,
+        started: Instant,
+        mode: QueryMode,
+    ) -> Option<Vec<(RecordId, Record)>> {
+        if !mode.uses_caches() {
+            return None;
+        }
+        if let Some(rows) = self.caches.results.get(key, epoch) {
+            let rows = rows.clone();
             self.telemetry.probe.record(Event::CacheProbe {
                 name: "result_cache",
-                hit: false,
+                hit: true,
             });
+            self.telemetry
+                .observe_shape(collection, shape, started, rows.len() as u64);
+            return Some(rows);
         }
+        self.telemetry.probe.record(Event::CacheProbe {
+            name: "result_cache",
+            hit: false,
+        });
+        None
+    }
 
+    /// The access decision for this query, from the plan cache or freshly made.
+    fn plan_decision(
+        &mut self,
+        logical: &LogicalPlan,
+        shape: QueryShape,
+        mode: QueryMode,
+    ) -> PlanDecision {
         // The cache holds a shape-invariant *decision*; the plan is rebuilt
         // around this query's literals every time. Caching the plan itself would
         // let one query be answered with another's literals.
@@ -393,7 +526,7 @@ impl Database {
         // an experiment differ in exactly that while sharing a shape. A cached
         // decision would hand the baseline's plan to the candidate and the
         // comparison would be of a thing against itself.
-        let decision = match self.caches.plans.get(shape).filter(|_| mode.uses_caches()) {
+        match self.caches.plans.get(shape).filter(|_| mode.uses_caches()) {
             Some(d) => {
                 let d = d.clone();
                 self.telemetry.probe.record(Event::CacheProbe {
@@ -415,35 +548,48 @@ impl Database {
                 }
                 d
             }
-        };
-        let physical = adabt_exec::planner::build_from(&logical.root, &decision);
+        }
+    }
+
+    /// Tell telemetry which index, if any, the chosen plan reads through.
+    fn record_index_used(&mut self, collection: &str, decision: &PlanDecision) {
         // Record the access path actually chosen. An index nobody picks is
         // invisible to any amount of watching queries arrive.
-        if mode.is_counted() {
-            if let adabt_exec::planner::AccessDecision::IndexLookup { field, .. }
-            | adabt_exec::planner::AccessDecision::IndexRange { field } = &decision.access
-            {
-                self.telemetry.probe.record(Event::IndexUsed {
-                    collection: &collection,
-                    field,
-                });
-            }
+        if let adabt_exec::planner::AccessDecision::IndexLookup { field, .. }
+        | adabt_exec::planner::AccessDecision::IndexRange { field } = &decision.access
+        {
+            self.telemetry
+                .probe
+                .record(Event::IndexUsed { collection, field });
         }
+    }
 
+    /// Execute a physical plan under the query budget, keeping its stats as the last run's.
+    fn execute_physical(
+        &mut self,
+        physical: &PhysicalPlan,
+    ) -> Result<(Vec<(RecordId, Record)>, ExecStats)> {
         let mut stats = ExecStats::default();
         let budget = ExecBudget {
             max_ram_bytes: self.policy.constraints.max_query_ram_bytes,
             cancel: self.execution.pending_cancel.clone(),
         };
-        let rows = execute_with_budget(&physical, self, &mut stats, &budget)?;
+        let rows = execute_with_budget(physical, self, &mut stats, &budget)?;
         self.execution.last_stats = stats;
-        // `explain` is only ever built when a query actually crossed the
-        // threshold, so a database with no slow-query log configured — the
-        // default — pays for exactly what it already paid for `started` and
-        // nothing more. Built in two passes because `self.explain` needs
-        // `&self` and the sink lives behind `&mut self.execution.slow_query`
-        // — not overlapping fields to the borrow checker once either goes
-        // through a method call.
+        Ok((rows, stats))
+    }
+
+    /// Send a query that took at least the slow-query threshold to the sink.
+    fn report_if_slow(
+        &mut self,
+        started: Instant,
+        stats: &ExecStats,
+        rows: &[(RecordId, Record)],
+        explain: impl FnOnce(&Self) -> String,
+    ) {
+        // Built in two passes because `explain` needs `&self` and the sink
+        // lives behind `&mut self.execution.slow_query` — not overlapping
+        // fields to the borrow checker once either goes through a method call.
         if let Some((threshold, _)) = &self.execution.slow_query {
             let elapsed = started.elapsed();
             if elapsed >= *threshold {
@@ -451,26 +597,12 @@ impl Database {
                     elapsed,
                     rows_scanned: stats.rows_scanned,
                     rows_returned: rows.len() as u64,
-                    explain: self.explain(logical),
+                    explain: explain(self),
                 };
                 if let Some((_, sink)) = &mut self.execution.slow_query {
                     sink(&event);
                 }
             }
         }
-        // The query has just been answered by a scan, which is exactly what a
-        // view is built from. Building it here means the first such query pays
-        // what it was going to pay anyway and every later one pays nothing.
-        self.maybe_materialize(&logical.root)?;
-        if mode.uses_caches() {
-            self.caches
-                .results
-                .insert(key, &collection, epoch, || rows.clone());
-        }
-        if mode.is_counted() {
-            self.telemetry
-                .observe_shape(&collection, shape, started, rows.len() as u64);
-        }
-        Ok(rows)
     }
 }

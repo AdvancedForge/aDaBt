@@ -9,21 +9,62 @@ use super::migration::is_migration_name;
 use super::{HeapStore, RecoverTarget, VersionChain, SLOT_PREFIX};
 use crate::catalog::decode_schema;
 use crate::page::{PageId, RecordLocation, SlotId};
-use crate::wal::WalOp;
+use crate::wal::{WalEntry, WalOp};
 
 impl HeapStore {
     pub(super) fn recover(&mut self) -> Result<()> {
         // Pass 0: the persisted catalog, if there is one.
+        let from_lsn = self.adopt_persisted_catalog()?;
+        self.check_restore_target(from_lsn)?;
+        let entries = self.read_log(from_lsn)?;
+        let entries = &entries[..];
+
+        // Pass 1: collection definitions, for whatever the catalog did not
+        // already cover. The page scan below cannot interpret a stored record
+        // without knowing its schema.
+        self.replay_definitions(entries, from_lsn)?;
+
+        // Pass 2: the page directory and free-space map, as of the last
+        // checkpoint. Loaded from the cache when one describes that exact
+        // checkpoint, and rebuilt by reading every page when it does not.
         //
-        // It supplies the name-to-id binding directly rather than letting it
-        // fall out of replay order. That matters because a collection's id is
-        // embedded in every one of its heap slots: re-deriving the binding from
-        // a log that has lost its beginning silently reattributes every page.
+        // Both produce the same directory. The scan is the definition and the
+        // cache is an optimization of it, which is why a cache that cannot be
+        // trusted for any reason costs a scan rather than an error.
+        let flushed_lsn = last_checkpoint(entries);
+        if !self.load_directory(flushed_lsn)? {
+            self.scan_pages()?;
+        }
+
+        // Pass 3: replay everything the heap file might not yet contain.
+        self.replay_records(entries, flushed_lsn)?;
+
+        // Pass 4: schema migrations that reached their commit entry, in log
+        // order. Deferred to here because an adoption hands over records, and
+        // the records only exist once passes 2 and 3 have placed them.
+        self.replay_adoptions(entries)?;
+        self.discard_unfinished_migrations()?;
+
+        // Replay appends a version onto chains the page scan already built. No
+        // snapshot can span a restart, so collapsing them is both safe and
+        // necessary: otherwise every restart doubles the retained history.
+        self.reclaim()?;
+        self.retained = 0;
+        Ok(())
+    }
+
+    /// Adopt the persisted catalog, returning the LSN it already reflects.
+    fn adopt_persisted_catalog(&mut self) -> Result<u64> {
+        // The catalog supplies the name-to-id binding directly rather than
+        // letting it fall out of replay order. That matters because a
+        // collection's id is embedded in every one of its heap slots:
+        // re-deriving the binding from a log that has lost its beginning
+        // silently reattributes every page.
         let catalog = crate::metadata::read(&self.dir, self.identity);
-        let from_lsn = match &catalog {
+        match &catalog {
             Some(cat) => {
                 self.adopt_catalog(cat)?;
-                cat.through_lsn
+                Ok(cat.through_lsn)
             }
             None => {
                 // No catalog. Sound only while the log still holds everything.
@@ -31,10 +72,13 @@ impl HeapStore {
                 if start.0 > 0 {
                     return Err(crate::metadata::missing(start));
                 }
-                0
+                Ok(0)
             }
-        };
+        }
+    }
 
+    /// Reject a restore target that the adopted catalog has already passed.
+    fn check_restore_target(&self, from_lsn: u64) -> Result<()> {
         // A restore target below what the catalog already reflects is not an
         // earlier state — the catalog Pass 0 just adopted already contains
         // writes past it, unconditionally. There is no way to "replay less"
@@ -48,7 +92,11 @@ impl HeapStore {
                 });
             }
         }
+        Ok(())
+    }
 
+    /// Read the log entries recovery needs, cut off at any restore target.
+    fn read_log(&self, from_lsn: u64) -> Result<Vec<WalEntry>> {
         // Read once, from the earliest point any pass still needs.
         //
         // That point is the catalog's `through_lsn`, because the catalog and the
@@ -67,11 +115,11 @@ impl HeapStore {
         if let RecoverTarget::Lsn(target) = self.recover_target {
             entries.retain(|e| e.lsn.0 <= target.0);
         }
-        let entries = &entries[..];
+        Ok(entries)
+    }
 
-        // Pass 1: collection definitions, for whatever the catalog did not
-        // already cover. The page scan below cannot interpret a stored record
-        // without knowing its schema.
+    /// Replay the definition entries logged after `from_lsn`.
+    fn replay_definitions(&mut self, entries: &[WalEntry], from_lsn: u64) -> Result<()> {
         for e in entries {
             if e.lsn.0 <= from_lsn {
                 continue;
@@ -126,27 +174,11 @@ impl HeapStore {
                 _ => {}
             }
         }
+        Ok(())
+    }
 
-        // Pass 2: the page directory and free-space map, as of the last
-        // checkpoint. Loaded from the cache when one describes that exact
-        // checkpoint, and rebuilt by reading every page when it does not.
-        //
-        // Both produce the same directory. The scan is the definition and the
-        // cache is an optimization of it, which is why a cache that cannot be
-        // trusted for any reason costs a scan rather than an error.
-        let flushed_lsn = entries
-            .iter()
-            .rev()
-            .find_map(|e| match e.op {
-                WalOp::Checkpoint { flushed_lsn } => Some(flushed_lsn),
-                _ => None,
-            })
-            .unwrap_or(Lsn(0));
-        if !self.load_directory(flushed_lsn)? {
-            self.scan_pages()?;
-        }
-
-        // Pass 3: replay everything the heap file might not yet contain.
+    /// Replay the record writes logged after `flushed_lsn`.
+    fn replay_records(&mut self, entries: &[WalEntry], flushed_lsn: Lsn) -> Result<()> {
         for e in entries {
             if e.lsn.0 <= flushed_lsn.0 {
                 continue;
@@ -173,14 +205,21 @@ impl HeapStore {
                 _ => {}
             }
         }
-        // Pass 4: schema migrations that reached their commit entry, in log
-        // order. Deferred to here because an adoption hands over records, and
-        // the records only exist once passes 2 and 3 have placed them.
+        Ok(())
+    }
+
+    /// Execute every committed migration adoption, in log order.
+    fn replay_adoptions(&mut self, entries: &[WalEntry]) -> Result<()> {
         for e in entries {
             if let WalOp::AdoptMigration { target, source } = &e.op {
                 self.adopt(target, source)?;
             }
         }
+        Ok(())
+    }
+
+    /// Drop what is left of migrations that never reached their commit entry.
+    fn discard_unfinished_migrations(&mut self) -> Result<()> {
         // Anything still wearing a migration name belongs to a change that was
         // cut short. Its target is untouched and correct, so this is waste, not
         // state — and leaving it would let the next attempt inherit a partial
@@ -197,12 +236,6 @@ impl HeapStore {
                 self.free_pages_of(&c)?;
             }
         }
-
-        // Replay appends a version onto chains the page scan already built. No
-        // snapshot can span a restart, so collapsing them is both safe and
-        // necessary: otherwise every restart doubles the retained history.
-        self.reclaim()?;
-        self.retained = 0;
         Ok(())
     }
 
@@ -305,4 +338,16 @@ impl HeapStore {
         }
         Ok(())
     }
+}
+
+/// The flushed LSN named by the last checkpoint in `entries`, or zero.
+fn last_checkpoint(entries: &[WalEntry]) -> Lsn {
+    entries
+        .iter()
+        .rev()
+        .find_map(|e| match e.op {
+            WalOp::Checkpoint { flushed_lsn } => Some(flushed_lsn),
+            _ => None,
+        })
+        .unwrap_or(Lsn(0))
 }

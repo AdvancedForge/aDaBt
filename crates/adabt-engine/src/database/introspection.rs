@@ -7,8 +7,11 @@ use adabt_core::ids::RecordId;
 use adabt_core::record::Record;
 use adabt_core::store::LogicalStore;
 use adabt_core::value::Value;
+use adabt_index::Index;
+use std::collections::HashMap;
 
 use crate::caches::CacheStats;
+use crate::column::ColumnStore;
 
 use super::{Database, VerifyReport};
 
@@ -33,6 +36,129 @@ fn classify_index(name: &str) -> IndexShape {
         IndexShape::Composite(adabt_index::composite_fields(name))
     } else {
         IndexShape::Ordinary(name.to_string())
+    }
+}
+
+/// Report every id `idx` holds that the heap does not.
+fn check_index_reverse(
+    collection: &str,
+    idx: &dyn Index,
+    heap: &HashMap<RecordId, &Record>,
+    problems: &mut Vec<String>,
+) {
+    let name = idx.field();
+    let snapshot = idx.snapshot();
+    let kind_desc = idx.kind().as_str().to_string();
+    for (key, ids) in &snapshot {
+        for id in ids {
+            if !heap.contains_key(id) {
+                problems.push(format!(
+                    "{collection}: index {name:?} ({kind_desc}) holds \
+                     id {id} under key {key:?} but the heap has no such record"
+                ));
+            }
+        }
+    }
+}
+
+/// Report every heap record that belongs in `idx` but is not listed under its key.
+fn check_index_forward(
+    collection: &str,
+    idx: &dyn Index,
+    rows: &[(RecordId, Record)],
+    problems: &mut Vec<String>,
+) {
+    let name = idx.field();
+    // Forward check, keyed by what kind of index this is.
+    let Some((fields, condition)) = forward_expectation(name) else {
+        // An undecodable condition means the checker cannot say
+        // who belongs; refusing silently would hide exactly the
+        // divergence it exists to find, so say so instead.
+        problems.push(format!(
+            "{collection}: partial index {name:?} carries a condition \
+             that will not decode; forward verification skipped"
+        ));
+        return;
+    };
+
+    'records: for (id, rec) in rows.iter() {
+        if let Some(cond) = &condition {
+            if !cond.matches(rec) {
+                continue;
+            }
+        }
+        let mut key = Vec::with_capacity(fields.len());
+        for f in &fields {
+            match rec.get(f) {
+                Some(v) if !v.is_null() => key.push(v.clone()),
+                _ => continue 'records, // absent/null keys are not indexed
+            }
+        }
+        let probe: Value = if key.len() == 1 {
+            key.pop().expect("len checked")
+        } else {
+            Value::List(key)
+        };
+        if !idx.lookup(&probe).contains(id) {
+            problems.push(format!(
+                "{collection}: record {id} holds key {probe:?} but index \
+                 {name:?} does not list it"
+            ));
+        }
+    }
+}
+
+/// The fields an index named `name` keys on and, for a partial index, its
+/// condition; `None` when that condition will not decode.
+fn forward_expectation(name: &str) -> Option<(Vec<String>, Option<adabt_ir::Expr>)> {
+    match classify_index(name) {
+        IndexShape::Ordinary(f) | IndexShape::Covering(f) => Some((vec![f], None)),
+        IndexShape::Composite(fs) => Some((fs, None)),
+        IndexShape::Partial(base) => {
+            // Only records satisfying the condition belong in a
+            // partial index, so the forward expectation needs
+            // the decoded condition to know which those are.
+            let condition = match adabt_index::partial_parts(name).1 {
+                Some(hex) => crate::exprcodec::decode_expr_hex(&hex).ok(),
+                None => None,
+            };
+            condition.map(|c| (vec![base], Some(c)))
+        }
+    }
+}
+
+/// Report any difference between a column store's live ids and the heap's.
+fn check_column_store(
+    collection: &str,
+    cs: &ColumnStore,
+    heap: &HashMap<RecordId, &Record>,
+    problems: &mut Vec<String>,
+) {
+    let mut store_ids = cs.live_ids();
+    store_ids.sort_unstable();
+    let mut heap_ids: Vec<RecordId> = heap.keys().copied().collect();
+    heap_ids.sort_unstable();
+    let extra: Vec<RecordId> = store_ids
+        .iter()
+        .filter(|id| !heap.contains_key(id))
+        .copied()
+        .collect();
+    let missing: Vec<RecordId> = heap_ids
+        .iter()
+        .filter(|id| !store_ids.contains(id))
+        .copied()
+        .collect();
+    if !extra.is_empty() {
+        problems.push(format!(
+            "{collection}: column store holds {} ids the heap does not have",
+            extra.len()
+        ));
+    }
+    if !missing.is_empty() {
+        problems.push(format!(
+            "{collection}: column store is missing {} ids the heap has",
+            missing.len()
+        ));
     }
 }
 
@@ -135,112 +261,18 @@ impl Database {
         for collection in self.store.collection_names() {
             let rows = self.store.scan(&collection)?;
             report.records_checked += rows.len() as u64;
-            let heap: std::collections::HashMap<RecordId, &Record> =
-                rows.iter().map(|(id, r)| (*id, r)).collect();
+            let heap: HashMap<RecordId, &Record> = rows.iter().map(|(id, r)| (*id, r)).collect();
 
             if let Some(list) = self.derived.indexes.get(&collection) {
                 report.indexes_checked += list.len();
                 for idx in list.iter() {
-                    let name = idx.field();
-                    let snapshot = idx.snapshot();
-                    let kind_desc = idx.kind().as_str().to_string();
-
                     // Reverse check first: it needs no per-record logic.
-                    for (key, ids) in &snapshot {
-                        for id in ids {
-                            if !heap.contains_key(id) {
-                                report.problems.push(format!(
-                                    "{collection}: index {name:?} ({kind_desc}) holds \
-                                     id {id} under key {key:?} but the heap has no such record"
-                                ));
-                            }
-                        }
-                    }
-
-                    // Forward check, keyed by what kind of index this is.
-                    let classified = classify_index(name);
-                    let mut condition = None;
-                    let fields: Vec<String> = match &classified {
-                        IndexShape::Ordinary(f) | IndexShape::Covering(f) => vec![f.clone()],
-                        IndexShape::Composite(fs) => fs.clone(),
-                        IndexShape::Partial(base) => {
-                            // Only records satisfying the condition belong in a
-                            // partial index, so the forward expectation needs
-                            // the decoded condition to know which those are.
-                            condition = match adabt_index::partial_parts(name).1 {
-                                Some(hex) => crate::exprcodec::decode_expr_hex(&hex).ok(),
-                                None => None,
-                            };
-                            vec![base.clone()]
-                        }
-                    };
-                    // An undecodable condition means the checker cannot say
-                    // who belongs; refusing silently would hide exactly the
-                    // divergence it exists to find, so say so instead.
-                    if matches!(classified, IndexShape::Partial(_)) && condition.is_none() {
-                        report.problems.push(format!(
-                            "{collection}: partial index {name:?} carries a condition \
-                             that will not decode; forward verification skipped"
-                        ));
-                        continue;
-                    }
-
-                    'records: for (id, rec) in rows.iter() {
-                        if let Some(cond) = &condition {
-                            if !cond.matches(rec) {
-                                continue;
-                            }
-                        }
-                        let mut key = Vec::with_capacity(fields.len());
-                        for f in &fields {
-                            match rec.get(f) {
-                                Some(v) if !v.is_null() => key.push(v.clone()),
-                                _ => continue 'records, // absent/null keys are not indexed
-                            }
-                        }
-                        let probe: Value = if key.len() == 1 {
-                            key.pop().expect("len checked")
-                        } else {
-                            Value::List(key)
-                        };
-                        if !idx.lookup(&probe).contains(id) {
-                            report.problems.push(format!(
-                                "{collection}: record {id} holds key {probe:?} but index \
-                                 {name:?} does not list it"
-                            ));
-                        }
-                    }
+                    check_index_reverse(&collection, idx.as_ref(), &heap, &mut report.problems);
+                    check_index_forward(&collection, idx.as_ref(), &rows, &mut report.problems);
                 }
             }
-
-            // Columnar id set versus the heap's.
             if let Some(cs) = self.derived.columns.get(&collection) {
-                let mut store_ids = cs.live_ids();
-                store_ids.sort_unstable();
-                let mut heap_ids: Vec<RecordId> = heap.keys().copied().collect();
-                heap_ids.sort_unstable();
-                let extra: Vec<RecordId> = store_ids
-                    .iter()
-                    .filter(|id| !heap.contains_key(id))
-                    .copied()
-                    .collect();
-                let missing: Vec<RecordId> = heap_ids
-                    .iter()
-                    .filter(|id| !store_ids.contains(id))
-                    .copied()
-                    .collect();
-                if !extra.is_empty() {
-                    report.problems.push(format!(
-                        "{collection}: column store holds {} ids the heap does not have",
-                        extra.len()
-                    ));
-                }
-                if !missing.is_empty() {
-                    report.problems.push(format!(
-                        "{collection}: column store is missing {} ids the heap has",
-                        missing.len()
-                    ));
-                }
+                check_column_store(&collection, cs, &heap, &mut report.problems);
             }
         }
 
