@@ -3,7 +3,21 @@
 The "automatically optimal" goal says an expert tuning by hand adds nothing
 over the adaptive engine. This is the measurement of that claim.
 
-**Latest (2026-11-15, sixth re-run, both sizes pinned): the plan cache was
+**Latest (2026-11-15, seventh re-run, both sizes pinned): the limit goes
+into the index fetch.** A range miss used to fetch the whole matching index
+range by id (~1,435 records at 20,000 rows) for the `Limit` above it to keep
+50. The planner now pushes a limit through projections and filters into a
+fetching index access (`LimitedFetch`), which fetches in id order and stops
+at the 50th row the residual filter keeps. At 20,000 rows the range
+phase's adaptive p50 went from 592.4 to 33.3 µs and its p99 from 708.3 to
+87.3 µs; the expert's p50 went from 414.5 to 26.6 µs. The ratio went from
+1.43× to 1.25×: what is left is the direct array (26.6 against 30.6 µs for
+the b-tree alone) and the soak's database (33.3 against 30.6 µs for the
+same configuration fresh). At 5,000 rows range filter is 1.25× (24.8
+against 19.8 µs). See
+[the seventh re-run](#re-run-2026-11-15-the-limit-pushed-into-the-index-fetch).
+
+**Previous (2026-11-15, sixth re-run, both sizes pinned): the plan cache was
 not a cause, and both sides now run the same operations.** Planning takes
 0.4–2 µs against misses of 0.4–8 ms, so the plan cache saves under 1%. Its
 estimate now rests on measured planning time and a ghost cache, and it
@@ -860,3 +874,128 @@ clustering on age and result cache (range and aggregate); direct lookup.
   harness, not a choice.
 - **The plan cache is settled on evidence.** It saves under 1% here, and
   the expert's figures do not depend on it.
+
+## Re-run 2026-11-15: the limit pushed into the index fetch
+
+The sixth re-run found that every range miss read ~1,435 records through
+the age index to return 50: the plan was `Limit(Filter(IndexRange))`, the
+index range was fetched in full, and the limit kept the first 50.
+
+### Change
+
+The planner pushes a `Limit` through `Project`s and `Filter`s into a
+fetching index access (`IndexRange`, `IndexLookup`, `CompositeLookup`).
+The result is a new physical operator, `LimitedFetch { access,
+predicates, n }`:
+
+```
+LimitedFetch(first 50 by id, where [And([Compare { op: Ge, lhs: Field("age"), … }])])
+  IndexRange(users.age via btree)
+```
+
+It asks the index for its ids exactly as before and puts them in record-id
+order, as `fetch_batches` does. That order is the answer's contract at every
+level. It then fetches one id at a time, applies the residual filters, and
+stops at the `n`-th row they keep. The limit counts rows after the filters.
+A deleted row is skipped as the fetch always skipped it, and no read path
+changed, so snapshot reads are unaffected. A `Sort`, an `Aggregate` or a
+`Join` between the limit and the access blocks the push, as do a covering
+access (nothing to fetch) and a scan. A limit under an aggregate is pushed
+into the aggregate's input, as written. `n` binds from the query, so cached
+decisions stay shape-only.
+
+The index walk itself still visits the whole range. The answer is in id
+order and the index is in key order, so the 50 smallest ids are not known
+until every id in the range is. Collecting ~1,435 ids is cheap next to
+fetching their records, which is what this bounds.
+
+Tests: plan shapes (`planner::limit_pushdown_tests`), and differential
+tests against a level-0 database with no indexes
+(`crates/adabt-engine/tests/limit_pushdown.rs`). The differential tests
+cover limits 0–100,000, residual filters, sorts, aggregates above and
+below, nested limits, and deletes, updates and re-inserts inside the
+range, at levels 0, 1, 3 and 10. Removing the id sort from `LimitedFetch`
+fails them.
+
+### Run
+
+`taskset -c 2` on a copy of each release binary, 3 repeats. Main
+(`0e62ce4`) and this change were run back to back: 20,000 rows before
+(4,826 s, load 2.04 → 1.94), after (4,402 s, load 1.94 → 1.83), then
+5,000 rows after (1,358 s, load 1.83 → 2.02) and before (1,278 s, load
+1.52 → 2.16). 6,426 manual answers were checked against level 0 in each
+run, with no divergence.
+
+#### Range filter
+
+| rows | | expert p50 | expert p99 | adaptive p50 | adaptive p99 | ratio |
+|---|---|---|---|---|---|---|
+| 20,000 | before | 414.5 µs (409.1–420.9) | 478.9 µs | 592.4 µs (591.2–596.7) | 708.3 µs | 1.43× |
+| 20,000 | after | 26.6 µs (26.3–26.8) | 52.1 µs | 33.3 µs (33.1–33.3) | 87.3 µs | 1.25× |
+| 5,000 | before | 118.9 µs (118.1–121.2) | 172.6 µs | 161.6 µs (159.6–161.7) | 233.2 µs | 1.36× |
+| 5,000 | after | 19.8 µs (19.8–19.9) | 42.7 µs | 24.8 µs (24.4–24.9) | 70.4 µs | 1.25× |
+
+Adaptive's range p50 is 17.8× lower at 20,000 rows and 6.5× lower at
+5,000; level 0 (no index, unchanged) is 4.2 and 1.2 ms. The configurations
+at 20,000 rows, after:
+
+| range configuration | p50 | p99 |
+|---|---|---|
+| level 10 / level 11 (direct lookup) | 26.6 µs | 52.1–55.2 µs |
+| hand: caches + b-tree on age | 30.6 µs | 68.8 µs |
+| hand: + clustered by age | 30.8 µs | 69.5 µs |
+| adaptive (soak) | 33.3 µs | 87.3 µs |
+
+#### 20,000 rows, after
+
+| phase | expert p50 (range) | adaptive p50 (range) | ratio | before | verdict | expert config |
+|---|---|---|---|---|---|---|
+| identity | 191 ns (191–192) | 196 ns (192–197) | 1.03× | 1.04× | **matches** | plan cache + direct lookup |
+| point filter | 1,701 ns (1,685–1,729) | 1,894 ns (1,765–2,046) | 1.11× | 1.10× | behind | level 10 |
+| range filter | 26.6 µs (26.3–26.8) | 33.3 µs (33.1–33.3) | 1.25× | 1.43× | behind | level 10 |
+| aggregate | 1,192 ns (1,182–1,197) | 1,557 ns (1,546–1,574) | 1.31× | 1.19× | behind | caches + column store + views |
+| identity again | 193 ns (192–194) | 209 ns (208–216) | 1.08× | 1.08× | behind | plan cache + direct lookup |
+
+#### 5,000 rows, after
+
+| phase | expert p50 (range) | adaptive p50 (range) | ratio | before | verdict | expert config |
+|---|---|---|---|---|---|---|
+| identity | 185 ns (185–187) | 193 ns (193–195) | 1.04× | 1.06× | behind | level 10 |
+| point filter | 1,731 ns (1,730–1,742) | 1,769 ns (1,760–1,779) | 1.02× | 1.02× | behind | level 11 |
+| range filter | 19.8 µs (19.8–19.9) | 24.8 µs (24.4–24.9) | 1.25× | 1.36× | behind | level 11 |
+| aggregate | 1,004 ns (1,003–1,036) | 1,177 ns (1,146–1,195) | 1.17× | 1.22× | behind | caches + column store + views |
+| identity again | 187 ns (185–189) | 193 ns (192–196) | 1.03× | 1.10× | behind | level 10 |
+
+Adaptive's configuration in every phase is unchanged: direct lookup; index
+on country and result cache; index and clustering on age and result cache
+(range and aggregate); direct lookup.
+
+### SQLite comparison
+
+The harness in `comparison/` has one range workload, `indexed range`
+(`age >= 30 AND age < 35`, projecting `name`, 100,000 rows). It has no
+limit, so its plan is unchanged (`CoveringRange` when tuned, a scan at
+level 0), and no workload in the harness combines a range with a limit.
+Run with `--only range`, pinned, before then after: level 0 4.58 ms both
+times, tuned 1.48 ms against 1.60 ms, SQLite 3.25 ms against 3.16 ms
+(2.20× and 1.97× faster). That is run-to-run noise on an unchanged plan,
+inside the 1.3–2.9× published in `comparison-notes.md`, so neither that
+file nor the README table changes.
+
+### Reading the seventh re-run
+
+- **The range phase's cost was the fetches, as located.** Every
+  configuration with the index dropped by 15–18× at 20,000 rows, the
+  expert's as much as adaptive's.
+- **What is left of the range gap is ~4 µs of direct array and ~3 µs of
+  soak.** The direct array was worth ~120 µs per miss (550 → 415 µs) and
+  is now worth ~4 µs (30.6 → 26.6 µs); adaptive still declines it.
+  Adaptive's own configuration is 30.6 µs fresh against 33.3 µs in the
+  soak, the same kind of soak-state gap as point filter's.
+- **The other phases did not change with this work.** No query in them has
+  a limit over an index access: point filter sorts before its limit, and
+  aggregate has no limit. Their before and after runs differ by noise,
+  for example aggregate at 20,000 rows 1.19× then 1.31× on medians that
+  are result-cache hits. Neither 5,000-row run reproduced the sixth
+  re-run's matches on identity and aggregate. The before run is the
+  unchanged code, so that is the machine and the windows, not this change.

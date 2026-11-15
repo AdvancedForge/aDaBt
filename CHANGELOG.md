@@ -6,6 +6,16 @@ A correctness and code-quality pass. The existing formats are unchanged; two
 files are new (`base.adabt`, `superseded-log/`).
 
 ### Fixed
+- **A `Limit` over an index fetched the whole index range first.**
+  `scan.filter(age >= ?).limit(50)` through a b-tree fetched every matching
+  record by id (~1,435 at 20k rows) and kept 50. The planner now pushes a
+  limit through projections and filters into an `IndexRange`,
+  `IndexLookup` or `CompositeLookup` (new physical operator
+  `LimitedFetch`). It reads the ids as before, in record-id order, then
+  fetches one at a time and stops at the n-th row the residual filter
+  keeps. A `Sort`, `Aggregate` or `Join` in between blocks the push. On the
+  expert comparison's range phase at 20k rows, adaptive's p50 went from
+  592 to 33 µs and its p99 from 708 to 87 µs.
 - **The plan cache was judged on a fixed 5% prior that never cleared the
   bar.** Planning time is now recorded per query shape (`Event::Planned`,
   `Snapshot::planning`). That covers measured planning on a miss and the

@@ -7,7 +7,7 @@ when the goal is met, as opposed to a list of features.
 |---|---|---|
 | **Usable** | you could ship on it | Met, for a single node with sharding as the growth story |
 | **Manually optimal** | the engine's ceiling is the hardware's ceiling | Met against SQLite; not yet measured against memory bandwidth or core count |
-| **Automatically optimal** | an expert tuning by hand adds nothing | Not met: on the same operations for both sides (since 2026-11-15), adaptive matches on 3 of 5 soak phases at 5k rows (identity, aggregate, identity again; point filter 1.02×, range filter 1.31×). At 20k, identity matches; point filter is 1.14–1.16×, range filter 1.47–1.55× and aggregate 1.15–1.64× across two loaded runs. The plan cache is not a cause (it saves under 1%). Range is the direct array, which the default priorities price below the bar ([`benchmarks/expert-vs-adaptive.md`](benchmarks/expert-vs-adaptive.md)) |
+| **Automatically optimal** | an expert tuning by hand adds nothing | Not met: on the same operations for both sides, the 2026-11-15 sixth re-run matched on 3 of 5 soak phases at 5k rows. In the seventh re-run (limit pushed into the index fetch), range filter went from 592 to 33 µs at 20k and is 1.25× the expert at both sizes, down from 1.43× at 20k; the rest is the direct array (~4 µs) and soak state. At 20k identity matches; point filter is 1.11× and aggregate 1.31×. At 5k every phase is behind (identity phases 1.03–1.04×, point filter 1.02×, aggregate 1.17×). The sixth re-run's 5k matches did not reproduce on the unchanged build either: same-day "before" run, identity 1.06×, aggregate 1.22× ([`benchmarks/expert-vs-adaptive.md`](benchmarks/expert-vs-adaptive.md)) |
 | **Good** | there is a workload where it is demonstrably the right answer | Met: 4 of 8 workloads won against SQLite, losses published alongside |
 
 "Met" means the finish line as defined here. It does not mean production-ready;
@@ -116,6 +116,24 @@ throughout: evidence first, then what it unblocks.
     - **Point filter** (1.02× at 5k, 1.14–1.16× at 20k): adaptive's
       configuration measured fresh is ~200 ns faster than in the soak,
       so this is soak state or harness, not a choice.
+
+  - 2026-11-15 seventh re-run. Fixed: the limit is pushed into the index
+    fetch (`LimitedFetch`), so a range miss fetches the 50 rows it returns
+    instead of the ~1,435 in the range. At 20k, range filter's adaptive
+    p50 went from 592 to 33 µs (p99 708 to 87 µs), the expert's from 415 to
+    27 µs, and the ratio from 1.43× to 1.25×. At 5k it is 1.25× (24.8
+    against 19.8 µs). What is left:
+    - **Range filter** (1.25× at both sizes): the direct array is now
+      ~4 µs of the expert's 26.6 µs (b-tree alone 30.6 µs), and adaptive's
+      configuration in the soak is ~3 µs slower than the same configuration
+      fresh. Adaptive still declines the direct array (its configuration
+      is unchanged), and the array now buys ~4 µs instead of ~120 µs.
+      The index walk still visits the whole range to find the smallest ids,
+      because the answer is in id order and the index is in key order.
+      Next: soak state on range, the same open question as point filter.
+    - **Aggregate** (1.31× at 20k, 1.17× at 5k) and **point filter**
+      (1.11× and 1.02×): unchanged by this work, and as in the sixth
+      re-run.
 
   Re-run `adabt-bench expert-vs-adaptive` after any change to the driver's
   scoring. Matching on every phase is the finish line.
