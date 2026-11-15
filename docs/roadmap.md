@@ -87,6 +87,12 @@ throughout: evidence first, then what it unblocks.
     adaptive chooses neither. The plan cache is still a workload-blind 5%
     prior.
 
+  - 2026-11-15 pinned 20k re-run after O(1) live counts: identity 1.03×,
+    identity again 1.09×, point filter 1.11×, range filter 1.48×,
+    aggregate 1.72×. The plan cache is in the expert's configuration for
+    all three of the last gaps and adaptive never enables it: estimate it
+    from measured planning time and plan-shape repetition next.
+
   Re-run `adabt-bench expert-vs-adaptive` after any change to the driver's
   scoring. Matching on every phase is the finish line.
 - **Writes:** bulk load is 1.5–2.0× behind SQLite; single-row inserts are now

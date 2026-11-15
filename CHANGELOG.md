@@ -6,6 +6,9 @@ A correctness and code-quality pass. The existing formats are unchanged; two
 files are new (`base.adabt`, `superseded-log/`).
 
 ### Fixed
+- **Counting live records walked every id in the directory**, on every plan
+  and every optimization cycle. A `Directory` type now keeps the live count
+  beside the id map, changed only by the mutations that can affect it.
 - **Every optimization cycle scanned every record to find each
   collection's highest id.** At 20k rows that took ~3.7 ms of a ~4.2 ms
   cycle. The ~100 µs of identity lookups between cycles then ran on caches

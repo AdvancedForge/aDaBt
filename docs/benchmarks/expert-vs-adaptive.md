@@ -3,7 +3,14 @@
 The "automatically optimal" goal says an expert tuning by hand adds nothing
 over the adaptive engine. This is the measurement of that claim.
 
-**Latest (2026-11-14, fourth re-run, both sizes): the identity gap was the
+**Latest (2026-11-15, fifth re-run, 20,000 rows pinned to one core): live
+counts are O(1) and identity again is 1.09×.** Identity matches (1.03×);
+point filter 1.11×, range filter 1.48× and aggregate 1.72× are behind on
+configuration, and in all three the expert runs the plan cache, which
+adaptive never enables. See
+[the fifth re-run](#re-run-2026-11-15-o1-live-counts-pinned).
+
+**Previous (2026-11-14, fourth re-run, both sizes): the identity gap was the
 optimizer's cycle.** Every 500 operations a cycle scanned every record to
 find each collection's highest id. That took ~4 ms against the ~100 µs of
 lookups between cycles, and the lookups after it ran on flushed caches. The
@@ -594,3 +601,38 @@ its choices. With most of that cost removed, identity again is within
 ~10% at 20,000 rows and within 1 ns at 5,000. Range filter (1.6×) and
 aggregate (1.3–1.7×) are now the large losses, and both come from
 configurations adaptive does not choose.
+
+## Re-run 2026-11-15: O(1) live counts, pinned
+
+**Change.** Live record counts were a walk of every id in the directory,
+asked on every plan and every cycle. A `Directory` type now keeps the count
+beside the id map, changed only by the four mutations that can affect it
+(commit `9ef4d01`).
+
+**Run.** `taskset -c 2 adabt-bench expert-vs-adaptive --size 20000`, 3
+repeats, 4,617 s, pinned to one performance core: this machine's efficiency
+cores run the identity lookups about 50% slower, and an unpinned run can land
+on either. One-minute load average was 3.3 at the start and 1.9 at the end.
+6,426 manual answers checked against level 0; no divergence.
+
+| phase | expert p50 | adaptive p50 | ratio | fourth re-run | verdict | expert config | adaptive config |
+|---|---|---|---|---|---|---|---|
+| identity | 196 ns | 201 ns | 1.03× | 1.03× | matches | direct_lookup | direct_lookup |
+| point filter | 1,727 ns | 1,918 ns | 1.11× | 1.10× | behind | plan_cache, result_cache | auto_index[country], result_cache |
+| range filter | 400.0 µs | 592.6 µs | 1.48× | 1.65× | behind | level 11 | auto_index[age], clustered_sort[age], result_cache |
+| aggregate | 957 ns | 1,650 ns | 1.72× | 1.71× | behind | column_store, materialized_view, plan_cache, result_cache | auto_index[age], clustered_sort[age], result_cache |
+| identity again | 198 ns | 215 ns | 1.09× | 1.12× | behind | direct_lookup | direct_lookup |
+
+### Reading the fifth re-run
+
+- **Pinning tightened every adaptive range** (identity 200–202 ns, against
+  272–417 ns in the third re-run), so these ratios are the most reliable
+  yet.
+- **Identity again** is 17 ns behind on the same configuration. What a cycle
+  still costs (about 0.3 ms, mostly reading the sampled pages) is the
+  remaining suspect.
+- **The other three gaps are choices.** The expert runs the plan cache in
+  all three; adaptive's estimate for it is still a workload-blind 5% prior
+  that never clears the bar. Aggregate also wants the column store and a
+  materialized view, and in that phase adaptive still carries the
+  range-filter phase's index and clustering.
