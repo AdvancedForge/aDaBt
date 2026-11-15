@@ -280,7 +280,7 @@ fn measure_candidates(
         eprintln!("{}: {}", phase.label, candidate.label);
         let mut cell = Cell::named(&candidate.label);
         for _ in 0..cfg.repeats {
-            let sample = measure_manual(&dir.join("manual"), cfg, index, phase, &candidate)?;
+            let sample = measure_manual(&dir.join("manual"), cfg, index, &candidate)?;
             // The first candidate is level 0; its first repeat is the reference.
             let want = reference.get_or_insert_with(|| sample.answers.clone());
             report.verified_queries += sample.answers.len() as u64;
@@ -329,29 +329,35 @@ struct Sample {
 }
 
 /// Load a fresh database under `candidate`, warm it on the phase's traffic,
-/// apply the configuration, and measure as many queries as the soak measures.
+/// apply the configuration, and measure the very operations the soak measures.
 ///
 /// Warm-up comes before the configuration is applied because several
 /// optimizations choose their scope from telemetry — which field to index,
-/// hash or b-tree — and have nothing to go on in an empty database. The
-/// traffic stream is seeded by phase alone, so every candidate and every
-/// repeat answers the same queries in the same order.
+/// hash or b-tree — and have nothing to go on in an empty database.
+///
+/// The traffic is the soak's own: the same queries and the same writes, in
+/// the same order, ending on the same last tenth of the phase that adaptive
+/// is measured on, over the same rows. It used to be a stream seeded by phase
+/// alone, which made every candidate comparable with every other but not with
+/// adaptive. On phases a result cache dominates, the median is a hit or a
+/// miss depending on how many writes happen to fall in the measured window,
+/// and the two windows differed in exactly that: at 20,000 rows the
+/// aggregate phase's expert window had 87% hits and adaptive's 75%, so the
+/// expert's median was a hit from the middle of the hit distribution and
+/// adaptive's one from its upper third, whatever either was configured with.
 fn measure_manual(
     dir: &Path,
     cfg: &ExpertConfig,
     index: usize,
-    phase: &Phase,
     candidate: &Candidate,
 ) -> Result<Sample, Failure> {
     let _ = std::fs::remove_dir_all(dir);
     let mut db = Database::open(dir, candidate.policy.clone())?;
-    soak::preload(&mut db, cfg.soak.size)?;
     let window = measured_window(cfg);
-    let mut traffic = Traffic {
-        phase,
-        rng: Rng::new(phase_seed(cfg.soak.seed, index)),
-        next_write_id: cfg.soak.size,
-    };
+    let mut traffic = soak_traffic(cfg, index, 2 * window);
+    // Every record the soak's database holds at this point: the preload and
+    // every write before it, which are inserts of consecutive ids.
+    soak::preload(&mut db, traffic.next_write_id)?;
     traffic.drive(&mut db, window / 2, None)?;
     db.optimize()?;
     traffic.drive(&mut db, window / 2, None)?;
@@ -369,9 +375,32 @@ fn measured_window(cfg: &ExpertConfig) -> u64 {
     (cfg.soak.ops_per_phase / 10).max(1)
 }
 
-/// A seed for phase `index` that every candidate shares.
-fn phase_seed(seed: u64, index: usize) -> u64 {
-    seed ^ (index as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+/// The soak's traffic for phase `index`, positioned `remaining` operations
+/// before the phase ends.
+///
+/// The soak draws every phase from one generator, and an operation does not
+/// depend on the database it is sent to, so replaying the generator through
+/// the earlier phases, and through this one up to that point, reproduces
+/// exactly what the adaptive run sends from there on.
+fn soak_traffic(cfg: &ExpertConfig, index: usize, remaining: u64) -> Traffic<'static> {
+    let mut rng = Rng::new(cfg.soak.seed);
+    let mut next_write_id = cfg.soak.size;
+    let skipped = cfg.soak.ops_per_phase.saturating_sub(remaining);
+    for (i, phase) in SCRIPT.iter().enumerate().take(index + 1) {
+        let ops = if i == index {
+            skipped
+        } else {
+            cfg.soak.ops_per_phase
+        };
+        for _ in 0..ops {
+            let _ = soak::next_op(phase, &mut rng, &mut next_write_id);
+        }
+    }
+    Traffic {
+        phase: &SCRIPT[index],
+        rng,
+        next_write_id,
+    }
 }
 
 /// One phase's traffic, replayable from its seed.
