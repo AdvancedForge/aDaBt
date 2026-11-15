@@ -294,10 +294,15 @@ impl Database {
     }
 
     /// Highest record id per collection, for density estimates.
+    ///
+    /// Off the page directory, not the last row of a scan: this runs every
+    /// cycle, and a scan read and decoded every record to keep one id — at
+    /// 20,000 rows about 4 ms, long enough to leave the lookups after each
+    /// cycle running on cold caches.
     fn max_ids(&mut self) -> Result<Vec<(String, u64)>> {
         let mut out = Vec::new();
         for n in self.store.collection_names() {
-            let max = self.store.scan(&n)?.last().map(|(id, _)| id.0).unwrap_or(0);
+            let max = self.store.max_live_id(&n)?.map(|id| id.0).unwrap_or(0);
             out.push((n, max));
         }
         Ok(out)

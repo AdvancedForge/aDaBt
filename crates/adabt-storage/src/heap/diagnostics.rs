@@ -1,6 +1,7 @@
 //! Read-only views of the store's internals, for the planner, the engine's
 //! metrics, and tests that assert on physical behaviour.
 
+use adabt_core::ids::RecordId;
 use adabt_core::policy::Durability;
 use std::path::Path;
 
@@ -18,6 +19,22 @@ impl HeapStore {
     pub fn live_count(&self, collection: &str) -> Option<u64> {
         let c = self.collections.get(collection)?;
         Some(c.directory.values().filter(|v| !v.is_absent()).count() as u64)
+    }
+
+    /// The highest id in `collection` whose newest version is a live record,
+    /// read off the in-memory directory: no pages, no decodes.
+    ///
+    /// The same answer as the last row of `scan`, which filters on the same
+    /// `newest()` and walks the same ordered directory, at the cost of a walk
+    /// back past any trailing tombstones rather than a read of every record.
+    /// The optimizer asks every cycle, inside the windows it measures.
+    pub fn max_live_id(&self, collection: &str) -> adabt_core::error::Result<Option<RecordId>> {
+        Ok(self
+            .coll(collection)?
+            .directory
+            .iter()
+            .rev()
+            .find_map(|(id, v)| v.newest().map(|_| *id)))
     }
 
     /// Every collection and the id its pages are stamped with, sorted by name.
