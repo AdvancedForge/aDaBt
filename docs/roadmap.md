@@ -7,7 +7,7 @@ when the goal is met, as opposed to a list of features.
 |---|---|---|
 | **Usable** | you could ship on it | Met, for a single node with sharding as the growth story |
 | **Manually optimal** | the engine's ceiling is the hardware's ceiling | Met against SQLite; not yet measured against memory bandwidth or core count |
-| **Automatically optimal** | an expert tuning by hand adds nothing | Not met: adaptive matches or beats the expert on 2 of 5 soak phases at 5k rows and 1 of 5 at 20k (was up to ~1,000× behind). The identity phases are within 1.04–1.12× on the expert's own configuration since a cycle stopped scanning every record. Range filter (1.6×) and aggregate (1.3–1.7×) are behind on configuration ([`benchmarks/expert-vs-adaptive.md`](benchmarks/expert-vs-adaptive.md)) |
+| **Automatically optimal** | an expert tuning by hand adds nothing | Not met: on the same operations for both sides (since 2026-11-15), adaptive matches on 3 of 5 soak phases at 5k rows (identity, aggregate, identity again; point filter 1.02×, range filter 1.31×). At 20k, identity matches; point filter is 1.14–1.16×, range filter 1.47–1.55× and aggregate 1.15–1.64× across two loaded runs. The plan cache is not a cause (it saves under 1%). Range is the direct array, which the default priorities price below the bar ([`benchmarks/expert-vs-adaptive.md`](benchmarks/expert-vs-adaptive.md)) |
 | **Good** | there is a workload where it is demonstrably the right answer | Met: 4 of 8 workloads won against SQLite, losses published alongside |
 
 "Met" means the finish line as defined here. It does not mean production-ready;
@@ -92,6 +92,30 @@ throughout: evidence first, then what it unblocks.
     aggregate 1.72×. The plan cache is in the expert's configuration for
     all three of the last gaps and adaptive never enables it: estimate it
     from measured planning time and plan-shape repetition next.
+
+  - 2026-11-15 sixth re-run. The plan cache is estimated from measured
+    planning time per shape and a ghost cache. It saves under 1%
+    (planning 0.4–2 µs, misses 0.4–8 ms) and stays off, correctly. The
+    expert now replays the soak's own operations: its windows had had more
+    result-cache hits than adaptive's (87% against 75% on aggregate). At
+    5k, aggregate went from 1.26× to 0.99× (matches). What is left:
+    - **Range filter** (1.31× at 5k, 1.47–1.55× at 20k): the direct array
+      is all of level 11's advantage (525 → 405 µs). Each miss fetches
+      ~1,435 records by id to return 50, because `Limit` is not pushed into
+      the index range. The direct array's estimate now counts index-served
+      fetches. At the default priorities it scores ~0.2 against the 0.5 bar
+      (freedom −2.0, resources −0.9), so adaptive declines it. Next: push
+      the limit into the index range, which would help every configuration.
+    - **Aggregate** (1.15–1.64× at 20k): the medians are result-cache hits
+      whose cost varied by more between the two runs than between
+      configurations. The column store would make misses 2.4× faster
+      (p99), but the planner reads `age >= ?` through the b-tree when both
+      exist. Next: the planner's choice between a wide index range and a
+      column scan, and running the soak's level-0 reference outside the
+      measured window.
+    - **Point filter** (1.02× at 5k, 1.14–1.16× at 20k): adaptive's
+      configuration measured fresh is ~200 ns faster than in the soak,
+      so this is soak state or harness, not a choice.
 
   Re-run `adabt-bench expert-vs-adaptive` after any change to the driver's
   scoring. Matching on every phase is the finish line.

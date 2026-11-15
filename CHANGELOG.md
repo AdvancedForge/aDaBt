@@ -6,6 +6,27 @@ A correctness and code-quality pass. The existing formats are unchanged; two
 files are new (`base.adabt`, `superseded-log/`).
 
 ### Fixed
+- **The plan cache was judged on a fixed 5% prior that never cleared the
+  bar.** Planning time is now recorded per query shape (`Event::Planned`,
+  `Snapshot::planning`). That covers measured planning on a miss and the
+  planning a hit skipped. While the cache is off, a ghost of it records
+  which queries it would have served. The estimate is the saved planning
+  time over total query time. On the expert comparison that is under 1%, so
+  the cache stays off, now on evidence.
+- **The direct array claimed its gain only on lookups by id.** Each read an
+  index serves fetches every match by id, and on the range phase the array
+  is all of level 11's advantage (p50 525 → 405 µs). It now claims on
+  index-served fetches too (`WorkloadMix::index_fetches`). What the result
+  cache answers is taken as its hit rate over the reads that reached it.
+  Queries that bypass the cache during an experiment had made the raw count
+  admit, then drop, the array within one soak phase. At the default
+  priorities it stays below the bar there.
+- **`expert-vs-adaptive` measured the expert on different operations from
+  adaptive.** Medians that are result-cache hits depend on how many writes
+  fall in the window: 87% hits for the expert against 75% for adaptive on
+  the 20k aggregate phase. The expert now replays the soak's own
+  operations over the same rows. At 5k, 3 of 5 phases match
+  (`docs/benchmarks/expert-vs-adaptive.md`).
 - **Counting live records walked every id in the directory**, on every plan
   and every optimization cycle. A `Directory` type now keeps the live count
   beside the id map, changed only by the mutations that can affect it.

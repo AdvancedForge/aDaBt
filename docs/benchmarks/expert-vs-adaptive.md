@@ -3,7 +3,25 @@
 The "automatically optimal" goal says an expert tuning by hand adds nothing
 over the adaptive engine. This is the measurement of that claim.
 
-**Latest (2026-11-15, fifth re-run, 20,000 rows pinned to one core): live
+**Latest (2026-11-15, sixth re-run, both sizes pinned): the plan cache was
+not a cause, and both sides now run the same operations.** Planning takes
+0.4–2 µs against misses of 0.4–8 ms, so the plan cache saves under 1%. Its
+estimate now rests on measured planning time and a ghost cache, and it
+stays off. Point filter and aggregate medians are result-cache hits, and the
+two sides had been measured on different operations, with different hit
+rates in their windows (87% against 75% on aggregate). The expert now
+replays the soak's own operations. At 5,000 rows 3 of 5 phases match
+(aggregate went from 1.26× to 0.99×). Point filter is 1.02×, 10 ns outside
+the expert's range. Range filter is 1.31×. At 20,000 rows, two loaded runs
+put range filter at 1.47–1.55× and point filter at 1.14–1.16×. In range
+filter the gap is the direct array: it is all of level 11's advantage there
+(525 to 405 µs). Adaptive can now claim it on evidence, but the default
+priorities price it below the bar. In point filter, the same configuration
+measured fresh is ~200 ns faster. Aggregate is 1.15–1.64×, on hits whose
+cost varies run to run. See
+[the sixth re-run](#re-run-2026-11-15-evidence-for-the-plan-cache-and-the-same-traffic-for-both).
+
+**Previous (2026-11-15, fifth re-run, 20,000 rows pinned to one core): live
 counts are O(1) and identity again is 1.09×.** Identity matches (1.03×);
 point filter 1.11×, range filter 1.48× and aggregate 1.72× are behind on
 configuration, and in all three the expert runs the plan cache, which
@@ -95,6 +113,13 @@ phases carry 2% writes, the aggregate phase 0.5%. Durability is the default
   operations, the same window the adaptive side is measured on. The expert
   knows the phase in advance and gets a fresh database for it. Both are
   advantages over adaptive, and both are deliberate.
+
+  Since the 2026-11-15 sixth re-run the expert's traffic is the soak's own
+  operations: the same queries and writes, ending on the same last 2,000
+  operations of the phase adaptive is measured on, over the same rows.
+  Before that it was a stream seeded by phase alone, the same kind of
+  traffic but not the same operations; see
+  [the sixth re-run](#re-run-2026-11-15-evidence-for-the-plan-cache-and-the-same-traffic-for-both).
 - **level 0:** the floor. It also serves as the reference: every manual
   configuration's sampled answers (every 64th query) are compared with level
   0's on the identical query stream. Adaptive answers are checked by the
@@ -636,3 +661,202 @@ on either. One-minute load average was 3.3 at the start and 1.9 at the end.
   that never clears the bar. Aggregate also wants the column store and a
   materialized view, and in that phase adaptive still carries the
   range-filter phase's index and clustering.
+
+## Re-run 2026-11-15: evidence for the plan cache, and the same traffic for both
+
+The fifth re-run left three gaps at 20,000 rows (point filter 1.11×, range
+filter 1.48×, aggregate 1.72×), each with the plan cache in the expert's
+configuration and not in adaptive's. Each was taken apart with a scratch
+harness before anything changed: the expert's procedure (fresh database,
+warm 1,000, configure, warm 1,000, measure 2,000) for any set of
+overrides, splitting each query by whether the result cache answered it,
+and timing `Database::plan` on every eighth query. All pinned to CPU 2 at
+20,000 rows; figures are per repeat.
+
+### What the measurements located
+
+**The plan cache is not a cause anywhere.** Planning (`plan()`, which
+builds the planner's context and decides) took 0.4–2 µs. The result cache
+answers repeated queries before planning, so the queries that plan are the
+misses, and those execute for 1.2–5 ms (point filter), 0.4–0.6 ms (range)
+and 2–8.5 ms (aggregate): planning is under 0.5% of them. With and without
+the plan cache, everything else equal:
+
+| phase | without plan cache | with plan cache |
+|---|---|---|
+| point filter (result cache) | 2,242 / 2,310 ns | 2,505 / 2,330 ns |
+| aggregate (result cache, column store, views) | 1,115 / 1,119 ns | 1,097 ns (one repeat of two) |
+
+It is in the expert's configuration because level presets and the
+hand-written candidates include it, not because it does anything there.
+
+**Point filter and aggregate medians are result-cache hits, and which hit
+depends on the window.** In every configuration tried, 92% of the point
+filter window and 87% of the aggregate window were hits, and the median
+was a hit (~1.1 µs on aggregate in every configuration, including
+adaptive's). The adaptive soak's own windows had 88% and 75% hits. The two
+sides were measured on different operations: the expert on a stream seeded
+by phase, adaptive on the soak's. With fewer hits, adaptive's median sat in
+the upper third of its hit distribution while the expert's sat in the
+middle, whatever either was configured with. In the soak's aggregate
+phase, consecutive 2,000-operation windows on one unchanged database had
+67–82% hits.
+
+**Materialized views answer nothing in the aggregate phase.** Its queries
+filter (`age >= ?`) and a view answers only unfiltered groupings: no query
+in any configuration with views was answered by one, and misses were as
+slow with views as without (7.4 against 8.5 ms). The estimate's claim of
+nothing on filtered traffic is correct.
+
+**The column store would make aggregate misses 2.4× faster, but not beside
+the age index.** Misses (the p99, not the p50):
+
+| aggregate configuration | miss p50 |
+|---|---|
+| result cache only (scan) | 8.5 ms |
+| + b-tree on age | 4.65 ms |
+| + b-tree on age + clustered by age | 4.64 ms |
+| + b-tree on age + column store | 4.63 ms |
+| + column store, no index | 1.9 ms |
+
+With the index present the planner reads `age >= ?` (on average 58% of the
+rows) through the index and leaves the column store unused. That is also
+why the range phase's index survives into the aggregate phase: the planner
+chooses it, and it does beat a scan. The column store estimate claims
+nothing because index-served reads are not scans. Making it claim gain
+here would admit a structure the planner then ignores; the planner's choice
+between a wide index range and a column scan is the lever, and it is not
+changed here.
+
+**Clustering by age does nothing measurable** on range (525 against 521 µs)
+or aggregate misses (4.64 against 4.65 ms).
+
+**In the range phase, the direct array is the whole of level 11's
+advantage.** Medians, three repeats each, load average ~1.7:
+
+| range configuration | p50 |
+|---|---|
+| result cache + b-tree on age | 520–529 µs |
+| + clustered by age | 515–532 µs |
+| + direct lookup | 402–406 µs |
+| + clustered + direct lookup | 403–411 µs |
+| level 11 | 404–407 µs |
+| level 11 without direct lookup | 526–534 µs |
+
+Every range miss reads ~1,435 records through the index to return 50 (the
+`Limit` is not pushed into the index range), each fetched by id; the
+direct array makes those fetches cheaper. Pushing the limit down would cut
+the fetches 28-fold for every configuration; it is an executor change
+outside this work.
+
+### Changes
+
+- **Planning time per query shape is recorded** (`Event::Planned`,
+  `Snapshot::planning`): what each decision cost, measured when made and
+  remembered by the cache on a hit, and whether the plan cache served it.
+  While the cache is off a ghost of it (shapes only, under the real
+  cache's admission, eviction and clear-on-index-change rules) says which
+  queries it would have served. The plan cache's estimate is the saved
+  planning time over total query time, its memory the bytes it holds or
+  would hold, its confidence growing with the queries planned. On this
+  benchmark that is well under 1%, so it is still not enabled, now on
+  evidence.
+- **The direct array claims its gain on index-served fetches**, not only on
+  lookups by id (`WorkloadMix::index_fetches`, `id_fetch_share`). What the
+  result cache answers among filtered reads is now its hit rate over the
+  reads that reached it: during an experiment queries bypass the cache
+  without probing it, and the raw count made the range phase look like 80%
+  index fetches instead of ~55%. With the count, a soak admitted the direct
+  array in the range phase and dropped it again in the same phase.
+  In steady state its score there is ~0.2 against the 0.5 bar (speed
+  +3.3, resources −0.9, freedom −2.0, at 50% confidence): the default
+  priorities (speed 9, resources 3, freedom 5) value a second copy of the
+  table and a fixed-width commitment above a 23% faster range median. The
+  expert optimizes latency alone and does not pay those costs.
+- **The expert now runs the soak's own operations** (`expert.rs`,
+  `soak_traffic`): the generator is replayed through the earlier phases to
+  the same last tenth of the phase, over the same rows.
+
+Soak (`adabt-bench soak --size 20000 --log`, after all three): the same
+decisions as before in the first four phases, nothing added and dropped
+within a phase. The only retractions are of the previous phase's
+structures.
+
+### Run
+
+`taskset -c 2 adabt-bench expert-vs-adaptive --size 20000`, then
+`--size 5000`, 3 repeats each, 5,282 s and 1,409 s. One-minute load
+average 3.3 at the start of the 20,000-row run (the machine was shared),
+2.0 between the runs and 2.7 at the end. Because the first 20,000-row run
+started loaded, it was repeated straight after (4,833 s, load 2.0 at the
+start and 2.7 at the end). 6,426 manual answers checked against level 0 in
+each run; no divergence.
+
+#### 20,000 rows, first run
+
+| phase | expert p50 (range) | adaptive p50 (range) | ratio | fifth re-run | verdict | expert config |
+|---|---|---|---|---|---|---|
+| identity | 191 ns (189–191) | 203 ns (194–234) | 1.06× | 1.03× | behind | plan cache + direct lookup |
+| point filter | 1,789 ns (1,789–1,852) | 2,080 ns (2,018–2,465) | 1.16× | 1.11× | behind | level 11 |
+| range filter | 412.9 µs (404.0–415.2) | 608.7 µs (603.8–611.9) | 1.47× | 1.48× | behind | level 11 |
+| aggregate | 1,233 ns (1,174–1,305) | 2,026 ns (1,796–3,106) | 1.64× | 1.72× | behind | caches + column store + views |
+| identity again | 191 ns (191–194) | 277 ns (212–344) | 1.45× | 1.09× | behind | plan cache + direct lookup |
+
+#### 20,000 rows, second run
+
+| phase | expert p50 (range) | adaptive p50 (range) | ratio | verdict | expert config |
+|---|---|---|---|---|---|
+| identity | 193 ns (191–197) | 195 ns (191–197) | 1.01× | **matches** | plan cache + direct lookup |
+| point filter | 1,743 ns (1,734–1,819) | 1,979 ns (1,945–2,215) | 1.14× | behind | level 8 |
+| range filter | 421.9 µs (421.2–434.5) | 655.1 µs (644.9–659.8) | 1.55× | behind | level 11 |
+| aggregate | 1,759 ns (1,673–1,910) | 2,019 ns (1,911–3,182) | 1.15× | behind (by 1 ns) | level 7 |
+| identity again | 198 ns (196–277) | 292 ns (222–297) | 1.47× | matches (on the expert's outlier) | plan cache + direct lookup |
+
+#### 5,000 rows
+
+| phase | expert p50 (range) | adaptive p50 (range) | ratio | fourth re-run | verdict | expert config |
+|---|---|---|---|---|---|---|
+| identity | 197 ns (197–198) | 199 ns (197–206) | 1.01× | 1.05× | **matches** | level 11 |
+| point filter | 1,748 ns (1,744–1,778) | 1,790 ns (1,788–1,847) | 1.02× | 0.97× | behind | level 8 |
+| range filter | 116.1 µs (115.9–117.5) | 152.6 µs (152.6–155.4) | 1.31× | 1.62× | behind | level 11 |
+| aggregate | 1,217 ns (1,079–1,345) | 1,205 ns (1,203–1,211) | 0.99× | 1.26× | **matches** | caches + column store + views |
+| identity again | 197 ns (196–198) | 199 ns (198–201) | 1.01× | 1.04× | **matches** | direct lookup |
+
+Adaptive's configuration in every phase is unchanged from the fifth
+re-run: direct lookup; index on country and result cache; index and
+clustering on age and result cache (range and aggregate); direct lookup.
+
+### Reading the sixth re-run
+
+- **At 5,000 rows three of five phases match**, aggregate among them
+  (1.26× to 0.99×) now that both sides answer the same operations. Point
+  filter is 10 ns outside the expert's range.
+- **At 20,000 rows the two runs disagree by more than the changes.** The
+  first started at load 3.3 and its adaptive cells spread up to 65%
+  (identity again 212–344 ns, against 215 ns in the fifth re-run). In the
+  second, identity matches again, and identity again is 222–297 ns. The
+  identity phases run the expert's configuration; their spread is the
+  machine, not a choice.
+- **Range filter is behind by the direct array** (1.47× and 1.55×), which
+  adaptive can now claim on its evidence but which the default priorities
+  price above its gain, and by the soak's database: adaptive's own
+  configuration measured fresh is 520–529 µs, the soak's window 604–659 µs.
+- **Aggregate at 20,000 rows is no longer a window artifact but is not
+  settled either.** On the same operations the expert's best cell was
+  1,233 ns in one run and 1,759 ns in the other, and its winner changed
+  (column store with views, then level 7); adaptive was ~2,020 ns both
+  times with one slow repeat (~3.1 µs) each. All of these medians are
+  result-cache hits at the same position in the same window, so the
+  differences are in what a hit costs on a loaded database, not in which
+  structures exist. One asymmetry remains in the harness: adaptive's soak
+  runs the level-0 reference's 8 ms full scans between its queries (every
+  64th, and every query for 300 after a change), while manual candidates
+  have their answers checked afterwards.
+- **Point filter** is 1.14–1.16× at 20,000 rows and 1.02× at 5,000, on
+  medians that are result-cache hits. Adaptive's configuration is the
+  hand-written expert candidate's (index on country and both caches), which
+  measured 1,858 and 1,768 ns against adaptive's 2,080 and 1,979 ns: the
+  same configuration, ~200 ns apart, so this gap is the soak's database and
+  harness, not a choice.
+- **The plan cache is settled on evidence.** It saves under 1% here, and
+  the expert's figures do not depend on it.
