@@ -60,7 +60,7 @@ use adabt_core::policy::Durability;
 use adabt_core::schema::Schema;
 #[cfg(feature = "loom")]
 use loom::sync::Arc;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 #[cfg(not(feature = "loom"))]
 use std::sync::Arc;
@@ -75,6 +75,7 @@ mod checkpoint;
 mod commit;
 mod definitions;
 mod diagnostics;
+mod directory;
 mod logical_store;
 mod migration;
 mod mvcc;
@@ -85,6 +86,7 @@ mod tuning;
 mod write;
 
 pub use commit::TxnWrite;
+use directory::Directory;
 use mvcc::VersionChain;
 use placement::{ClusterState, FreeSpaceMap};
 pub use tuning::{RecordFootprint, FOOTPRINT_SAMPLE};
@@ -108,7 +110,7 @@ pub const MAX_RECORD_BYTES: usize = MAX_PAYLOAD - SLOT_PREFIX;
 struct Collection {
     id: CollectionId,
     codec: RecordCodec,
-    directory: BTreeMap<RecordId, VersionChain>,
+    directory: Directory,
     /// The id an auto-allocated insert will use next.
     ///
     /// Persisted, and never reused even across a restart: a manual insert at id
@@ -353,7 +355,7 @@ impl HeapStore {
             Collection {
                 id,
                 codec: RecordCodec::new(schema),
-                directory: BTreeMap::new(),
+                directory: Directory::default(),
                 next_record_id: 0,
                 cluster: None,
                 cluster_name: None,

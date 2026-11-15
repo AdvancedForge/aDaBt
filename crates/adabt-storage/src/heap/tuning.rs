@@ -185,7 +185,7 @@ impl HeapStore {
     /// the in-memory directory.
     fn sample_live(&self, name: &str) -> Result<(usize, Vec<RecordLocation>)> {
         let directory = &self.coll(name)?.directory;
-        let records = directory.values().filter(|v| v.newest().is_some()).count();
+        let records = directory.live();
         let stride = records.div_ceil(FOOTPRINT_SAMPLE).max(1);
         let sample = directory
             .values()

@@ -116,20 +116,12 @@ impl HeapStore {
         let horizon = self.versions.reclaim_horizon();
         let mut slots = Vec::new();
         for c in self.collections.values_mut() {
-            let mut empty_ids = Vec::new();
-            for (id, chain) in c.directory.iter_mut() {
-                for (txn, loc) in chain.reclaim_to(horizon) {
-                    slots.push(Release::of(c.id, *id, txn, loc));
-                }
-                // A chain holding only a tombstone no reader can precede is
-                // just overhead.
-                if chain.len() == 1 && chain.is_absent() {
-                    empty_ids.push(*id);
-                }
-            }
-            for id in empty_ids {
-                c.directory.remove(&id);
-            }
+            // A chain left holding only a tombstone no reader can precede is
+            // just overhead, and goes too.
+            let cid = c.id;
+            c.directory.reclaim_to(horizon, |id, txn, loc| {
+                slots.push(Release::of(cid, id, txn, loc));
+            });
         }
         let count = slots.len();
         self.release(slots)?;
@@ -313,8 +305,8 @@ impl HeapStore {
         let new_loc = self.place(&payload)?;
         let txn = self.versions.begin_write();
         if let Some(c) = self.collections.get_mut(collection) {
-            if let Some(chain) = c.directory.get_mut(&id) {
-                chain.push(txn, Some(new_loc));
+            if c.directory.contains_key(&id) {
+                c.directory.push(id, txn, Some(new_loc));
                 self.retained += 1;
             }
         }

@@ -252,13 +252,9 @@ impl LogicalStore for HeapStore {
         Ok(out)
     }
 
+    /// O(1): the directory keeps its live count as it changes.
     fn count(&mut self, collection: &str) -> Result<usize> {
-        Ok(self
-            .coll(collection)?
-            .directory
-            .values()
-            .filter(|v| !v.is_absent())
-            .count())
+        Ok(self.coll(collection)?.directory.live())
     }
 
     /// Straight off the in-memory page directory: no pages, no decodes.

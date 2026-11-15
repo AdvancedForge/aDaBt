@@ -10,7 +10,7 @@ use super::HeapStore;
 use crate::pager::BufferStats;
 
 impl HeapStore {
-    /// Approximate live row count without taking `&mut`.
+    /// Live row count without taking `&mut`, in O(1).
     ///
     /// Used by the planner's calibrated cost model: an index that matches a
     /// large fraction of the collection can be more expensive than a scan, but
@@ -18,7 +18,7 @@ impl HeapStore {
     /// half, and keeping it `&self` lets `plan_context` be `&self`.
     pub fn live_count(&self, collection: &str) -> Option<u64> {
         let c = self.collections.get(collection)?;
-        Some(c.directory.values().filter(|v| !v.is_absent()).count() as u64)
+        Some(c.directory.live() as u64)
     }
 
     /// The highest id in `collection` whose newest version is a live record,

@@ -109,8 +109,9 @@ fn heap_matches_the_reference_model_over_a_long_run() {
         .unwrap_or_else(|d| panic!("{d}"));
 }
 
-/// The highest live id read off the directory agrees with the last row of a
-/// scan, through inserts, updates and deletes, trailing deletes included.
+/// The highest live id and the live count, both read off the directory,
+/// agree with a scan through inserts, updates and deletes, trailing deletes
+/// included.
 #[test]
 fn max_live_id_matches_the_last_scanned_row() {
     let cfg = config();
@@ -121,11 +122,17 @@ fn max_live_id_matches_the_last_scanned_row() {
         for step in 0..400 {
             let _ = apply(&mut h, &gen.next_op());
             for (name, _) in &cfg.collections {
-                let want = h.scan(name).unwrap().last().map(|(id, _)| *id);
+                let rows = h.scan(name).unwrap();
+                let want = rows.last().map(|(id, _)| *id);
                 assert_eq!(
                     h.max_live_id(name).unwrap(),
                     want,
                     "seed {seed:#x} step {step} collection {name}"
+                );
+                assert_eq!(
+                    h.live_count(name),
+                    Some(rows.len() as u64),
+                    "live count, seed {seed:#x} step {step} collection {name}"
                 );
             }
         }

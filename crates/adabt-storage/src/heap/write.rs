@@ -109,9 +109,7 @@ impl HeapStore {
         self.payload = payload;
         let loc = placed?;
         let c = self.collections.get_mut(collection).expect("checked above");
-        let chain = c.directory.entry(id).or_default();
-        let superseded = !chain.versions.is_empty();
-        chain.push(txn, Some(loc));
+        let superseded = c.directory.push(id, txn, Some(loc));
         c.note_write(txn, id);
         // Every write through here — manual or auto-allocated, live or
         // replayed — pushes the sequence past whatever id it just used. This is
@@ -130,15 +128,12 @@ impl HeapStore {
         let Some(c) = self.collections.get_mut(collection) else {
             return Ok(false);
         };
-        let Some(chain) = c.directory.get_mut(&id) else {
-            return Ok(false);
-        };
-        if chain.is_absent() {
+        if c.directory.get(&id).is_none_or(|chain| chain.is_absent()) {
             return Ok(false);
         }
         // A tombstone rather than a removal: a reader whose snapshot predates
         // the delete must still find the record.
-        chain.push(txn, None);
+        c.directory.push(id, txn, None);
         c.note_write(txn, id);
         self.retained += 1;
         self.maybe_reclaim()?;

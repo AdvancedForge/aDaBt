@@ -354,7 +354,7 @@ impl HeapStore {
                 continue;
             };
             for (id, loc) in records {
-                c.directory.insert(id, VersionChain::recovered(loc));
+                c.directory.insert_recovered(id, loc);
             }
         }
         // A page vacuum truncated after the checkpoint is gone, and must not
@@ -386,7 +386,7 @@ impl HeapStore {
         let Some(loc) = c.directory.get(&id).and_then(VersionChain::only_recovered) else {
             return Ok(());
         };
-        c.directory.remove(&id);
+        c.directory.remove(id);
         let release = Release::of(c.id, id, RECOVERED, loc);
         self.release(vec![release]).map(|_| ())
     }
