@@ -12,7 +12,7 @@ pub mod histogram;
 pub mod probe;
 pub mod sketch;
 
-pub use collector::{CollectingProbe, OpStats, ShapeStats, Snapshot};
+pub use collector::{CollectingProbe, OpStats, PlanningStats, ShapeStats, Snapshot};
 pub use event::{Event, OpKind, QueryShape};
 pub use export::to_prometheus_text;
 pub use histogram::Histogram;

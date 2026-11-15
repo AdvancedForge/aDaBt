@@ -156,6 +156,22 @@ pub enum Event<'a> {
     /// from its capacity, which overstates it by however many slots the
     /// workload never fills.
     CacheResident { name: &'static str, bytes: u64 },
+    /// A query reached planning: its access decision was made, or taken from
+    /// the plan cache.
+    ///
+    /// **The evidence a plan cache is judged on.** What a plan cache saves is
+    /// planning time, and only on the queries it would have served, so both
+    /// halves are recorded here per shape: `nanos` is what making this
+    /// decision costs (measured when it was made, remembered by the cache
+    /// when it was served), and `saved` says whether the plan cache served it
+    /// or, while it is off, whether its ghost would have. Set against the
+    /// time queries take, that is the fraction of query time a plan cache
+    /// removes, with nothing assumed.
+    Planned {
+        shape: QueryShape,
+        nanos: u64,
+        saved: bool,
+    },
     /// An optimization changed state.
     OptChanged { name: &'static str, enabled: bool },
 }

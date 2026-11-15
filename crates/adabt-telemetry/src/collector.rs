@@ -61,6 +61,20 @@ impl ShapeStats {
     }
 }
 
+/// Per-query-shape planning cost: what a plan cache is judged on.
+///
+/// See [`Event::Planned`]. Decays with the other counts, so it describes the
+/// planning the workload does now.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PlanningStats {
+    /// Queries of this shape that reached planning.
+    pub calls: u64,
+    /// What planning them cost, in total.
+    pub nanos: u64,
+    /// The part of `nanos` the plan cache saved, or would have saved.
+    pub saved_nanos: u64,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct Snapshot {
     pub per_op: HashMap<OpKind, OpStats>,
@@ -94,6 +108,8 @@ pub struct Snapshot {
     /// `(collection, field)` -> index entries written on the write path.
     /// The cost half of retraction; `index_usage` is the benefit half.
     pub index_maintenance: HashMap<(String, String), u64>,
+    /// Planning cost per query shape; see [`Event::Planned`].
+    pub planning: HashMap<QueryShape, PlanningStats>,
     pub touches: u64,
     pub temperature: Option<TemperatureSketch>,
     pub opt_changes: Vec<(&'static str, bool)>,
@@ -134,6 +150,23 @@ impl Snapshot {
     pub fn probes(&self, cache: &str) -> u64 {
         self.cache_hits.get(cache).copied().unwrap_or(0)
             + self.cache_misses.get(cache).copied().unwrap_or(0)
+    }
+
+    /// Planning cost summed over every shape.
+    pub fn total_planning(&self) -> PlanningStats {
+        self.planning
+            .values()
+            .fold(PlanningStats::default(), |acc, p| PlanningStats {
+                calls: acc.calls + p.calls,
+                nanos: acc.nanos + p.nanos,
+                saved_nanos: acc.saved_nanos + p.saved_nanos,
+            })
+    }
+
+    /// Time spent answering queries, summed over every query shape: the
+    /// denominator against which a saving on the query path is a fraction.
+    pub fn total_query_nanos(&self) -> u64 {
+        self.per_shape.values().map(|s| s.total_nanos).sum()
     }
 
     pub fn latency(&self, kind: OpKind) -> Option<&Histogram> {
@@ -280,6 +313,7 @@ struct Shard {
     projected_covers: HashMap<(String, String, Vec<String>, bool), u64>,
     index_usage: HashMap<(String, String), u64>,
     index_maintenance: HashMap<(String, String), u64>,
+    planning: HashMap<QueryShape, PlanningStats>,
     touches: u64,
     temperature: TemperatureSketch,
     opt_changes: Vec<(&'static str, bool)>,
@@ -388,6 +422,12 @@ impl CollectingProbe {
             for (k, v) in &g.equality_filters {
                 *out.equality_filters.entry(k.clone()).or_default() += v;
             }
+            for (shape, p) in &g.planning {
+                let e = out.planning.entry(*shape).or_default();
+                e.calls += p.calls;
+                e.nanos += p.nanos;
+                e.saved_nanos += p.saved_nanos;
+            }
             for (k, v) in &g.pinned_sets {
                 *out.pinned_sets.entry(k.clone()).or_default() += v;
             }
@@ -474,6 +514,11 @@ impl CollectingProbe {
             for v in g.index_maintenance.values_mut() {
                 scale(v);
             }
+            for p in g.planning.values_mut() {
+                scale(&mut p.calls);
+                scale(&mut p.nanos);
+                scale(&mut p.saved_nanos);
+            }
             // Latency histograms and the temperature sketch are left alone: the
             // first is a distribution rather than a count, and the second does
             // its own decaying.
@@ -559,6 +604,18 @@ impl Probe for CollectingProbe {
                     *g.cache_hits.entry(name).or_default() += 1;
                 } else {
                     *g.cache_misses.entry(name).or_default() += 1;
+                }
+            }
+            Event::Planned {
+                shape,
+                nanos,
+                saved,
+            } => {
+                let p = g.planning.entry(shape).or_default();
+                p.calls += 1;
+                p.nanos += nanos;
+                if saved {
+                    p.saved_nanos += nanos;
                 }
             }
             Event::OptChanged { name, enabled } => g.opt_changes.push((name, enabled)),
@@ -817,5 +874,51 @@ mod tests {
         let s = p.snapshot();
         assert_eq!(s.total_calls(), 0);
         assert!(s.per_shape.is_empty());
+    }
+
+    #[test]
+    fn planning_cost_is_kept_per_shape_and_split_by_what_a_cache_saved() {
+        let p = CollectingProbe::new();
+        for saved in [false, true, true] {
+            p.record(Event::Planned {
+                shape: QueryShape(7),
+                nanos: 1_000,
+                saved,
+            });
+        }
+        p.record(Event::Planned {
+            shape: QueryShape(8),
+            nanos: 400,
+            saved: false,
+        });
+        let s = p.snapshot();
+        assert_eq!(
+            s.planning[&QueryShape(7)],
+            PlanningStats {
+                calls: 3,
+                nanos: 3_000,
+                saved_nanos: 2_000
+            }
+        );
+        let total = s.total_planning();
+        assert_eq!(
+            (total.calls, total.nanos, total.saved_nanos),
+            (4, 3_400, 2_000)
+        );
+    }
+
+    #[test]
+    fn planning_cost_decays_with_the_other_counts() {
+        let p = CollectingProbe::new();
+        for _ in 0..4 {
+            p.record(Event::Planned {
+                shape: QueryShape(7),
+                nanos: 1_000,
+                saved: true,
+            });
+        }
+        p.decay(3, 4);
+        let s = p.snapshot().planning[&QueryShape(7)];
+        assert_eq!((s.calls, s.nanos, s.saved_nanos), (3, 3_000, 3_000));
     }
 }
