@@ -401,6 +401,11 @@ fn run<S: Source>(
             relational::project(input, fields, src, stats, budget)
         }
         PhysicalOp::Limit { input, n } => relational::limit(input, *n, src, stats, budget),
+        PhysicalOp::LimitedFetch {
+            access,
+            predicates,
+            n,
+        } => index::limited_fetch(access, predicates, *n, src, stats, budget),
         PhysicalOp::Sort { input, keys } => relational::sort(input, keys, src, stats, budget),
         PhysicalOp::Aggregate {
             input,

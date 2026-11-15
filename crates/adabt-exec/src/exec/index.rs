@@ -11,7 +11,7 @@ use adabt_ir::Expr;
 use std::ops::Bound;
 
 use super::access::scan_heap;
-use super::{batches_of, fetch_batches, ExecBudget, ExecStats, Source};
+use super::{batches_of, fetch_batches, ExecBudget, ExecStats, Source, CANCEL_CHECK_INTERVAL};
 use crate::batch::{RecordBatch, BATCH_SIZE};
 use crate::physical::PhysicalOp;
 
@@ -248,4 +248,82 @@ pub(super) fn index_range<S: Source>(
             scan_heap(collection, src, stats, budget)
         }
     }
+}
+
+/// `Limit(n)` over `Filter`s over a fetching index access, fetching only as
+/// far as the `n`-th row the filters keep. See `PhysicalOp::LimitedFetch`.
+///
+/// Every step that decides the answer is the unbounded path's own: the same
+/// probe of the same index, the same fallback to every id of the collection
+/// when the index is missing (counted as a miss), the same sort and dedup of
+/// ids into record-id order that `fetch_batches` performs, the same `fetch`
+/// that skips a row that no longer exists, and the same compiled predicates
+/// `Filter` runs. Only the stopping point differs, and it is the point after
+/// which `Limit` would have discarded everything.
+pub(super) fn limited_fetch<S: Source>(
+    access: &PhysicalOp,
+    predicates: &[Expr],
+    n: usize,
+    src: &mut S,
+    stats: &mut ExecStats,
+    budget: &ExecBudget,
+) -> Result<Vec<RecordBatch>> {
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let collection = access.collection();
+    stats.index_probes += 1;
+    let ids = match access {
+        PhysicalOp::IndexRange { field, lo, hi, .. } => {
+            src.index_range(collection, field, lo.as_ref(), hi.as_ref())?
+        }
+        PhysicalOp::IndexLookup { field, key, .. } => src.index_lookup(collection, field, key)?,
+        PhysicalOp::CompositeLookup { fields, key, .. } => {
+            src.composite_lookup(collection, fields, key)?
+        }
+        other => unreachable!(
+            "the planner pushes a limit only into a fetching index access, not {}",
+            other.name()
+        ),
+    };
+    let mut ids = match ids {
+        Some(ids) => ids,
+        None => {
+            // As the unbounded accesses do: the answer stays correct, read
+            // from every row, and the disagreement is counted.
+            stats.index_misses += 1;
+            src.all_ids(collection)?
+        }
+    };
+    ids.sort_unstable();
+    ids.dedup();
+
+    let programs: Vec<Program> = predicates.iter().map(Program::compile).collect();
+    let mut out = Vec::new();
+    let mut current = RecordBatch::with_capacity(BATCH_SIZE.min(n));
+    let mut kept = 0usize;
+    for (i, id) in ids.into_iter().enumerate() {
+        if kept == n {
+            break;
+        }
+        if i % CANCEL_CHECK_INTERVAL == 0 {
+            budget.check_cancelled()?;
+        }
+        let Some(rec) = src.fetch(collection, id)? else {
+            continue;
+        };
+        stats.rows_scanned += 1;
+        if !programs.iter().all(|p| p.matches(&rec)) {
+            continue;
+        }
+        current.push(id, rec);
+        kept += 1;
+        if current.len() >= BATCH_SIZE {
+            out.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    Ok(out)
 }

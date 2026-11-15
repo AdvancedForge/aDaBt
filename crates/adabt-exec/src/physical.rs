@@ -109,6 +109,37 @@ pub enum PhysicalOp {
         input: Box<PhysicalOp>,
         n: usize,
     },
+    /// The first `n` rows, in record-id order, that an index access yields
+    /// and every one of `predicates` keeps: a `Limit` pushed through the
+    /// filters above a fetching index access, into the fetch itself.
+    ///
+    /// `access` is an `IndexRange`, `IndexLookup` or `CompositeLookup` — the
+    /// access paths whose cost is a fetch per id. The index is asked for its
+    /// ids exactly as those operators ask, and the ids are put in record-id
+    /// order exactly as they put them, so the answer is the first `n` rows of
+    /// `Limit(Filter(access))` and nothing else. What changes is that ids are
+    /// then fetched one at a time and judged as they arrive, and the fetching
+    /// stops at the `n`-th row the predicates keep, rather than fetching every
+    /// id in the range for the limit to throw all but `n` of them away.
+    ///
+    /// The limit counts rows *after* `predicates`, which are the residual
+    /// filter the planner keeps above every index access; a row the index
+    /// matched and the filter rejects does not use up the limit. A row that
+    /// no longer exists is skipped exactly as the fetch skips it. The index
+    /// walk itself still visits the whole range: the answer is in id order
+    /// and the index is in key order, so the `n` smallest ids are not known
+    /// until every id in the range is. Collecting ids is cheap next to
+    /// fetching their records, which is the part this bounds.
+    ///
+    /// The planner emits it only for a `Limit` whose input is, through any
+    /// projections, filters directly over such an access. A `Sort` or an
+    /// `Aggregate` in between blocks it, because then the limit counts rows
+    /// of a different order or of a different relation.
+    LimitedFetch {
+        access: Box<PhysicalOp>,
+        predicates: Vec<Expr>,
+        n: usize,
+    },
     Aggregate {
         input: Box<PhysicalOp>,
         group_by: Vec<String>,
@@ -147,6 +178,7 @@ impl PhysicalOp {
             | PhysicalOp::Sort { input, .. }
             | PhysicalOp::Limit { input, .. }
             | PhysicalOp::Aggregate { input, .. } => Some(input),
+            PhysicalOp::LimitedFetch { access, .. } => Some(access),
             PhysicalOp::Join { .. } => {
                 panic!("child() called on a Join; use children()")
             }
@@ -193,9 +225,25 @@ impl PhysicalOp {
             PhysicalOp::Project { .. } => "Project",
             PhysicalOp::Sort { .. } => "Sort",
             PhysicalOp::Limit { .. } => "Limit",
+            PhysicalOp::LimitedFetch { .. } => "LimitedFetch",
             PhysicalOp::Aggregate { .. } => "Aggregate",
             PhysicalOp::Join { .. } => "Join",
         }
+    }
+
+    /// Whether this is an index access that yields ids and then fetches a
+    /// record per id: the accesses a `LimitedFetch` can bound.
+    ///
+    /// Covering accesses are not among them — they fetch nothing, so there
+    /// is no per-id fetch to stop — and neither is a scan, whose ids come
+    /// from the collection rather than from an index.
+    pub fn is_fetching_index_access(&self) -> bool {
+        matches!(
+            self,
+            PhysicalOp::IndexRange { .. }
+                | PhysicalOp::IndexLookup { .. }
+                | PhysicalOp::CompositeLookup { .. }
+        )
     }
 
     /// Whether this plan reads the whole collection.
@@ -294,6 +342,13 @@ impl PhysicalOp {
                         .join(", ")
                 ),
                 PhysicalOp::Limit { n, .. } => format!("Limit({n})"),
+                PhysicalOp::LimitedFetch { n, predicates, .. } => {
+                    if predicates.is_empty() {
+                        format!("LimitedFetch(first {n} by id)")
+                    } else {
+                        format!("LimitedFetch(first {n} by id, where {predicates:?})")
+                    }
+                }
                 PhysicalOp::Aggregate { group_by, aggs, .. } => format!(
                     "Aggregate(by [{}], {})",
                     group_by.join(", "),
