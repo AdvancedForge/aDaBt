@@ -3,12 +3,12 @@
 The "automatically optimal" goal says an expert tuning by hand adds nothing
 over the adaptive engine. This is the measurement of that claim.
 
-**Latest (2026-11-14, second re-run): record compression is fixed and was
-not the cause.** Its estimate now sizes the saving from the stored records,
-adaptive no longer enables it at any size, and the 20,000-row gaps remain:
-3 of 5 phases match at 5,000 rows, 1 of 5 at 20,000, with the identity
-phases behind on the same configuration as the expert. See
-[the second re-run](#re-run-2026-11-14-record-compression-sized-from-the-records).
+**Latest (2026-11-14, third re-run, 20,000 rows only): the optimizer's
+inputs are now sampled.** Range filter moved from 1.74× to 1.23× behind and
+aggregate from 1.99× to 1.12×. The identity phases did not move (1.33× and
+1.52×) on the expert's own configuration, so per-cycle scans were not their
+cause. At 5,000 rows the second re-run stands: 3 of 5 phases match. See
+[the third re-run](#re-run-2026-11-14-a-bounded-sample-each-cycle).
 
 **Result (2026-11-14 re-run): the claim does not hold yet, but the
 gaps are now small.** After the scoring fixes described in
@@ -431,3 +431,41 @@ configurations, so the next suspect there is the adaptive database's state
 and its decision cycles, not its choices. The aggregate and range gaps
 still have the plan cache and the aggregate hit path as their unseparated
 suspects.
+
+## Re-run 2026-11-14: a bounded sample each cycle
+
+**Change.** Every optimization cycle (every 500 operations, including inside
+measured windows) summed every live record's stored size and read every
+record's framing for the compression footprint: a page read per record,
+twice, at a cost that grows with the database. Both now come from an evenly
+spaced sample of at most 256 records per collection
+(`HeapStore::record_footprint`, `HeapStore::sampled_stored_bytes`), commit
+`50fe324`.
+
+**Run.** `adabt-bench expert-vs-adaptive --size 20000`, 3 repeats, 5,459 s.
+One-minute load average was 3.8 at the start and 2.3 at the end; the machine
+was shared. 6,426 manual answers checked against level 0; no divergence.
+
+| phase | level 0 p50 | expert p50 | adaptive p50 | ratio | previous | verdict | adaptive config |
+|---|---|---|---|---|---|---|---|
+| identity | 402 ns | 209 ns | 278 ns | 1.33× | 1.34× | behind | direct_lookup |
+| point filter | 5,717 µs | 1,691 ns | 1,879 ns | 1.11× | 1.12× | behind | auto_index[country], result_cache |
+| range filter | 4,272 µs | 539.8 µs | 666.5 µs | 1.23× | 1.74× | behind | auto_index[age], clustered_sort[age], result_cache |
+| aggregate | 13.06 ms | 1,550 ns | 1,729 ns | 1.12× | 1.99× | behind | auto_index[age], clustered_sort[age], result_cache |
+| identity again | 452 ns | 195 ns | 297 ns | 1.52× | 1.50× | behind | direct_lookup |
+
+### Reading the third re-run
+
+- **Range filter and aggregate closed most of their gap.** Their
+  configurations are unchanged, so the full-record passes each cycle were a
+  real part of those losses. The aggregate cell's adaptive range is still
+  wide (1.70–5.09 µs), so its ratio is not settled.
+- **The identity phases did not move.** Adaptive runs the expert's exact
+  configuration and is about 70–100 ns slower at the median. A per-cycle cost
+  every 500 operations cannot move a median by that much, so the difference
+  is paid on every lookup: what an adaptive database does per operation
+  (telemetry recording, the compiled path's tally, the result-cache ghost)
+  or the state its history left behind. Measuring a manual database with
+  telemetry at the adaptive setting separates the two.
+- **Point filter** is 1.11×, within the spread of the adaptive cell
+  (1.86–2.35 µs).

@@ -6,6 +6,12 @@ A correctness and code-quality pass. The existing formats are unchanged; two
 files are new (`base.adabt`, `superseded-log/`).
 
 ### Fixed
+- **Every optimization cycle read every live record twice.** Summing stored
+  bytes and measuring the compression footprint each touched a page per
+  record, every 500 operations and inside measured windows. Both now read
+  an evenly spaced sample of at most 256 records per collection
+  (`HeapStore::sampled_stored_bytes`). At 20k rows, adaptive's range filter
+  went from 1.74× to 1.23× the expert and aggregate from 1.99× to 1.12×.
 - **Record compression's estimate claimed to free more than the database
   held.** It assumed a fixed 64 bytes saved a row. The expert comparison's
   records are about 43 bytes, below the size the store compresses at all,
