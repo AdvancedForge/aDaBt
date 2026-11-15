@@ -554,6 +554,13 @@ impl Database {
                     name: "plan_cache",
                     hit: true,
                 });
+                if mode.is_counted() {
+                    self.telemetry.probe.record(Event::Planned {
+                        shape: adabt_telemetry::QueryShape(shape.0),
+                        nanos: self.caches.plans.cost_of(shape),
+                        saved: true,
+                    });
+                }
                 d
             }
             None => {
@@ -563,13 +570,46 @@ impl Database {
                         hit: false,
                     });
                 }
+                // Timed, context included: building the planner's view of
+                // the indexes and stores is part of what a cached decision
+                // skips.
+                let started = Instant::now();
                 let d = adabt_exec::planner::decide(&logical.root, &self.plan_context());
+                let nanos = started.elapsed().as_nanos() as u64;
                 if mode.uses_caches() {
-                    self.caches.plans.insert(shape, || d.clone());
+                    self.caches.plans.insert_costing(shape, nanos, || d.clone());
+                }
+                if mode.uses_caches() && mode.is_counted() {
+                    self.note_planned(shape, nanos);
                 }
                 d
             }
         }
+    }
+
+    /// Record what planning this query cost and whether a plan cache would
+    /// have saved it: the evidence the plan cache is judged on.
+    ///
+    /// While the cache is off its ghost answers whether it would have held
+    /// this shape, the way the result cache's ghost does for answers.
+    fn note_planned(&mut self, shape: QueryShape, nanos: u64) {
+        let plans = &mut self.caches.plans;
+        let saved = if plans.enabled() {
+            false
+        } else {
+            let hit = plans.would_hit(shape);
+            plans.note_would_insert(shape);
+            self.telemetry.probe.record(Event::CacheProbe {
+                name: crate::caches::PLAN_CACHE_GHOST,
+                hit,
+            });
+            hit
+        };
+        self.telemetry.probe.record(Event::Planned {
+            shape: adabt_telemetry::QueryShape(shape.0),
+            nanos,
+            saved,
+        });
     }
 
     /// Tell telemetry which index, if any, the chosen plan reads through.

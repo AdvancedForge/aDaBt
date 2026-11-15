@@ -4,7 +4,7 @@
 //! All three spend memory, or write-path work, to skip repeating a computation
 //! whose result is already known.
 
-use crate::caches::{RESULT_CACHE_ENTRIES, RESULT_CACHE_GHOST};
+use crate::caches::{PLAN_CACHE_ENTRIES, RESULT_CACHE_ENTRIES, RESULT_CACHE_GHOST};
 use adabt_core::policy::GuaranteeRequirements;
 use adabt_opt::action::{Action, ChangePlan};
 use adabt_opt::config::Params;
@@ -36,15 +36,47 @@ impl Optimization for PlanCacheOpt {
     fn applicability(&self, _ctx: &OptContext<'_>) -> Applicability {
         Applicability::Applicable
     }
-    fn estimate(&self, _ctx: &OptContext<'_>) -> CostEstimate {
-        // Planning is a small part of a query's cost, so the benefit is modest
-        // and the confidence low until measured.
-        CostEstimate::faster(0.95, 0.95)
-            .with_ram(512 * 4_096)
-            .with_confidence(0.4)
+    /// Judged on the planning time the cache saves, or would save, as a
+    /// fraction of the time queries take.
+    ///
+    /// A plan cache skips planning, and only for a shape whose decision it
+    /// still holds, so what it is worth is two measurements: what planning
+    /// costs, and how much of that a cache would have served. The engine
+    /// records both per shape (`Event::Planned`): planning is timed whenever
+    /// it happens, a hit reports the planning it skipped, and while the cache
+    /// is off a ghost of it says which queries it would have served. Set
+    /// against the time every query took, that is the share of query time
+    /// the cache removes.
+    ///
+    /// The prior this replaces claimed 5% on every workload and never cleared
+    /// the bar. On the expert comparison planning measured 0.4–2 µs, and the
+    /// result cache already answers most repeated queries before planning, so
+    /// the queries that do plan are the ones whose execution takes 0.4–5 ms:
+    /// what a plan cache could save there is a fraction of a percent. See
+    /// `docs/benchmarks/expert-vs-adaptive.md`.
+    fn estimate(&self, ctx: &OptContext<'_>) -> CostEstimate {
+        let t = ctx.telemetry;
+        let planning = t.total_planning();
+        let query_nanos = t.total_query_nanos();
+        let gain = if query_nanos == 0 {
+            0.0
+        } else {
+            (planning.saved_nanos as f64 / query_nanos as f64).min(1.0)
+        };
+        let n = planning.calls as f64;
+        CostEstimate::faster(1.0 - gain, 1.0 - gain)
+            .with_ram(
+                t.cache_resident_bytes
+                    .get("plan_cache")
+                    .copied()
+                    .unwrap_or(0) as i64,
+            )
+            .with_confidence(MAX_CACHE_CONFIDENCE * n / (n + HALF_TRUST_PROBES))
     }
     fn plan_enable(&self, ctx: &OptContext<'_>, _scope: &str, _params: &Params) -> ChangePlan {
-        let n = entries(ctx, 512);
+        // The size the ghost simulates, so the cache that is turned on is the
+        // one whose savings were measured.
+        let n = entries(ctx, PLAN_CACHE_ENTRIES);
         ChangePlan::new(
             vec![Action::SetPlanCacheEntries(n)],
             vec![Action::SetPlanCacheEntries(0)],
@@ -295,6 +327,75 @@ mod tests {
             bytes: resident,
         });
         probe.snapshot()
+    }
+
+    /// Telemetry in which `planned` queries reached planning at `nanos` each,
+    /// `saved` of which a plan cache served or would have, among queries that
+    /// took `query_nanos` in total.
+    fn planning(
+        planned: u64,
+        saved: u64,
+        nanos: u64,
+        query_nanos: u64,
+    ) -> adabt_telemetry::Snapshot {
+        let probe = CollectingProbe::new();
+        for i in 0..planned {
+            probe.record(Event::Planned {
+                shape: adabt_telemetry::QueryShape(1),
+                nanos,
+                saved: i < saved,
+            });
+        }
+        probe.record(Event::Op {
+            collection: "users",
+            kind: adabt_telemetry::OpKind::Scan,
+            shape: adabt_telemetry::QueryShape(1),
+            nanos: query_nanos,
+            rows: 1,
+        });
+        probe.snapshot()
+    }
+
+    #[test]
+    fn with_no_evidence_the_plan_cache_claims_nothing() {
+        let fx = Fx::new();
+        let e = PlanCacheOpt.estimate(&fx.ctx());
+        assert!(!e.helps_latency(), "{e:?}");
+        assert_eq!(e.confidence, 0.0);
+    }
+
+    #[test]
+    fn the_plan_cache_claims_the_share_of_query_time_it_saves() {
+        let mut fx = Fx::new();
+        // Planning is a third of query time and the cache would serve 90% of
+        // it: 30% of query time saved.
+        fx.snap = planning(1_000, 900, 1_000, 3_000_000);
+        let e = PlanCacheOpt.estimate(&fx.ctx());
+        assert!((e.p50_delta.0 - 0.7).abs() < 1e-9, "{e:?}");
+    }
+
+    #[test]
+    fn planning_dwarfed_by_execution_is_not_worth_caching() {
+        // The expert comparison's point-filter phase: a microsecond of
+        // planning on queries that execute for a millisecond or more.
+        let mut fx = Fx::new();
+        fx.snap = planning(150, 140, 1_000, 150 * 1_300_000);
+        let e = PlanCacheOpt.estimate(&fx.ctx());
+        assert!(e.p50_delta.0 > 0.999, "{e:?}");
+        let s = adabt_opt::score::score_against(
+            &PlanCacheOpt.meta().axis_effects,
+            &e,
+            fx.ctx().policy,
+            fx.ctx().current_bytes,
+        );
+        assert!(s.total < 0.5, "{}", s.describe());
+    }
+
+    #[test]
+    fn a_plan_cache_without_repeats_saves_nothing_however_slow_planning_is() {
+        let mut fx = Fx::new();
+        fx.snap = planning(1_000, 0, 50_000, 1_000 * 60_000);
+        assert!(!PlanCacheOpt.estimate(&fx.ctx()).helps_latency());
     }
 
     #[test]

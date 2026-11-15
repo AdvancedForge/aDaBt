@@ -223,6 +223,10 @@ impl Database {
             name: "result_cache",
             bytes: self.caches.results.resident_bytes() as u64,
         });
+        self.telemetry.probe.record(Event::CacheResident {
+            name: "plan_cache",
+            bytes: self.caches.plans.resident_bytes() as u64,
+        });
         self.report_compiled_traffic();
         let snapshot = self.telemetry.probe.snapshot();
         let collections = self.collection_sizes()?;

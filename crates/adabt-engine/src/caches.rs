@@ -49,10 +49,66 @@ impl CacheStats {
 #[derive(Default)]
 pub struct PlanCache {
     entries: HashMap<QueryShape, PlanDecision>,
+    /// What making each held decision cost, so a hit can report the planning
+    /// it saved.
+    costs: HashMap<QueryShape, u64>,
     /// Insertion order, for eviction.
     order: Vec<QueryShape>,
     capacity: usize,
     stats: CacheStats,
+    /// The shapes a cache of [`PLAN_CACHE_ENTRIES`] would hold, kept only
+    /// while this one is off.
+    ghost: PlanGhost,
+}
+
+/// Entries a plan cache holds when the optimizer turns it on, and therefore
+/// the size of the ghost that predicts what such a cache would do while it is
+/// off.
+pub const PLAN_CACHE_ENTRIES: usize = 512;
+
+/// The telemetry name the plan cache ghost's would-be hits and misses are
+/// recorded under, apart from `"plan_cache"` for the same reason as
+/// [`RESULT_CACHE_GHOST`].
+pub const PLAN_CACHE_GHOST: &str = "plan_cache_ghost";
+
+/// Bytes one plan cache entry is charged: the decision, its key and cost, and
+/// the map's own overhead. An approximation on the scale of
+/// [`ResultCache::resident_bytes`], used for the gauge the optimizer weighs a
+/// plan cache's memory by.
+const PLAN_ENTRY_BYTES: usize = std::mem::size_of::<PlanDecision>() + 64;
+
+/// A plan cache that keeps shapes but no decisions.
+///
+/// The plan cache's counterpart of the result cache's ghost: whether a plan
+/// cache would be hit is a fact about how often shapes repeat between index
+/// changes, which a cache that is off cannot see. This runs the real cache's
+/// admission, oldest-first eviction and clear-on-index-change rules on the
+/// shapes alone.
+#[derive(Default)]
+struct PlanGhost {
+    seen: std::collections::HashSet<QueryShape>,
+    order: VecDeque<QueryShape>,
+}
+
+impl PlanGhost {
+    fn admit(&mut self, shape: QueryShape) {
+        if !self.seen.insert(shape) {
+            return;
+        }
+        self.order.push_back(shape);
+        while self.seen.len() > PLAN_CACHE_ENTRIES {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    self.seen.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        *self = PlanGhost::default();
+    }
 }
 
 impl PlanCache {
@@ -85,6 +141,10 @@ impl PlanCache {
         while self.entries.len() > self.capacity {
             self.evict_one();
         }
+        // A real cache now measures itself; the ghost would only shadow it.
+        if self.enabled() {
+            self.ghost.clear();
+        }
     }
 
     fn evict_one(&mut self) {
@@ -93,7 +153,37 @@ impl PlanCache {
         }
         let victim = self.order.remove(0);
         self.entries.remove(&victim);
+        self.costs.remove(&victim);
         self.stats.evictions += 1;
+    }
+
+    /// What making the held decision for `shape` cost, 0 if none is held.
+    pub fn cost_of(&self, shape: QueryShape) -> u64 {
+        self.costs.get(&shape).copied().unwrap_or(0)
+    }
+
+    /// While the cache is off: whether it would have held a decision for
+    /// `shape`. Always `false` while it is on, for the reason
+    /// [`ResultCache::would_hit`] gives.
+    pub fn would_hit(&self, shape: QueryShape) -> bool {
+        !self.enabled() && self.ghost.seen.contains(&shape)
+    }
+
+    /// While the cache is off: note a decision it would now hold.
+    pub fn note_would_insert(&mut self, shape: QueryShape) {
+        if !self.enabled() {
+            self.ghost.admit(shape);
+        }
+    }
+
+    /// Bytes the cache holds, or while it is off, would hold.
+    pub fn resident_bytes(&self) -> usize {
+        let held = if self.enabled() {
+            self.entries.len()
+        } else {
+            self.ghost.seen.len()
+        };
+        held * PLAN_ENTRY_BYTES
     }
 
     pub fn get(&mut self, shape: QueryShape) -> Option<&PlanDecision> {
@@ -113,9 +203,21 @@ impl PlanCache {
     /// [`ResultCache::insert`] for why this takes a closure rather than a
     /// value. Cheaper here than there, and wrong for the same reason.
     pub fn insert(&mut self, shape: QueryShape, plan: impl FnOnce() -> PlanDecision) {
+        self.insert_costing(shape, 0, plan);
+    }
+
+    /// [`PlanCache::insert`], remembering that making the decision took
+    /// `nanos`, so a later hit can say what it saved.
+    pub fn insert_costing(
+        &mut self,
+        shape: QueryShape,
+        nanos: u64,
+        plan: impl FnOnce() -> PlanDecision,
+    ) {
         if !self.enabled() {
             return;
         }
+        self.costs.insert(shape, nanos);
         if self.entries.insert(shape, plan()).is_none() {
             self.order.push(shape);
             while self.entries.len() > self.capacity {
@@ -131,7 +233,11 @@ impl PlanCache {
     /// slower than necessary or reference a structure that is gone.
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.costs.clear();
         self.order.clear();
+        // The ghost forgets too: a cache that was on would have lost these
+        // decisions, and the next query of each shape would have planned.
+        self.ghost.clear();
         self.stats.invalidations += 1;
     }
 }
@@ -657,5 +763,50 @@ mod tests {
         c.insert(QueryShape(1), || plan("u"));
         c.get(QueryShape(1));
         assert_eq!(c.stats().hit_rate(), Some(1.0));
+    }
+
+    #[test]
+    fn a_plan_cache_ghost_predicts_hits_while_the_cache_is_off() {
+        let mut c = PlanCache::new(0);
+        assert!(!c.would_hit(QueryShape(1)));
+        c.note_would_insert(QueryShape(1));
+        assert!(c.would_hit(QueryShape(1)));
+        assert!(!c.would_hit(QueryShape(2)));
+        assert_eq!(c.resident_bytes(), PLAN_ENTRY_BYTES);
+        // Nothing real is held, and the real cache's stats are untouched.
+        assert!(c.is_empty());
+        assert_eq!(c.stats(), CacheStats::default());
+    }
+
+    #[test]
+    fn an_index_change_clears_the_plan_cache_ghost_as_it_clears_the_cache() {
+        let mut c = PlanCache::new(0);
+        c.note_would_insert(QueryShape(1));
+        c.clear();
+        assert!(!c.would_hit(QueryShape(1)));
+    }
+
+    #[test]
+    fn the_plan_cache_ghost_evicts_oldest_first_at_the_size_it_simulates() {
+        let mut c = PlanCache::new(0);
+        for i in 0..=PLAN_CACHE_ENTRIES as u64 {
+            c.note_would_insert(QueryShape(i + 1));
+        }
+        assert!(!c.would_hit(QueryShape(1)));
+        assert!(c.would_hit(QueryShape(2)));
+        assert!(c.would_hit(QueryShape(PLAN_CACHE_ENTRIES as u64 + 1)));
+    }
+
+    #[test]
+    fn enabling_the_plan_cache_discards_its_ghost_and_hits_remember_their_cost() {
+        let mut c = PlanCache::new(0);
+        c.note_would_insert(QueryShape(1));
+        c.set_capacity(PLAN_CACHE_ENTRIES);
+        assert!(!c.would_hit(QueryShape(1)));
+        assert_eq!(c.resident_bytes(), 0);
+        c.insert_costing(QueryShape(1), 1_234, || plan("users"));
+        assert!(c.get(QueryShape(1)).is_some());
+        assert_eq!(c.cost_of(QueryShape(1)), 1_234);
+        assert_eq!(c.cost_of(QueryShape(2)), 0);
     }
 }
