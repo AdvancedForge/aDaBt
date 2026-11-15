@@ -1307,10 +1307,11 @@ fn build_node(op: &LogicalOp, decision: &PlanDecision) -> PhysicalOp {
                     k: *n,
                 };
             }
-            PhysicalOp::Limit {
-                input: Box::new(build_node(input, decision)),
-                n: *n,
-            }
+            // Built first, then the limit is pushed as far down as it can
+            // go. Pushing is a fact about the physical tree — what access
+            // the decision put at the bottom — so it happens here, after the
+            // decision, and binds n from this node like everything else.
+            push_limit(build_node(input, decision), *n)
         }
         LogicalOp::Aggregate {
             input,
@@ -1330,6 +1331,74 @@ fn build_node(op: &LogicalOp, decision: &PlanDecision) -> PhysicalOp {
         // way to recover from cleanly.
         LogicalOp::Join { .. } => {
             panic!("build_node reached a Join; callers must go through plan(), not build_node() directly")
+        }
+    }
+}
+
+/// `Limit(n)` over `op`, with the limit pushed into a fetching index access
+/// when nothing between them changes which rows the limit counts.
+///
+/// The limit passes through:
+///
+/// - `Project`: one row in, one row out, in the same order, so the first `n`
+///   rows of a projection are the projection of the first `n` rows.
+/// - `Filter`s directly over the access: they become the `LimitedFetch`'s
+///   residual predicates, judged per fetched row, so the limit counts rows
+///   after them, as it did above them.
+///
+/// Everything else stops it: a `Sort` (the limit then counts rows in sort
+/// order, not in the id order the access yields), an `Aggregate` (the limit
+/// counts groups, not input rows), a `Join`, a scan, a covering access (it
+/// fetches nothing, so there is no fetch to stop), and any limit already
+/// pushed. The result is then the plain `Limit` it would have been.
+fn push_limit(op: PhysicalOp, n: usize) -> PhysicalOp {
+    if limit_can_enter(&op) {
+        push_into(op, n)
+    } else {
+        PhysicalOp::Limit {
+            input: Box::new(op),
+            n,
+        }
+    }
+}
+
+/// Whether `op` is projections over filters over a fetching index access.
+fn limit_can_enter(op: &PhysicalOp) -> bool {
+    match op {
+        PhysicalOp::Project { input, .. } => limit_can_enter(input),
+        PhysicalOp::Filter { .. } => {
+            let mut node = op;
+            while let PhysicalOp::Filter { input, .. } = node {
+                node = input;
+            }
+            node.is_fetching_index_access()
+        }
+        other => other.is_fetching_index_access(),
+    }
+}
+
+/// `push_limit`'s rewrite, on an `op` that `limit_can_enter` accepted.
+fn push_into(op: PhysicalOp, n: usize) -> PhysicalOp {
+    match op {
+        PhysicalOp::Project { input, fields } => PhysicalOp::Project {
+            input: Box::new(push_into(*input, n)),
+            fields,
+        },
+        op => {
+            // Peel the filters, outermost first...
+            let mut predicates = Vec::new();
+            let mut node = op;
+            while let PhysicalOp::Filter { input, predicate } = node {
+                predicates.push(predicate);
+                node = *input;
+            }
+            // ...and keep them innermost first: the order they ran in.
+            predicates.reverse();
+            PhysicalOp::LimitedFetch {
+                access: Box::new(node),
+                predicates,
+                n,
+            }
         }
     }
 }
@@ -1554,5 +1623,230 @@ mod decision_tests {
         let l = LogicalOp::scan("users").filter(Expr::eq("user_id", 42i64));
         let p = plan(&l, &ctx);
         assert_eq!(p.root.access_path().name(), "IndexLookup");
+    }
+}
+
+/// Where a `Limit` goes, by plan shape: into the fetch when only projections
+/// and filters stand between it and a fetching index access, and nowhere
+/// otherwise.
+#[cfg(test)]
+mod limit_pushdown_tests {
+    use super::*;
+    use adabt_core::value::Value;
+    use adabt_ir::plan::{Agg, SortKey};
+
+    fn btree_on_age() -> PlanContext<'static> {
+        let mut ctx = PlanContext::empty();
+        ctx.indexes.insert(
+            "users",
+            vec![("age", IndexKind::BTree), ("country", IndexKind::Hash)],
+        );
+        ctx
+    }
+
+    fn range() -> Expr {
+        Expr::And(vec![
+            Expr::cmp("age", CmpOp::Ge, 18i64),
+            Expr::cmp("age", CmpOp::Lt, 23i64),
+        ])
+    }
+
+    #[test]
+    fn a_limit_over_a_filtered_range_goes_into_the_fetch() {
+        let l = LogicalOp::scan("users").filter(range()).limit(50);
+        let p = plan(&l, &btree_on_age());
+        match &p.root {
+            PhysicalOp::LimitedFetch {
+                access,
+                predicates,
+                n,
+            } => {
+                assert_eq!(*n, 50);
+                assert_eq!(access.name(), "IndexRange");
+                // The residual filter is kept, whole: the limit counts rows
+                // after it.
+                assert_eq!(predicates, &vec![range()]);
+            }
+            other => panic!("expected LimitedFetch, got:\n{}", other.explain()),
+        }
+        assert_eq!(p.root.access_path().name(), "IndexRange");
+        assert!(!p.is_full_scan());
+        assert!(
+            p.explain().contains("LimitedFetch(first 50 by id"),
+            "{}",
+            p.explain()
+        );
+    }
+
+    #[test]
+    fn a_residual_filter_the_index_cannot_answer_is_kept_below_the_limit() {
+        let pred = Expr::And(vec![
+            Expr::cmp("age", CmpOp::Gt, 30i64),
+            Expr::eq("city", "Oslo"),
+        ]);
+        let l = LogicalOp::scan("users").filter(pred.clone()).limit(5);
+        let p = plan(&l, &btree_on_age());
+        match &p.root {
+            PhysicalOp::LimitedFetch { predicates, .. } => {
+                assert_eq!(predicates, &vec![pred]);
+            }
+            other => panic!("expected LimitedFetch, got:\n{}", other.explain()),
+        }
+    }
+
+    #[test]
+    fn stacked_filters_all_become_residuals_innermost_first() {
+        let outer = Expr::eq("city", "Oslo");
+        let l = LogicalOp::scan("users")
+            .filter(range())
+            .filter(outer.clone())
+            .limit(5);
+        let p = plan(&l, &btree_on_age());
+        match &p.root {
+            PhysicalOp::LimitedFetch { predicates, .. } => {
+                assert_eq!(predicates, &vec![range(), outer]);
+            }
+            other => panic!("expected LimitedFetch, got:\n{}", other.explain()),
+        }
+    }
+
+    #[test]
+    fn a_limit_passes_through_a_projection() {
+        let l = LogicalOp::scan("users")
+            .filter(range())
+            .project(vec!["id".into()])
+            .limit(7);
+        let p = plan(&l, &btree_on_age());
+        let PhysicalOp::Project { input, .. } = &p.root else {
+            panic!("expected Project on top, got:\n{}", p.explain());
+        };
+        assert!(
+            matches!(input.as_ref(), PhysicalOp::LimitedFetch { n: 7, .. }),
+            "{}",
+            p.explain()
+        );
+    }
+
+    #[test]
+    fn an_equality_lookup_takes_the_limit_too() {
+        let l = LogicalOp::scan("users")
+            .filter(Expr::eq("country", "NO"))
+            .limit(3);
+        let p = plan(&l, &btree_on_age());
+        match &p.root {
+            PhysicalOp::LimitedFetch { access, n, .. } => {
+                assert_eq!(*n, 3);
+                assert_eq!(access.name(), "IndexLookup");
+            }
+            other => panic!("expected LimitedFetch, got:\n{}", other.explain()),
+        }
+    }
+
+    #[test]
+    fn a_sort_between_blocks_the_push() {
+        // Even a sort on the indexed field: the index walks key order, but
+        // the fetch puts ids in id order, so neither order is the sort's.
+        for key in ["age", "balance"] {
+            let l = LogicalOp::scan("users")
+                .filter(range())
+                .sort(vec![SortKey {
+                    field: key.into(),
+                    descending: false,
+                }])
+                .limit(5);
+            let p = plan(&l, &btree_on_age());
+            let PhysicalOp::Limit { input, n: 5 } = &p.root else {
+                panic!("expected a plain Limit, got:\n{}", p.explain());
+            };
+            assert_eq!(input.name(), "Sort");
+            assert!(!p.explain().contains("LimitedFetch"), "{}", p.explain());
+        }
+    }
+
+    #[test]
+    fn an_aggregate_between_blocks_the_push() {
+        let l = LogicalOp::scan("users")
+            .filter(range())
+            .aggregate(vec!["country".into()], vec![Agg::count("n")])
+            .limit(2);
+        let p = plan(&l, &btree_on_age());
+        let PhysicalOp::Limit { input, n: 2 } = &p.root else {
+            panic!("expected a plain Limit, got:\n{}", p.explain());
+        };
+        assert_eq!(input.name(), "Aggregate");
+        assert!(!p.explain().contains("LimitedFetch"), "{}", p.explain());
+    }
+
+    #[test]
+    fn a_limit_under_an_aggregate_bounds_only_the_aggregates_input() {
+        // Written that way by the caller: aggregate over the first 10 rows.
+        let l = LogicalOp::scan("users")
+            .filter(range())
+            .limit(10)
+            .aggregate(vec![], vec![Agg::count("n")]);
+        let p = plan(&l, &btree_on_age());
+        let PhysicalOp::Aggregate { input, .. } = &p.root else {
+            panic!("expected Aggregate on top, got:\n{}", p.explain());
+        };
+        assert!(
+            matches!(input.as_ref(), PhysicalOp::LimitedFetch { n: 10, .. }),
+            "{}",
+            p.explain()
+        );
+    }
+
+    #[test]
+    fn without_an_index_the_limit_stays_where_it_was() {
+        let l = LogicalOp::scan("users").filter(range()).limit(5);
+        let p = plan(&l, &PlanContext::empty());
+        let PhysicalOp::Limit { input, n: 5 } = &p.root else {
+            panic!("expected a plain Limit, got:\n{}", p.explain());
+        };
+        assert_eq!(input.name(), "Filter");
+        // And a bare scan with a limit is untouched.
+        let p = plan(&LogicalOp::scan("users").limit(5), &btree_on_age());
+        assert!(matches!(p.root, PhysicalOp::Limit { n: 5, .. }));
+    }
+
+    #[test]
+    fn nested_limits_push_only_the_inner_one() {
+        let l = LogicalOp::scan("users").filter(range()).limit(10).limit(3);
+        let p = plan(&l, &btree_on_age());
+        let PhysicalOp::Limit { input, n: 3 } = &p.root else {
+            panic!("expected the outer Limit kept, got:\n{}", p.explain());
+        };
+        assert!(
+            matches!(input.as_ref(), PhysicalOp::LimitedFetch { n: 10, .. }),
+            "{}",
+            p.explain()
+        );
+    }
+
+    #[test]
+    fn a_cached_decision_rebinds_n_and_the_bounds() {
+        let ctx = btree_on_age();
+        let first = LogicalOp::scan("users").filter(range()).limit(50);
+        let decision = decide(&first, &ctx);
+        let other_range = Expr::cmp("age", CmpOp::Gt, 40i64);
+        let second = LogicalOp::scan("users")
+            .filter(other_range.clone())
+            .limit(9);
+        let p = build_from(&second, &decision);
+        match &p.root {
+            PhysicalOp::LimitedFetch {
+                access,
+                predicates,
+                n,
+            } => {
+                assert_eq!(*n, 9);
+                assert_eq!(predicates, &vec![other_range]);
+                let PhysicalOp::IndexRange { lo, .. } = access.as_ref() else {
+                    panic!("expected IndexRange, got {}", access.name());
+                };
+                assert_eq!(lo, &Bound::Excluded(Value::I64(40)));
+            }
+            other => panic!("expected LimitedFetch, got:\n{}", other.explain()),
+        }
+        assert_eq!(p, plan(&second, &ctx));
     }
 }
