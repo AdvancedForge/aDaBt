@@ -7,7 +7,7 @@ when the goal is met, as opposed to a list of features.
 |---|---|---|
 | **Usable** | you could ship on it | Met, for a single node with sharding as the growth story |
 | **Manually optimal** | the engine's ceiling is the hardware's ceiling | Met against SQLite; not yet measured against memory bandwidth or core count |
-| **Automatically optimal** | an expert tuning by hand adds nothing | Not met: adaptive matches the expert on 3 of 5 soak phases at 5k rows and effectively 1 of 5 at 20k, and is 1.1–1.6× behind on the rest (was up to ~1,000×). At 20k the identity phases are 1.3–1.5× behind on the expert's own configuration; range filter and aggregate are 1.1–1.2× since the optimizer's inputs became a bounded sample ([`benchmarks/expert-vs-adaptive.md`](benchmarks/expert-vs-adaptive.md)) |
+| **Automatically optimal** | an expert tuning by hand adds nothing | Not met: adaptive matches or beats the expert on 2 of 5 soak phases at 5k rows and 1 of 5 at 20k (was up to ~1,000× behind). The identity phases are within 1.04–1.12× on the expert's own configuration since a cycle stopped scanning every record. Range filter (1.6×) and aggregate (1.3–1.7×) are behind on configuration ([`benchmarks/expert-vs-adaptive.md`](benchmarks/expert-vs-adaptive.md)) |
 | **Good** | there is a workload where it is demonstrably the right answer | Met: 4 of 8 workloads won against SQLite, losses published alongside |
 
 "Met" means the finish line as defined here. It does not mean production-ready;
@@ -71,15 +71,21 @@ throughout: evidence first, then what it unblocks.
   - Fixed in the third re-run: each optimization cycle read every live
     record twice; it now reads a bounded sample. At 20k, range filter went
     from 1.74× to 1.23× and aggregate from 1.99× to 1.12×.
-  - **Identity at 20k rows** (1.33–1.52×) with the same configuration as
-    the expert (direct lookup alone). A per-cycle cost cannot move a median
-    this much, so it is paid per lookup: adaptive's per-operation telemetry
-    and bookkeeping, or state left by its history. Next step: a manual
-    database with telemetry at the adaptive setting, then one that has run
-    the soak.
-  - **Range filter at 5k** (1.44×) and **aggregate at 5k** (1.40×) predate
-    the sampling fix and need a 5k re-run; the plan cache is still a
-    workload-blind 5% prior.
+  - Fixed in the fourth re-run: the 20k identity gaps (1.33–1.52×) were
+    not a per-lookup cost. Each cycle scanned every record to find the
+    highest id, taking ~4 ms against ~100 µs of lookups between cycles, and
+    the lookups after it ran on flushed caches. The id now comes off the
+    page directory. Identity went to 1.03× (matches) and identity again to
+    1.12×.
+  - **Identity again** (1.12× at 20k, 1 ns outside the expert's range at
+    5k). A cycle still costs ~0.33 ms, mostly walks of the page directory
+    for live counts and samples. Next step: O(1) live counts.
+  - **Range filter** (1.62× at 5k, 1.65× at 20k) and **aggregate** (1.26×
+    and 1.71×). Adaptive's own figures held steady while the expert's
+    improved on a quieter machine. The expert wins with the level 11
+    preset on range and with column store plus views on aggregate, and
+    adaptive chooses neither. The plan cache is still a workload-blind 5%
+    prior.
 
   Re-run `adabt-bench expert-vs-adaptive` after any change to the driver's
   scoring. Matching on every phase is the finish line.

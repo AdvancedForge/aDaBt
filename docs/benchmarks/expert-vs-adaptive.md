@@ -3,7 +3,19 @@
 The "automatically optimal" goal says an expert tuning by hand adds nothing
 over the adaptive engine. This is the measurement of that claim.
 
-**Latest (2026-11-14, third re-run, 20,000 rows only): the optimizer's
+**Latest (2026-11-14, fourth re-run, both sizes): the identity gap was the
+optimizer's cycle.** Every 500 operations a cycle scanned every record to
+find each collection's highest id. That took ~4 ms against the ~100 µs of
+lookups between cycles, and the lookups after it ran on flushed caches. The
+id now comes off the page directory. At 20,000 rows, identity went from
+1.33× to 1.03× (matches) and identity again from 1.52× to 1.12×. At 5,000
+rows identity matches, point filter is ahead, and identity again is 1 ns
+outside the expert's range. Range filter (1.6× at both sizes) and
+aggregate (1.26× and 1.71×) are behind on configuration. The expert was
+faster on these this run, and adaptive's own figures did not move. See
+[the fourth re-run](#re-run-2026-11-14-the-highest-id-off-the-directory).
+
+**Previous (2026-11-14, third re-run, 20,000 rows only): the optimizer's
 inputs are now sampled.** Range filter moved from 1.74× to 1.23× behind and
 aggregate from 1.99× to 1.12×. The identity phases did not move (1.33× and
 1.52×) on the expert's own configuration, so per-cycle scans were not their
@@ -469,3 +481,116 @@ was shared. 6,426 manual answers checked against level 0; no divergence.
   telemetry at the adaptive setting separates the two.
 - **Point filter** is 1.11×, within the spread of the adaptive cell
   (1.86–2.35 µs).
+
+## Re-run 2026-11-14: the highest id off the directory
+
+**Where the identity gap came from.** A scratch harness drove one
+database through identity lookups at 20,000 rows and took the p50 of the
+last 2,000 (the soak's settled window). Each figure is from one run; the
+spreads across runs were a few nanoseconds unless noted.
+
+| database | identity p50 |
+|---|---|
+| manual, direct lookup, fresh | 186–190 ns |
+| the same database, also driven through the soak's cycles (`optimize_verified` every 500, `advance_experiment` every 100) | 259–262 ns |
+| adaptive, the soak's identity phase, last 2,000 | 257–273 ns |
+| the same adaptive database, 20,000 more lookups without cycles | 185–191 ns |
+| manual, direct lookup, after the soak's first four phases (no cycles while measured) | 220 ns |
+| adaptive after the first four phases, cycles off | 206 ns |
+
+So the cost was not per lookup and not state left behind. A quiet
+adaptive database is as fast as a manual one, since telemetry is set the
+same way in both modes and the compiled path records nothing per call. A
+manual database driven through the same cycles loses the same 70 ns. With
+the clock read around each call, `advance_experiment` took 13 ns and
+`optimize_verified` took 4.2 ms, of which 3.7 ms was `max_ids`. To get each
+collection's highest id it took the last row of a full scan, which reads
+and decodes every record. At ~200 ns a lookup, the 500 operations between
+cycles last about 100 µs. A 4 ms pass through the whole heap between every
+one of them left most lookups running on caches it had flushed. A median
+can move after all, because the cycles take far longer than the lookups
+between them. At 5,000 rows the same pass took about 1 ms and left the
+direct array in cache, which is why that size matched. `perf` was not
+available (`perf_event_paranoid` is 4), so the breakdown came from timing
+each part of `opt_inputs`.
+
+Core placement also matters on this machine. Pinned to an efficiency core
+(CPU 6), the quiet manual figure is ~290 ns against ~190 ns on a
+performance core (CPU 2). An unpinned long run can land on either. The
+before/after figures below were all taken pinned to CPU 2.
+
+**Change.** `HeapStore::max_live_id` reads the highest id whose newest
+version is live off the in-memory directory, with no page reads. A
+differential test checks it against the scan's last row through generated
+inserts, updates and deletes. Commit `b74bcef`. A cycle at 20,000 rows went
+from ~4.2 ms to ~0.33 ms.
+
+| harness, pinned to CPU 2 | before | after |
+|---|---|---|
+| manual + cycles | 260–262 ns | 195–197 ns |
+| adaptive identity phase, last 2,000 | 261–272 ns | 195–217 ns |
+
+**The optimizer's evidence is unchanged.** The id is the same, so its
+inputs are the same. A full `adabt-bench soak --size 20000 --log` before
+and after made the same decisions in the same order with the same verdicts
+and ended every phase with the same configuration. Only the measured
+latencies and the scores computed from them differ in the last digits.
+
+**Run.** `adabt-bench expert-vs-adaptive --size 20000` and `--size 5000`,
+3 repeats each, 4,572 s and 1,222 s, back to back. The one-minute load
+average was 3.9 at the start of the 20,000-row run, 2.0 between the runs
+and 2.0 at the end. The machine was shared. 6,426 manual answers were
+checked against level 0 at each size, with no divergence.
+
+### 20,000 rows
+
+| phase | level 0 p50 | expert p50 (range) | adaptive p50 (range) | ratio | previous | verdict | adaptive config |
+|---|---|---|---|---|---|---|---|
+| identity | 369 ns | 198 ns (194–210) | 203 ns (197–214) | 1.03× | 1.33× | **matches** | direct_lookup |
+| point filter | 4,692 µs | 1,736 ns (1,724–1,756) | 1,911 ns (1,780–1,939) | 1.10× | 1.11× | behind | auto_index[country], result_cache |
+| range filter | 4,057 µs | 400.8 µs (392.6–404.7) | 661.1 µs (655.9–669.5) | 1.65× | 1.23× | behind | auto_index[age], clustered_sort[age], result_cache |
+| aggregate | 7.89 ms | 974 ns (964–1,018) | 1,670 ns (1,647–1,725) | 1.71× | 1.12× | behind | auto_index[age], clustered_sort[age], result_cache |
+| identity again | 373 ns | 198 ns (193–199) | 221 ns (216–221) | 1.12× | 1.52× | behind | direct_lookup |
+
+### 5,000 rows
+
+| phase | level 0 p50 | expert p50 (range) | adaptive p50 (range) | ratio | previous (second re-run) | verdict | adaptive config |
+|---|---|---|---|---|---|---|---|
+| identity | 452 ns | 189 ns (188–197) | 198 ns (195–199) | 1.05× | 0.99× | **matches** | direct_lookup |
+| point filter | 1,116 µs | 1,781 ns (1,780–1,799) | 1,730 ns (1,720–1,746) | 0.97× | 0.97× | **ahead** | auto_index[country], result_cache |
+| range filter | 1,012 µs | 105.2 µs (103.2–107.1) | 170.5 µs (166.7–170.5) | 1.62× | 1.44× | behind | auto_index[age], clustered_sort[age], result_cache |
+| aggregate | 1,783 µs | 958 ns (950–971) | 1,211 ns (1,190–1,301) | 1.26× | 1.40× | behind | auto_index[age], clustered_sort[age], result_cache |
+| identity again | 294 ns | 190 ns (186–195) | 197 ns (196–198) | 1.04× | 1.09× | behind | direct_lookup |
+
+### Reading the fourth re-run
+
+- **The 20,000-row identity phases closed most of their gap.** The first
+  phase went from 278 ns to 203 ns and now matches. Identity again went
+  from 297 ns to 221 ns, 1.12× and narrowly behind. Both run the expert's
+  configuration.
+- **What is left on identity again** is about 20 ns at 20,000 rows and
+  1 ns at 5,000, where the ranges miss each other by 1 ns. A cycle still
+  costs ~0.33 ms. It walks the page directory several times (live counts
+  in `collection_sizes` and twice in each 256-record sample) and reads the
+  sampled records' pages. In the harness that left the soak's last 2,000
+  lookups at 195–217 ns against 186–191 ns with cycles off. Making live
+  counts O(1) is the next step there.
+- **Range filter and aggregate look worse, but adaptive did not get
+  slower.** Its cells are within a few percent of the third re-run (661
+  against 667 µs, 1,670 against 1,729 ns). The expert's got faster on a
+  quieter machine (401 against 540 µs, 974 against 1,550 ns). The third
+  re-run's 1.23× and 1.12× flattered adaptive. The gaps there are
+  configuration: the expert wins with the level 11 preset on range and
+  with column store plus materialized views on aggregate, and adaptive
+  picks neither.
+- **Point filter** is 1.10× at 20,000 rows, with the adaptive range
+  (1,780–1,939 ns) almost reaching the expert's. At 5,000 rows it is ahead.
+
+## What the fourth re-run means for the goal
+
+Still **not met**: 2 of 5 phases at 5,000 rows (one of them ahead), and 1
+of 5 at 20,000. The identity gaps were the optimizer's own cycle cost, not
+its choices. With most of that cost removed, identity again is within
+~10% at 20,000 rows and within 1 ns at 5,000. Range filter (1.6×) and
+aggregate (1.3–1.7×) are now the large losses, and both come from
+configurations adaptive does not choose.

@@ -6,6 +6,16 @@ A correctness and code-quality pass. The existing formats are unchanged; two
 files are new (`base.adabt`, `superseded-log/`).
 
 ### Fixed
+- **Every optimization cycle scanned every record to find each
+  collection's highest id.** At 20k rows that took ~3.7 ms of a ~4.2 ms
+  cycle. The ~100 µs of identity lookups between cycles then ran on caches
+  the scan had flushed. That was the whole 20k identity gap: a manual
+  database driven through the same cycles was just as slow, and a quiet
+  adaptive one was as fast as manual. The id now comes off the page
+  directory (`HeapStore::max_live_id`), with the same value and the same
+  decisions in the soak. At 20k rows identity went from 1.33× the expert
+  to 1.03× (matches) and identity again from 1.52× to 1.12×
+  (`docs/benchmarks/expert-vs-adaptive.md`).
 - **Every optimization cycle read every live record twice.** Summing stored
   bytes and measuring the compression footprint each touched a page per
   record, every 500 operations and inside measured windows. Both now read
