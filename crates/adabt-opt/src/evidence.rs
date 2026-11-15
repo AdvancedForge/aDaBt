@@ -26,6 +26,10 @@
 //!   every change of workload.)
 //! - Of those, the ones **an index served** left an `IndexUsed`, and the ones
 //!   **the result cache answered** left a hit; neither scanned. The rest did.
+//!   The ones an index served and the cache did not answer **fetched each
+//!   match by identity**, as a lookup does. What the cache answers is taken
+//!   as its hit rate over the reads that reached it, so reads that bypassed
+//!   it during an experiment do not hide its share.
 //! - **Unfiltered reads** are what remains, and those that returned at most
 //!   one row per call are **identity lookups**; the others read the whole
 //!   collection.
@@ -54,6 +58,10 @@ pub struct WorkloadMix {
     /// Unfiltered reads of more than one record: whole-collection scans and
     /// groupings.
     pub unfiltered_scans: u64,
+    /// Filtered reads an index served and the result cache did not answer:
+    /// each found its matches in the index and then fetched every one of
+    /// them by identity.
+    pub index_fetches: u64,
     /// Reads that constrained a field to a range.
     pub ranges: u64,
     /// Reads that reached stored records, which is every read the result
@@ -102,6 +110,21 @@ impl WorkloadMix {
             })
             .sum();
         let cache_answered = t.cache_hits.get("result_cache").copied().unwrap_or(0);
+        // The filtered reads the cache answers, as its hit rate over the reads
+        // that reached it, applied to every filtered read. Not the raw hit
+        // count: while an experiment runs, queries on its collection bypass
+        // the cache without probing it, so for the cycles telemetry takes to
+        // forget, the count says the cache answered far fewer reads than it
+        // does. On the soak that history claimed the range phase's indexed
+        // reads fetched by identity 80% of the time, not 55%, and admitted a
+        // direct array that was retracted again within the phase. The rate
+        // is unbiased by the bypass, because a bypassed query is not a probe.
+        let probes = t.probes("result_cache");
+        let cache_answered_filtered = if probes == 0 {
+            0
+        } else {
+            (filtered as f64 * cache_answered.min(probes) as f64 / probes as f64).round() as u64
+        };
         let ranges = t
             .field_filters
             .keys()
@@ -121,7 +144,8 @@ impl WorkloadMix {
         Self {
             operations,
             identity,
-            filtered_scans: filtered.saturating_sub(served + cache_answered),
+            filtered_scans: filtered.saturating_sub(served + cache_answered_filtered),
+            index_fetches: served.min(filtered).saturating_sub(cache_answered_filtered),
             unfiltered_scans: unfiltered - identity,
             ranges,
             record_reads: reads - cache_answered.min(reads),
@@ -139,6 +163,12 @@ impl WorkloadMix {
     /// Share of operations that looked up one record by identity.
     pub fn identity_share(&self) -> f64 {
         self.share(self.identity)
+    }
+
+    /// Share of operations that fetched records by identity: lookups, and
+    /// reads an index served, which fetch each match by its id.
+    pub fn id_fetch_share(&self) -> f64 {
+        self.share(self.identity + self.index_fetches)
     }
 
     /// Share of operations that read through a collection rather than into
@@ -307,6 +337,53 @@ mod tests {
             WorkloadMix::with_indexes(&p.snapshot(), &existing).scan_share(),
             1.0
         );
+    }
+
+    #[test]
+    fn reads_an_index_served_fetch_by_identity_unless_the_cache_answered_them() {
+        // The expert comparison's range phase: every read filtered on an
+        // indexed field, two in five answered by the result cache.
+        let p = CollectingProbe::new();
+        for i in 0..100 {
+            query(&p, 1, 50, &[("age", false)], i >= 40);
+            p.record(Event::CacheProbe {
+                name: "result_cache",
+                hit: i < 40,
+            });
+        }
+        let existing = [("users".into(), "age".into(), IndexKind::BTree)];
+        let mix = WorkloadMix::with_indexes(&p.snapshot(), &existing);
+        assert!((mix.id_fetch_share() - 0.6).abs() < 1e-9, "{mix:?}");
+        assert_eq!(mix.identity_share(), 0.0);
+        assert_eq!(mix.scan_share(), 0.0);
+    }
+
+    #[test]
+    fn reads_that_bypassed_the_cache_do_not_hide_what_it_answers() {
+        // Sixty indexed range reads during an experiment, which bypass the
+        // cache without probing it, then forty that reach it, half answered.
+        let p = CollectingProbe::new();
+        for i in 0..100 {
+            query(&p, 1, 50, &[("age", false)], true);
+            if i >= 60 {
+                p.record(Event::CacheProbe {
+                    name: "result_cache",
+                    hit: i % 2 == 0,
+                });
+            }
+        }
+        let existing = [("users".into(), "age".into(), IndexKind::BTree)];
+        let mix = WorkloadMix::with_indexes(&p.snapshot(), &existing);
+        assert!((mix.id_fetch_share() - 0.5).abs() < 1e-9, "{mix:?}");
+    }
+
+    #[test]
+    fn an_unindexed_filter_fetches_nothing_by_identity() {
+        let p = CollectingProbe::new();
+        for _ in 0..100 {
+            query(&p, 1, 20, &[("country", true)], false);
+        }
+        assert_eq!(WorkloadMix::of(&p.snapshot()).id_fetch_share(), 0.0);
     }
 
     #[test]

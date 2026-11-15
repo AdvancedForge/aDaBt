@@ -152,11 +152,19 @@ impl Optimization for DirectLookupOpt {
             .map(|c| ctx.rows_in(c))
             .sum();
         // A whole second copy of the data, in exchange for removing the page
-        // directory, the slot table and the search from the lookup path. Only
-        // a lookup by identity takes that path, so the gain is claimed on the
-        // share of the workload that does: on a filtering workload the copy is
-        // all cost, and it should be given back.
-        let lookups = ctx.workload().identity_share();
+        // directory, the slot table and the search from every fetch by
+        // identity. A lookup by id is one such fetch; a read an index serves
+        // is a run of them, one per match. So the gain is claimed on the share
+        // of the workload that fetches by identity, either way: on a workload
+        // of scans or cache hits the copy is all cost, and it should be given
+        // back.
+        //
+        // Counting only lookups by id missed the index paths. On the expert
+        // comparison's range phase the direct array is the one part of the
+        // level 11 preset that matters (p50 525 µs to 405 µs, every index
+        // range fetching ~1,400 records by id), and this estimate claimed
+        // nothing for it there.
+        let lookups = ctx.workload().id_fetch_share();
         CostEstimate::faster(1.0 - 0.6 * lookups, 1.0 - 0.65 * lookups)
             .with_ram(rows as i64 * 64)
             .with_maintenance(0.15)

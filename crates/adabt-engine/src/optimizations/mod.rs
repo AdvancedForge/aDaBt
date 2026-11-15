@@ -245,6 +245,37 @@ mod tests {
     }
 
     #[test]
+    fn direct_lookup_claims_a_gain_on_reads_an_index_serves() {
+        // Each read an index serves fetches its matches by identity, which is
+        // the path the direct array replaces.
+        let mut fx = Fx::new();
+        fx.fixed = vec!["users".into()];
+        fx.indexes = vec![("users".into(), "age".into(), IndexKind::BTree)];
+        let probe = CollectingProbe::new();
+        for _ in 0..2_000 {
+            probe.record(Event::FieldFiltered {
+                collection: "users",
+                field: "age",
+                equality: false,
+            });
+            probe.record(Event::IndexUsed {
+                collection: "users",
+                field: "age",
+            });
+            probe.record(Event::Op {
+                collection: "users",
+                kind: OpKind::Scan,
+                shape: QueryShape(3),
+                nanos: 500_000,
+                rows: 50,
+            });
+        }
+        fx.snap = probe.snapshot();
+        let e = DirectLookupOpt.estimate(&fx.ctx());
+        assert!(e.p50_delta.0 < 0.5, "{e:?}");
+    }
+
+    #[test]
     fn every_builtin_registers_and_orders() {
         let mut r = Registry::new();
         register_builtins(&mut r);
