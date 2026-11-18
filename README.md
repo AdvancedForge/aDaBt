@@ -24,12 +24,14 @@ cargo run --release -p adabt-engine --example watch_it_optimize
 
 <p align="center">
   <img src="docs/images/watch-it-optimize.png" width="860"
-       alt="Terminal output of watch_it_optimize: a grouped count over 50,000 records takes 24.1 ms as a heap scan before optimize() and 10.6 µs as a column scan after it, 2,277× faster with identical rows">
+       alt="Terminal output of watch_it_optimize: a grouped count over 50,000 records takes a median 24.1 ms as a heap scan before optimize() and 511 ns after it, about 47,000 times faster with identical rows">
 </p>
 
 Same query, same 50,000 records, no configuration. The engine saw a repeated
 grouped count, proposed a column store and a maintained view, proved them, and
-promoted them.
+promoted them. Each time is the median of 51 runs after a warm-up. The
+maintained view answers this query outright, which is where most of the
+speedup comes from; the plan shown is what runs if the view cannot.
 
 ## How it works
 

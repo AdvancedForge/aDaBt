@@ -14,7 +14,33 @@ use adabt_core::schema::Schema;
 use adabt_core::store::LogicalStore;
 use adabt_engine::Database;
 use adabt_ir::plan::{Agg, LogicalOp, LogicalPlan};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Queries timed on each side; the median of them is what is reported.
+const TIMED_RUNS: usize = 51;
+
+/// Untimed queries run first on each side, so the timing measures the
+/// steady state rather than caches, branch predictors and freshly allocated
+/// memory warming up after a change.
+const WARMUP_RUNS: usize = 20;
+
+/// The median latency of `plan` over [`TIMED_RUNS`] queries, after
+/// [`WARMUP_RUNS`] untimed ones. One timing of a query this fast is mostly
+/// noise; a median of many is what a reader can reproduce.
+fn median_latency(db: &mut Database, plan: &LogicalPlan) -> Duration {
+    for _ in 0..WARMUP_RUNS {
+        db.query(plan).unwrap();
+    }
+    let mut times: Vec<Duration> = (0..TIMED_RUNS)
+        .map(|_| {
+            let t = Instant::now();
+            db.query(plan).unwrap();
+            t.elapsed()
+        })
+        .collect();
+    times.sort_unstable();
+    times[TIMED_RUNS / 2]
+}
 
 fn main() {
     let mut dir = std::env::temp_dir();
@@ -58,25 +84,27 @@ fn main() {
         db.query(&by_region).unwrap();
     }
 
-    let t = Instant::now();
     let before = db.query(&by_region).unwrap();
-    let plain = t.elapsed();
-    println!("\nbefore optimize(): {} groups in {plain:?}", before.len());
+    let plain = median_latency(&mut db, &by_region);
+    println!(
+        "\nbefore optimize(): {} groups in {plain:?} (median of {TIMED_RUNS})",
+        before.len()
+    );
     println!("{}", db.plan(&by_region).explain());
 
     println!("\noptimize() — propose, prove, promote…");
     let report = db.optimize().unwrap();
     println!("applied: {:?}", report.applied);
 
-    // The first query after a structure lands may pay its construction; a
-    // benchmark that times that moment measures the building, not the
-    // building's worth. Steady state is the honest comparison.
-    let _ = db.query(&by_region).unwrap();
-
-    let t = Instant::now();
+    // The first queries after a structure lands pay for its construction and
+    // for cold caches; `median_latency` runs those untimed, so this measures
+    // what the structure is worth rather than the moment it arrived.
     let after = db.query(&by_region).unwrap();
-    let tuned = t.elapsed();
-    println!("\nafter optimize():  {} groups in {tuned:?}", after.len());
+    let tuned = median_latency(&mut db, &by_region);
+    println!(
+        "\nafter optimize():  {} groups in {tuned:?} (median of {TIMED_RUNS})",
+        after.len()
+    );
     println!("{}", db.plan(&by_region).explain());
     // The plan above is what a cache miss would run; a maintained view
     // answers this shape before planning is reached at all.
