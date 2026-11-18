@@ -22,19 +22,10 @@ machinery can be driven by hand, one level or one optimization at a time.
 cargo run --release -p adabt-engine --example watch_it_optimize
 ```
 
-```text
-before optimize(): 3 groups in 63.648328ms
-Aggregate(by [region], count(*))
-  HeapScan(events)
-rationale: no applicable index; full scan
-
-optimize() — propose, prove, promote…
-applied: ["column_store[global]", "delta_encoding[global]", "materialized_view[global]", ...]
-
-after optimize():  3 groups in 6.736µs
-...
-faster by 9449.0x — with identical rows.
-```
+<p align="center">
+  <img src="docs/images/watch-it-optimize.png" width="860"
+       alt="Terminal output of watch_it_optimize: a grouped count over 50,000 records takes 24.1 ms as a heap scan before optimize() and 10.6 µs as a column scan after it, 2,277× faster with identical rows">
+</p>
 
 Same query, same 50,000 records, no configuration. The engine saw a repeated
 grouped count, proposed a column store and a maintained view, proved them, and
